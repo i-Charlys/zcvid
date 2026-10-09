@@ -1,0 +1,4 @@
+tests/test_ternary_packing
+*.o
+*.so
+*.a
