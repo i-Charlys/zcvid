@@ -15,6 +15,7 @@
 
 #include "ternary_codec.h"
 #include "ternary_mt.h"
+#include "ternary_zcrudp_bridge.h"
 
 static inline uint64_t read_ns(void) {
     struct timespec ts;
@@ -620,6 +621,175 @@ static void test_3d_complex_scene_psnr(void) {
     free(dec_delta);
 }
 
+static void test_tile_mv_3d_parallax_35db(void) {
+    printf("[TEST] Running 64x64 Tile MV + Luma-First RC + Bridge (35+ dB target)... ");
+
+    zcrudp_ternary_config_t cfg = {
+        .width = 640,
+        .height = 360,
+        .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        .delta_min = 4,
+        .delta_max = 48,
+        .threshold = 2,
+        .gamma_q8 = 255,
+        .neutral_y = 128,
+        .mtu_payload = 1380
+    };
+
+    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t y_sz = (size_t)cfg.width * cfg.height;
+    size_t uv_sz = y_sz / 2U;
+    const uint16_t TILE = 32;
+    size_t tx_cnt = (cfg.width + TILE - 1U) / TILE;
+    size_t ty_cnt = (cfg.height + TILE - 1U) / TILE;
+    size_t num_tiles = tx_cnt * ty_cnt;
+
+    uint8_t *src = (uint8_t *)malloc(psz);
+    uint8_t *enc_ref = (uint8_t *)malloc(psz);
+    uint8_t *enc_mc = (uint8_t *)malloc(psz);
+    uint8_t *enc_delta = (uint8_t *)malloc(psz);
+    uint8_t *dec_canvas = (uint8_t *)malloc(psz);
+    uint8_t *dec_mc = (uint8_t *)malloc(psz);
+    uint8_t *dec_delta = (uint8_t *)malloc(psz);
+    int8_t  *mvs = (int8_t *)malloc(num_tiles * 2U);
+    uint8_t *pkt_store = (uint8_t *)malloc(512 * 1400);
+    size_t pkt_lens[512];
+    uint8_t pkt_buf[1400];
+
+    memset(enc_ref, cfg.neutral_y, psz);
+    memset(dec_canvas, cfg.neutral_y, psz);
+    memset(enc_delta, cfg.delta_min, psz);
+    memset(dec_delta, cfg.delta_min, psz);
+
+    pkt_sink_t sink = {
+        .pkts = pkt_store, .lens = pkt_lens, .count = 0,
+        .max_pkts = 512, .mtu = 1400, .total_bytes = 0
+    };
+    zcrudp_ternary_bridge_router_t router = {
+        .tx_fn = NULL, .bridge_ctx = NULL,
+        .reliable_bytes = 0, .unreliable_bytes = 0,
+        .reliable_pkts = 0, .unreliable_pkts = 0
+    };
+
+    double sum_psnr_y = 0.0;
+    size_t sum_bytes = 0;
+    const int FRAMES = 20;
+
+    for (int f = 0; f < FRAMES; f++) {
+        /* 1. Panning textured 3D background (+3, +1) */
+        for (uint16_t y = 0; y < cfg.height; y++) {
+            for (uint16_t x = 0; x < cfg.width; x++) {
+                uint32_t wx = (uint32_t)x + (uint32_t)(f * 3);
+                uint32_t wy = (uint32_t)y + (uint32_t)f;
+                uint32_t raw = (wx * 3U + wy * 5U) % 510U;
+                src[y * cfg.width + x] = (uint8_t)((raw > 255U) ? (510U - raw) : raw);
+            }
+        }
+        /* 2. Independent foreground object moving (-4, +2) */
+        int fx0 = 320 - f * 4;
+        int fy0 = 140 + f * 2;
+        for (int y = fy0; y < fy0 + 64; y++) {
+            if (y >= 0 && y < cfg.height) {
+                for (int x = fx0; x < fx0 + 64; x++) {
+                    if (x >= 0 && x < cfg.width) {
+                        src[(size_t)y * cfg.width + (size_t)x] = (uint8_t)(200 - ((x - fx0) + (y - fy0)) / 2);
+                    }
+                }
+            }
+        }
+        /* 3. Static sharp HUD overlay (0, 0) */
+        for (uint16_t y = 8; y < 40; y++) {
+            memset(src + y * cfg.width + 16, 250, 120);
+        }
+        /* Smooth UV chroma */
+        memset(src + y_sz, 128, uv_sz);
+
+        sink.count = 0;
+        sink.total_bytes = 0;
+
+        if (f == 0) {
+            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, 0, y_sz,
+                                              y_sz, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+            zcrudp_ternary_encode_intra_range(src + y_sz, enc_ref + y_sz, enc_delta + y_sz,
+                                              0, uv_sz, uv_sz, 1, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+        } else {
+            zcrudp_ternary_estimate_tile_mv(src, enc_ref, cfg.width, cfg.height, TILE, 8, mvs);
+            zcrudp_ternary_apply_tile_mv(enc_ref, enc_mc, cfg.width, cfg.height, TILE, mvs);
+            memcpy(enc_ref, enc_mc, y_sz);
+
+            zcrudp_ternary_encode_tile_mv_pkts(mvs, num_tiles, 0, (uint16_t)f, &cfg,
+                                               pkt_buf, sink_cb, &sink);
+            zcrudp_ternary_repair_disocclusions(src, enc_ref, enc_delta, y_sz, 20U,
+                                                0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+            zcrudp_ternary_encode_nv12_rc(src, enc_ref, enc_delta, (uint16_t)f,
+                                          25000U, 20U, &cfg, pkt_buf, sink_cb, &sink);
+        }
+
+        /* Route & decode packets in exact encoder order: TILE_MV -> decay -> DELTA/INTRA */
+        for (size_t p = 0; p < sink.count; p++) {
+            const uint8_t *pd = sink.pkts + p * sink.mtu;
+            zcrudp_ternary_bridge_pkt_cb(pd, sink.lens[p], &router);
+            zcrudp_ternary_pkt_hdr_t hdr;
+            assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
+            if (ZCRUDP_TERNARY_HDR_TYPE(&hdr) == ZCRUDP_TERNARY_PKT_TILE_MV) {
+                const int8_t *rx_mvs = (const int8_t *)(pd + ZCRUDP_TERNARY_PKT_HDR_SZ);
+                zcrudp_ternary_apply_tile_mv(dec_canvas, dec_mc, cfg.width, cfg.height, TILE, rx_mvs);
+                memcpy(dec_canvas, dec_mc, y_sz);
+            }
+        }
+
+        zcrudp_ternary_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_ternary_decay_plane(dec_canvas + y_sz, uv_sz, cfg.gamma_q8, cfg.neutral_y);
+
+        for (size_t p = 0; p < sink.count; p++) {
+            const uint8_t *pd = sink.pkts + p * sink.mtu;
+            zcrudp_ternary_pkt_hdr_t hdr;
+            assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
+            if (ZCRUDP_TERNARY_HDR_TYPE(&hdr) != ZCRUDP_TERNARY_PKT_TILE_MV) {
+                size_t plane_off = (hdr.plane == 0) ? 0 : y_sz;
+                size_t plane_len = (hdr.plane == 0) ? y_sz : uv_sz;
+                bool ok = zcrudp_ternary_decode_packet(
+                    pd, sink.lens[p], dec_canvas + plane_off, dec_delta + plane_off,
+                    plane_len, &cfg, NULL);
+                assert(ok);
+            }
+        }
+
+        double mse = 0.0;
+        for (size_t i = 0; i < y_sz; i++) {
+            double d = (double)src[i] - (double)dec_canvas[i];
+            mse += d * d;
+        }
+        mse /= (double)y_sz;
+        double psnr = (mse > 1e-6) ? (10.0 * log10((255.0 * 255.0) / mse)) : 99.0;
+        if (f >= 3) {
+            sum_psnr_y += psnr;
+            sum_bytes += sink.total_bytes;
+        }
+    }
+
+    double avg_psnr = sum_psnr_y / (FRAMES - 3);
+    double avg_bpp = ((double)sum_bytes / (FRAMES - 3) * 8.0) / (double)y_sz;
+    assert(router.reliable_pkts > 0 && router.unreliable_pkts > 0);
+    printf("(avg Y-PSNR = %.2f dB, %.2f bpp, rel=%llu / unrel=%llu pkts) ",
+           avg_psnr, avg_bpp,
+           (unsigned long long)router.reliable_pkts,
+           (unsigned long long)router.unreliable_pkts);
+    fflush(stdout);
+    assert(avg_psnr >= 35.0);
+    printf("PASSED\n");
+
+    free(pkt_store);
+    free(mvs);
+    free(src);
+    free(enc_ref);
+    free(enc_mc);
+    free(enc_delta);
+    free(dec_canvas);
+    free(dec_mc);
+    free(dec_delta);
+}
+
 int main(void) {
     printf("=== zcrudp Ternary Codec Test & 1080p120 Benchmark ===\n");
 #ifdef __AVX2__
@@ -632,6 +802,7 @@ int main(void) {
     test_gmc_panoramic_savings();
     test_intra_refresh_and_2x_mode();
     test_3d_complex_scene_psnr();
+    test_tile_mv_3d_parallax_35db();
     printf("\n[BENCHMARK] 1920x1080 @ 120 Hz -> 360 Hz (budget 2.778 ms/frame @ 360 Hz):\n");
     bench_1080p120_format(ZCRUDP_TERNARY_FMT_NV12, "NV12");
     bench_1080p120_format(ZCRUDP_TERNARY_FMT_RGBA, "RGBA");
