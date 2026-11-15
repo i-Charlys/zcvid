@@ -98,14 +98,32 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
     uint num_px = width * height;
 
     if (tag == 3u) {
-        // 2-pixel 4:2:2 Intra pair: [Y0 | Cb<<8 | Y1<<16 | Cr<<24]
-        uint y0 = w1 & 0xFFu;
-        uint cb = (w1 >> 8) & 0xFFu;
-        uint y1 = (w1 >> 16) & 0xFFu;
-        uint cr = (w1 >> 24) & 0xFFu;
-        uint chroma_d = (cb << 8) | (cr << 16) | (delta_min << 24);
-        if (id < num_px) g_cur_yuvd[id] = y0 | chroma_d;
-        if (id + 1u < num_px) g_cur_yuvd[id + 1u] = y1 | chroma_d;
+        if (is_2x != 0u) {
+            // 4-pixel 6-bit Intra: w0 = [tag=3|is_4px=1|cr_q6(6)|idx(22)], w1 = [y0..y3(24)|cb_q6(6)]
+            uint idx4 = w0 & 0x3FFFFFu;
+            uint cr_q6 = (w0 >> 22) & 0x3Fu;
+            uint y0_q6 = w1 & 0x3Fu;
+            uint y1_q6 = (w1 >> 6) & 0x3Fu;
+            uint y2_q6 = (w1 >> 12) & 0x3Fu;
+            uint y3_q6 = (w1 >> 18) & 0x3Fu;
+            uint cb_q6 = (w1 >> 24) & 0x3Fu;
+            uint cb = (cb_q6 << 2) | (cb_q6 >> 4);
+            uint cr = (cr_q6 << 2) | (cr_q6 >> 4);
+            uint chroma_d = (cb << 8) | (cr << 16) | (delta_min << 24);
+            if (idx4 + 0u < num_px) g_cur_yuvd[idx4 + 0u] = ((y0_q6 << 2) | (y0_q6 >> 4)) | chroma_d;
+            if (idx4 + 1u < num_px) g_cur_yuvd[idx4 + 1u] = ((y1_q6 << 2) | (y1_q6 >> 4)) | chroma_d;
+            if (idx4 + 2u < num_px) g_cur_yuvd[idx4 + 2u] = ((y2_q6 << 2) | (y2_q6 >> 4)) | chroma_d;
+            if (idx4 + 3u < num_px) g_cur_yuvd[idx4 + 3u] = ((y3_q6 << 2) | (y3_q6 >> 4)) | chroma_d;
+        } else {
+            // 2-pixel 4:2:2 Intra pair: [Y0 | Cb<<8 | Y1<<16 | Cr<<24]
+            uint y0 = w1 & 0xFFu;
+            uint cb = (w1 >> 8) & 0xFFu;
+            uint y1 = (w1 >> 16) & 0xFFu;
+            uint cr = (w1 >> 24) & 0xFFu;
+            uint chroma_d = (cb << 8) | (cr << 16) | (delta_min << 24);
+            if (id < num_px) g_cur_yuvd[id] = y0 | chroma_d;
+            if (id + 1u < num_px) g_cur_yuvd[id + 1u] = y1 | chroma_d;
+        }
         return;
     }
 

@@ -146,6 +146,7 @@ void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 // =========================================================================
 struct PixState {
     bool valid;       // idx is inside the frame
+    bool rolling;     // rolling intra-refresh row
     bool want_intra;  // rolling refresh row or disocclusion
     int cy, ccb, ccr; // source
     int ry, rcb, rcr; // motion-compensated reference
@@ -172,9 +173,9 @@ PixState LoadPix(uint idx, uint num_px, uint intra_y0, uint intra_y1, bool allow
     float4 src_c = g_src_rgba.Load(int3(px, py, 0));
     RgbToYCbCr(src_c.rgb, s.cy, s.ccb, s.ccr);
 
-    bool rolling = (py >= intra_y0 && py < intra_y1);
+    s.rolling = (py >= intra_y0 && py < intra_y1);
     bool disocc  = allow_disocc && (abs(s.cy - s.ry) > (int)intra_err_thr);
-    s.want_intra = s.valid && (rolling || disocc);
+    s.want_intra = s.valid && (s.rolling || disocc);
     return s;
 }
 
@@ -192,10 +193,11 @@ void StoreDelta(uint idx, PixState s, int ty, int tcb, int tcr, int d_used, int 
 
 [numthreads(64, 1, 1)]
 void CSEncode(uint3 dtid : SV_DispatchThreadID) {
-    uint blk = dtid.x;
     uint is_2x = mode_flags & 1u;
     uint eff_blocks = (is_2x != 0u) ? ((total_blocks + 1u) >> 1) : total_blocks;
-    if (blk >= eff_blocks) return;
+    if (dtid.x >= eff_blocks) return;
+    // Rotate starting block per frame so hard-cap budgets never starve the bottom of the frame.
+    uint blk = (dtid.x + ((frame_id * 29713u) % eff_blocks)) % eff_blocks;
 
     uint num_px = width * height;
     uint cycles = max(intra_cycles, 1u);
@@ -203,15 +205,15 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
     uint intra_y0 = (frame_id % cycles) * rows_per_slot;
     uint intra_y1 = intra_y0 + rows_per_slot;
 
-    // Best-effort rate control: the counter is read while other groups are
-    // still appending, so the cap is soft. Both sides stay in sync because
-    // the reference is updated from what is actually emitted.
+    // Hard rate control: g_out_counter counts total desired words (for CPU RC),
+    // while g_out_records and g_cur_yuvd only commit records within max_record_words.
     uint cur_words = g_out_counter.Load(0);
-    bool allow_disocc = (max_record_words == 0u) || (cur_words < (max_record_words >> 1));
+    bool budget_full = (max_record_words != 0u) && (cur_words >= max_record_words);
+    bool allow_disocc = (max_record_words == 0u) || (cur_words < (max_record_words >> 2));
     bool allow_chroma = (max_record_words == 0u) || (cur_words < max_record_words);
 
     int y_thr = (int)threshold;
-    int c_thr = (int)threshold + 2;
+    int c_thr = (int)threshold * 2 + 4;
 
     uint packed_y  = 0;
     uint packed_cb = 0;
@@ -223,6 +225,8 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
     // 1x: 5 pairs, 2 trits each (10 px). 2x: 10 pairs, 1 trit each (20 px).
     uint base_px = blk * ((is_2x != 0u) ? 20u : 10u);
     uint num_pairs = (is_2x != 0u) ? 10u : 5u;
+    bool skip_pair = false;
+    uint intra_mask = 0u;
 
     [unroll]
     for (uint k = 0; k < 10u; k++) {
@@ -236,21 +240,66 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
         int ty_a = 0, tcb_a = 0, tcr_a = 0;
         int ty_b = 0, tcb_b = 0, tcr_b = 0;
 
-        if (a.valid && (a.want_intra || b.want_intra)) {
-            int cy_b = b.valid ? b.cy : a.cy;
-            int cb = b.valid ? ((a.ccb + b.ccb + 1) >> 1) : a.ccb;
-            int cr = b.valid ? ((a.ccr + b.ccr + 1) >> 1) : a.ccr;
+        if (skip_pair) {
+            skip_pair = false;
+        } else if (a.valid && (a.want_intra || b.want_intra)) {
+            if (budget_full) {
+                StoreDelta(idx_a, a, 0, 0, 0, a.d, max((int)delta_min, a.d >> 1));
+                if (b.valid) StoreDelta(idx_b, b, 0, 0, 0, b.d, max((int)delta_min, b.d >> 1));
+            } else if ((k & 1u) == 0u && (k + 1u) < num_pairs && a.rolling && (idx_a + 3u < num_px)) {
+                PixState c = LoadPix(idx_a + 2u, num_px, intra_y0, intra_y1, allow_disocc);
+                PixState d = LoadPix(idx_a + 3u, num_px, intra_y0, intra_y1, allow_disocc);
+                uint slot = 0;
+                g_out_counter.InterlockedAdd(0, 2u, slot);
+                if (max_record_words == 0u || slot + 2u <= max_record_words) {
+                    int y0_q6 = clamp((a.cy + 2) >> 2, 0, 63);
+                    int y1_q6 = clamp((b.cy + 2) >> 2, 0, 63);
+                    int y2_q6 = clamp((c.cy + 2) >> 2, 0, 63);
+                    int y3_q6 = clamp((d.cy + 2) >> 2, 0, 63);
+                    int cb_q6 = clamp(((a.ccb + b.ccb + c.ccb + d.ccb + 8) >> 4), 0, 63);
+                    int cr_q6 = clamp(((a.ccr + b.ccr + c.ccr + d.ccr + 8) >> 4), 0, 63);
+                    g_out_records[slot + 0u] = 0xE0000000u | ((uint)cr_q6 << 22) | (idx_a & 0x3FFFFFu);
+                    g_out_records[slot + 1u] = (uint)y0_q6 | ((uint)y1_q6 << 6) | ((uint)y2_q6 << 12) | ((uint)y3_q6 << 18) | ((uint)cb_q6 << 24);
+                    uint cb_rec = (uint)((cb_q6 << 2) | (cb_q6 >> 4));
+                    uint cr_rec = (uint)((cr_q6 << 2) | (cr_q6 >> 4));
+                    uint chroma_d = (cb_rec << 8) | (cr_rec << 16) | (delta_min << 24);
+                    g_cur_yuvd[idx_a + 0u] = (uint)((y0_q6 << 2) | (y0_q6 >> 4)) | chroma_d;
+                    g_cur_yuvd[idx_a + 1u] = (uint)((y1_q6 << 2) | (y1_q6 >> 4)) | chroma_d;
+                    g_cur_yuvd[idx_a + 2u] = (uint)((y2_q6 << 2) | (y2_q6 >> 4)) | chroma_d;
+                    g_cur_yuvd[idx_a + 3u] = (uint)((y3_q6 << 2) | (y3_q6 >> 4)) | chroma_d;
+                    intra_mask |= (0xFu << (k * 2u));
+                } else {
+                    StoreDelta(idx_a + 0u, a, 0, 0, 0, a.d, max((int)delta_min, a.d >> 1));
+                    StoreDelta(idx_a + 1u, b, 0, 0, 0, b.d, max((int)delta_min, b.d >> 1));
+                    StoreDelta(idx_a + 2u, c, 0, 0, 0, c.d, max((int)delta_min, c.d >> 1));
+                    StoreDelta(idx_a + 3u, d, 0, 0, 0, d.d, max((int)delta_min, d.d >> 1));
+                }
+                skip_pair = true;
+            } else {
+                int cy_b = b.valid ? b.cy : a.cy;
+                int cb = b.valid ? ((a.ccb + b.ccb + 1) >> 1) : a.ccb;
+                int cr = b.valid ? ((a.ccr + b.ccr + 1) >> 1) : a.ccr;
 
-            uint slot = 0;
-            g_out_counter.InterlockedAdd(0, 2u, slot);
-            g_out_records[slot + 0u] = 0xC0000000u | (idx_a & 0x1FFFFFFFu);
-            g_out_records[slot + 1u] = (uint)a.cy | ((uint)cb << 8) | ((uint)cy_b << 16) | ((uint)cr << 24);
+                uint slot = 0;
+                g_out_counter.InterlockedAdd(0, 2u, slot);
+                if (max_record_words == 0u || slot + 2u <= max_record_words) {
+                    g_out_records[slot + 0u] = 0xC0000000u | (idx_a & 0x1FFFFFFFu);
+                    g_out_records[slot + 1u] = (uint)a.cy | ((uint)cb << 8) | ((uint)cy_b << 16) | ((uint)cr << 24);
 
-            uint chroma_d = ((uint)cb << 8) | ((uint)cr << 16) | (delta_min << 24);
-            g_cur_yuvd[idx_a] = (uint)a.cy | chroma_d;
-            if (b.valid) g_cur_yuvd[idx_b] = (uint)cy_b | chroma_d;
+                    uint chroma_d = ((uint)cb << 8) | ((uint)cr << 16) | (delta_min << 24);
+                    g_cur_yuvd[idx_a] = (uint)a.cy | chroma_d;
+                    if (b.valid) g_cur_yuvd[idx_b] = (uint)cy_b | chroma_d;
+                    intra_mask |= (3u << (k * 2u));
+                } else {
+                    StoreDelta(idx_a, a, 0, 0, 0, a.d, max((int)delta_min, a.d >> 1));
+                    if (b.valid) StoreDelta(idx_b, b, 0, 0, 0, b.d, max((int)delta_min, b.d >> 1));
+                }
+            }
         } else if (a.valid) {
-            if (is_2x != 0u) {
+            if (budget_full) {
+                StoreDelta(idx_a, a, 0, 0, 0, a.d, max((int)delta_min, a.d >> 1));
+                if (b.valid) StoreDelta(idx_b, b, 0, 0, 0, b.d, max((int)delta_min, b.d >> 1));
+            } else if (is_2x != 0u) {
                 // Mean error of the pair (encoder-only decision, any rounding is fine).
                 int ey  = b.valid ? (((a.cy  - a.ry)  + (b.cy  - b.ry))  >> 1) : (a.cy  - a.ry);
                 int ecb = b.valid ? (((a.ccb - a.rcb) + (b.ccb - b.rcb)) >> 1) : (a.ccb - a.rcb);
@@ -301,22 +350,70 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
     }
 
     uint hdr_base = (is_2x << 29) | (blk & 0x1FFFFFFFu);
+    bool drop_y = false, drop_cb = false, drop_cr = false;
     if (nz_y) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (0u << 30) | hdr_base;
-        g_out_records[slot + 1u] = packed_y;
+        if (max_record_words == 0u || slot + 2u <= max_record_words) {
+            g_out_records[slot + 0u] = (0u << 30) | hdr_base;
+            g_out_records[slot + 1u] = packed_y;
+        } else {
+            drop_y = true;
+        }
     }
     if (nz_cb) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (1u << 30) | hdr_base;
-        g_out_records[slot + 1u] = packed_cb;
+        if (max_record_words == 0u || slot + 2u <= max_record_words) {
+            g_out_records[slot + 0u] = (1u << 30) | hdr_base;
+            g_out_records[slot + 1u] = packed_cb;
+        } else {
+            drop_cb = true;
+        }
     }
     if (nz_cr) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (2u << 30) | hdr_base;
-        g_out_records[slot + 1u] = packed_cr;
+        if (max_record_words == 0u || slot + 2u <= max_record_words) {
+            g_out_records[slot + 0u] = (2u << 30) | hdr_base;
+            g_out_records[slot + 1u] = packed_cr;
+        } else {
+            drop_cr = true;
+        }
+    }
+
+    // Boundary safety: if a delta record exceeded max_record_words, revert its
+    // plane(s) in g_cur_yuvd to pure motion-compensated decay so Enc == Dec.
+    if (drop_y || drop_cb || drop_cr) {
+        uint px_cnt = (is_2x != 0u) ? 20u : 10u;
+        for (uint p = 0; p < px_cnt; p++) {
+            uint pidx = base_px + p;
+            if (pidx < num_px && ((intra_mask & (1u << p)) == 0u)) {
+                uint py = pidx / width;
+                uint px = pidx - py * width;
+                int2 mv = g_tile_mvs[(py >> 5) * tiles_x + (px >> 5)];
+                int sx = clamp((int)px - mv.x, 0, (int)width - 1);
+                int sy = clamp((int)py - mv.y, 0, (int)height - 1);
+                uint ref_w = g_prev_yuvd[(uint)sy * width + (uint)sx];
+                uint cur_w = g_cur_yuvd[pidx];
+                if (drop_y) {
+                    int ry = (int)(ref_w & 0xFFu);
+                    int ny = LeakyStep(ry, 0, 0, (int)neutral_y);
+                    int d  = max((int)delta_min, (int)((ref_w >> 24) & 0xFFu) >> 1);
+                    cur_w = (cur_w & 0x00FFFF00u) | (uint)ny | ((uint)d << 24);
+                }
+                if (drop_cb) {
+                    int rcb = (int)((ref_w >> 8) & 0xFFu);
+                    int ncb = LeakyStep(rcb, 0, 0, 128);
+                    cur_w = (cur_w & 0xFFFF00FFu) | ((uint)ncb << 8);
+                }
+                if (drop_cr) {
+                    int rcr = (int)((ref_w >> 16) & 0xFFu);
+                    int ncr = LeakyStep(rcr, 0, 0, 128);
+                    cur_w = (cur_w & 0xFF00FFFFu) | ((uint)ncr << 16);
+                }
+                g_cur_yuvd[pidx] = cur_w;
+            }
+        }
     }
 }
