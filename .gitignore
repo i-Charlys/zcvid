@@ -1,4 +1,6 @@
 tests/test_ternary_packing
+tests/test_ternary_packing_san
+*.exe
 *.o
 *.so
 *.a
