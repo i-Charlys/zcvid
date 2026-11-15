@@ -789,6 +789,92 @@ static void test_tile_mv_3d_parallax_35db(void) {
     free(dec_mc);
     free(dec_delta);
 }
+/*
+ * NV12 chroma is interleaved (U0 V0 U1 V1 ...). DELTA_2X on that plane must
+ * pair samples of the same component: pairing byte neighbours would copy U
+ * into V. U and V are given very different values so such a mix-up shows.
+ */
+static void test_nv12_chroma_2x_keeps_components(void) {
+    printf("[TEST] Running NV12 Interleaved Chroma DELTA_2X Component Test... ");
+
+    zcrudp_ternary_config_t cfg = {
+        .width = 320,
+        .height = 180,
+        .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        .delta_min = 4,
+        .delta_max = 32,
+        .threshold = 2,
+        .gamma_q8 = 255,
+        .neutral_y = 128,
+        .mtu_payload = 1380
+    };
+    size_t y_sz = (size_t)cfg.width * cfg.height;
+    size_t uv_sz = y_sz / 2U;
+
+    uint8_t *src = (uint8_t *)malloc(uv_sz);
+    uint8_t *enc_ref = (uint8_t *)malloc(uv_sz);
+    uint8_t *enc_delta = (uint8_t *)malloc(uv_sz);
+    uint8_t *dec_canvas = (uint8_t *)malloc(uv_sz);
+    uint8_t *dec_delta = (uint8_t *)malloc(uv_sz);
+    uint8_t *pkt_store = (uint8_t *)malloc(128 * 1400);
+    size_t pkt_lens[128];
+    uint8_t pkt_buf[1400];
+    assert(src && enc_ref && enc_delta && dec_canvas && dec_delta && pkt_store);
+
+    memset(enc_ref, cfg.neutral_y, uv_sz);
+    memset(dec_canvas, cfg.neutral_y, uv_sz);
+    memset(enc_delta, cfg.delta_min, uv_sz);
+    memset(dec_delta, cfg.delta_min, uv_sz);
+
+    /* Smooth horizontal ramps: U around 200, V around 60. */
+    for (size_t i = 0; i + 1U < uv_sz; i += 2U) {
+        uint8_t ramp = (uint8_t)(((i / 2U) % (cfg.width / 2U)) / 8U);
+        src[i] = (uint8_t)(200U + ramp);
+        src[i + 1U] = (uint8_t)(60U - ramp);
+    }
+
+    pkt_sink_t sink = {
+        .pkts = pkt_store, .lens = pkt_lens, .count = 0,
+        .max_pkts = 128, .mtu = 1400, .total_bytes = 0
+    };
+
+    for (int f = 0; f < 40; f++) {
+        sink.count = 0;
+        sink.total_bytes = 0;
+        zcrudp_ternary_encode_plane_2x(src, enc_ref, enc_delta, uv_sz, 1,
+                                       (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+        assert(sink.count < sink.max_pkts);
+
+        zcrudp_ternary_decay_plane(dec_canvas, uv_sz, cfg.gamma_q8, cfg.neutral_y);
+        for (size_t p = 0; p < sink.count; p++) {
+            bool ok = zcrudp_ternary_decode_packet(
+                sink.pkts + p * sink.mtu, sink.lens[p], dec_canvas, dec_delta,
+                uv_sz, &cfg, NULL);
+            assert(ok);
+        }
+        assert(memcmp(enc_ref, dec_canvas, uv_sz) == 0);
+        assert(memcmp(enc_delta, dec_delta, uv_sz) == 0);
+    }
+
+    double err_u = 0.0, err_v = 0.0;
+    for (size_t i = 0; i + 1U < uv_sz; i += 2U) {
+        err_u += fabs((double)src[i] - (double)dec_canvas[i]);
+        err_v += fabs((double)src[i + 1U] - (double)dec_canvas[i + 1U]);
+    }
+    err_u /= (double)(uv_sz / 2U);
+    err_v /= (double)(uv_sz / 2U);
+    printf("(mean abs err U = %.2f, V = %.2f) ", err_u, err_v);
+    fflush(stdout);
+    assert(err_u < 4.0 && err_v < 4.0);
+    printf("PASSED\n");
+
+    free(pkt_store);
+    free(dec_delta);
+    free(dec_canvas);
+    free(enc_delta);
+    free(enc_ref);
+    free(src);
+}
 
 int main(void) {
     printf("=== zcrudp Ternary Codec Test & 1080p120 Benchmark ===\n");
@@ -801,6 +887,7 @@ int main(void) {
     test_nv12_and_rgba_roundtrip();
     test_gmc_panoramic_savings();
     test_intra_refresh_and_2x_mode();
+    test_nv12_chroma_2x_keeps_components();
     test_3d_complex_scene_psnr();
     test_tile_mv_3d_parallax_35db();
     printf("\n[BENCHMARK] 1920x1080 @ 120 Hz -> 360 Hz (budget 2.778 ms/frame @ 360 Hz):\n");

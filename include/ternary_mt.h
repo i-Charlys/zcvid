@@ -27,6 +27,16 @@ extern "C" {
 
 #define ZCRUDP_TERNARY_MT_MAX_THREADS 16U
 
+/* Spin-wait hint, portable across GCC/Clang and MSVC, x86 and others. */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#define ZCRUDP_MT_CPU_RELAX() _mm_pause()
+#elif defined(__x86_64__) || defined(__i386__)
+#define ZCRUDP_MT_CPU_RELAX() __builtin_ia32_pause()
+#else
+#define ZCRUDP_MT_CPU_RELAX() ((void)0)
+#endif
+
 typedef enum {
     ZCRUDP_MT_OP_NONE = 0,
     ZCRUDP_MT_OP_ENCODE_PLANE = 1,
@@ -138,7 +148,13 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
             const uint8_t *pd = p->pkt_in_base + idx * p->pkt_in_stride;
             size_t plen = p->pkt_in_lens[idx];
             zcrudp_ternary_pkt_hdr_t hdr;
-            if (!zcrudp_ternary_pkt_hdr_read_le(pd, &hdr)) continue;
+            if (plen < ZCRUDP_TERNARY_PKT_HDR_SZ ||
+                !zcrudp_ternary_pkt_hdr_read_le(pd, &hdr)) continue;
+            /* hdr.plane comes off the wire: it selects the destination buffer,
+             * so reject planes the configured pixel format does not have. */
+            uint8_t num_planes = (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_RGBA) ? 3U
+                               : (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12) ? 2U : 1U;
+            if (hdr.plane >= num_planes) continue;
             size_t plane_off = (hdr.plane == 0) ? 0 : ((size_t)hdr.plane * p->y_sz);
             size_t plane_len = (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12 && hdr.plane == 1)
                 ? (p->y_sz / 2U) : p->y_sz;
@@ -165,9 +181,7 @@ static void *zcrudp_mt_worker_entry(void *arg) {
         uint32_t spins = 0;
         while ((cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire)) == seen_gen) {
             if (++spins < 2000U) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-                __asm__ __volatile__("pause");
-#endif
+                ZCRUDP_MT_CPU_RELAX();
             } else {
 #if defined(_WIN32)
                 SwitchToThread();
@@ -200,9 +214,7 @@ static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
     zcrudp_mt_run_task(p, 0);
     if (p->num_threads > 1U) {
         while (atomic_load_explicit(&p->active_workers, memory_order_acquire) != 0U) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-            __asm__ __volatile__("pause");
-#endif
+            ZCRUDP_MT_CPU_RELAX();
         }
     }
 }
@@ -210,6 +222,8 @@ static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
 /**
  * @brief Initializes a persistent worker pool (num_threads clamped to [1, 16]).
  *        Each slice sink uses caller-provided per-thread packet buffers.
+ *        If the OS refuses a thread the pool shrinks to the workers that did
+ *        start (p->num_threads); it always keeps the calling thread.
  */
 static inline void zcrudp_ternary_mt_init(zcrudp_ternary_mt_pool_t *p,
                                           uint32_t num_threads,
@@ -234,13 +248,21 @@ static inline void zcrudp_ternary_mt_init(zcrudp_ternary_mt_pool_t *p,
         p->workers[t].sink.mtu_stride = mtu_stride;
         p->workers[t].sink.max_pkts = max_pkts_per_thread;
         if (t > 0) {
+            /* A worker that never started would never acknowledge a dispatch
+             * and the pool would hang: stop at the last thread that exists. */
 #if defined(_WIN32)
             p->workers[t].handle = CreateThread(NULL, 0, zcrudp_mt_worker_entry,
                                                 &p->workers[t], 0, NULL);
+            bool started = (p->workers[t].handle != NULL);
 #else
-            pthread_create(&p->workers[t].handle, NULL, zcrudp_mt_worker_entry,
-                           &p->workers[t]);
+            bool started = (pthread_create(&p->workers[t].handle, NULL,
+                                           zcrudp_mt_worker_entry,
+                                           &p->workers[t]) == 0);
 #endif
+            if (!started) {
+                p->num_threads = t;
+                break;
+            }
         }
     }
 }
@@ -269,6 +291,11 @@ static inline size_t zcrudp_ternary_mt_encode_plane(zcrudp_ternary_mt_pool_t *p,
                                                     uint16_t frame_id,
                                                     const zcrudp_ternary_config_t *cfg,
                                                     size_t *out_total_pkts) {
+    /* Workers packetize into a fixed per-thread scratch buffer. */
+    if (cfg->mtu_payload > sizeof(p->workers[0].pkt_scratch)) {
+        if (out_total_pkts) *out_total_pkts = 0;
+        return 0;
+    }
     p->src = src;
     p->ref_or_canvas = ref;
     p->delta_buf = delta_buf;

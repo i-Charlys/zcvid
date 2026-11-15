@@ -203,6 +203,36 @@ static inline void zcrudp_ternary_decay_plane(uint8_t * ZCRUDP_RESTRICT canvas,
 }
 
 /* =========================================================================
+ * DELTA_2X Sample Geometry
+ * ========================================================================= */
+
+/**
+ * @brief True when a plane stores two interleaved components (NV12 plane 1 is
+ *        U0 V0 U1 V1 ...). In DELTA_2X mode a trit then drives two samples of
+ *        the SAME component (U0+U1, V0+V1), never a U/V pair.
+ */
+static inline bool zcrudp_ternary_2x_interleaved(const zcrudp_ternary_config_t *cfg,
+                                                 uint8_t plane_id) {
+    return cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12 && plane_id == 1U;
+}
+
+/** Bytes covered by one 10-trit DELTA_2X block (10 trits x 2 samples). */
+#define ZCRUDP_TERNARY_2X_SPAN 20U
+
+/**
+ * Index of the sample coded by trit j of a DELTA_2X block starting at base.
+ * Planar: 0 2 4 ... 18. Interleaved: U0 V0 U2 V2 ... (0 1 4 5 8 9 ...).
+ */
+static inline size_t zcrudp_ternary_2x_idx(size_t base, size_t j, bool interleaved) {
+    return interleaved ? (base + 4U * (j >> 1) + (j & 1U)) : (base + 2U * j);
+}
+
+/** Distance from a coded sample to the sample that follows it in DELTA_2X. */
+static inline size_t zcrudp_ternary_2x_pair(bool interleaved) {
+    return interleaved ? 2U : 1U;
+}
+
+/* =========================================================================
  * Plane Encoder (MTU-Packetized with In-Band RLE Zero-Block Skip)
  * ========================================================================= */
 
@@ -463,7 +493,10 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
 
     size_t blk = hdr.start_block;
     const uint8_t *tok_ptr = pkt_data + ZCRUDP_TERNARY_PKT_HDR_SZ;
-    const size_t step_px = (ptype == ZCRUDP_TERNARY_PKT_DELTA_2X) ? 2U : 1U;
+    const bool is_2x = (ptype == ZCRUDP_TERNARY_PKT_DELTA_2X);
+    const bool il = is_2x && zcrudp_ternary_2x_interleaved(cfg, hdr.plane);
+    const size_t span = is_2x ? ZCRUDP_TERNARY_2X_SPAN : 10U;
+    const size_t pair = zcrudp_ternary_2x_pair(il);
 
     for (uint16_t t = 0; t < hdr.num_tokens; t++) {
         uint16_t tok = zcrudp_ternary_read_u16_le(tok_ptr + (size_t)t * 2U);
@@ -474,10 +507,10 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
 
         zcrudp_trit_t trits[10];
         zcrudp_unpack_10trits(tok, trits);
-        size_t base = blk * 10U * step_px;
+        size_t base = blk * span;
 
         for (size_t j = 0; j < 10U; j++) {
-            size_t idx = base + j * step_px;
+            size_t idx = is_2x ? zcrudp_ternary_2x_idx(base, j, il) : (base + j);
             if (idx >= plane_len) {
                 break;
             }
@@ -491,18 +524,18 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
                     delta_buf[idx] = zcrudp_adm_update_delta(
                         d, trits[j], cfg->delta_min, cfg->delta_max);
                 }
-                if (step_px == 2U && (idx + 1U) < plane_len) {
-                    canvas[idx + 1U] = canvas[idx];
+                if (is_2x && (idx + pair) < plane_len) {
+                    canvas[idx + pair] = canvas[idx];
                     if (delta_buf != NULL) {
-                        delta_buf[idx + 1U] = delta_buf[idx];
+                        delta_buf[idx + pair] = delta_buf[idx];
                     }
                 }
             } else if (delta_buf != NULL) {
                 delta_buf[idx] = zcrudp_adm_update_delta(
                     delta_buf[idx], 0, cfg->delta_min, cfg->delta_max);
-                if (step_px == 2U && (idx + 1U) < plane_len) {
-                    delta_buf[idx + 1U] = zcrudp_adm_update_delta(
-                        delta_buf[idx + 1U], 0, cfg->delta_min, cfg->delta_max);
+                if (is_2x && (idx + pair) < plane_len) {
+                    delta_buf[idx + pair] = zcrudp_adm_update_delta(
+                        delta_buf[idx + pair], 0, cfg->delta_min, cfg->delta_max);
                 }
             }
         }
@@ -570,6 +603,8 @@ static inline size_t zcrudp_ternary_encode_intra_range(const uint8_t * ZCRUDP_RE
 /**
  * @brief Encodes a plane in 2x horizontal subsampled delta mode (0.8 bpp max)
  *        for high-entropy / 3D rotation scenes exceeding the bitrate budget.
+ *        On the interleaved NV12 chroma plane (plane_id 1) each trit drives two
+ *        samples of the same component, see zcrudp_ternary_2x_interleaved().
  */
 static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * ZCRUDP_RESTRICT src,
                                                     uint8_t * ZCRUDP_RESTRICT ref,
@@ -584,7 +619,10 @@ static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * ZCRUDP_RESTR
     const size_t max_tokens = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
         ? ((size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ) / 2U)
         : 1U;
-    const size_t total_blocks = (len + 19U) / 20U;
+    const bool il = zcrudp_ternary_2x_interleaved(cfg, plane_id);
+    const size_t span = ZCRUDP_TERNARY_2X_SPAN;
+    const size_t pair = zcrudp_ternary_2x_pair(il);
+    const size_t total_blocks = (len + span - 1U) / span;
 
     size_t total_bytes = 0;
     uint32_t pkt_start_block = 0;
@@ -592,24 +630,24 @@ static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * ZCRUDP_RESTR
     uint32_t skip_run = 0;
 
     for (size_t blk = 0; blk < total_blocks; blk++) {
-        size_t base = blk * 20U;
+        size_t base = blk * span;
         zcrudp_trit_t trits[10] = { 0 };
         bool any_nonzero = false;
 
         for (size_t j = 0; j < 10U; j++) {
-            size_t idx = base + j * 2U;
+            size_t idx = zcrudp_ternary_2x_idx(base, j, il);
             if (idx >= len) break;
 
             uint8_t d = (delta_buf != NULL) ? delta_buf[idx] : cfg->delta_min;
             zcrudp_trit_t t = zcrudp_encode_step(src[idx], &ref[idx],
                                                  cfg->threshold, d,
                                                  cfg->gamma_q8, cfg->neutral_y);
-            if (idx + 1U < len) {
+            if (idx + pair < len) {
                 if (t != 0) {
-                    ref[idx + 1U] = ref[idx];
+                    ref[idx + pair] = ref[idx];
                 } else {
-                    ref[idx + 1U] = zcrudp_leaky_integrator_step(
-                        ref[idx + 1U], 0, 0, cfg->gamma_q8, cfg->neutral_y);
+                    ref[idx + pair] = zcrudp_leaky_integrator_step(
+                        ref[idx + pair], 0, 0, cfg->gamma_q8, cfg->neutral_y);
                 }
             }
             trits[j] = t;
@@ -618,16 +656,16 @@ static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * ZCRUDP_RESTR
 
         if (any_nonzero && delta_buf != NULL) {
             for (size_t j = 0; j < 10U; j++) {
-                size_t idx = base + j * 2U;
+                size_t idx = zcrudp_ternary_2x_idx(base, j, il);
                 if (idx >= len) break;
                 delta_buf[idx] = zcrudp_adm_update_delta(
                     delta_buf[idx], trits[j], cfg->delta_min, cfg->delta_max);
-                if (idx + 1U < len) {
+                if (idx + pair < len) {
                     if (trits[j] != 0) {
-                        delta_buf[idx + 1U] = delta_buf[idx];
+                        delta_buf[idx + pair] = delta_buf[idx];
                     } else {
-                        delta_buf[idx + 1U] = zcrudp_adm_update_delta(
-                            delta_buf[idx + 1U], 0, cfg->delta_min, cfg->delta_max);
+                        delta_buf[idx + pair] = zcrudp_adm_update_delta(
+                            delta_buf[idx + pair], 0, cfg->delta_min, cfg->delta_max);
                     }
                 }
             }
@@ -831,7 +869,15 @@ static inline void zcrudp_ternary_estimate_gmc(const uint8_t * ZCRUDP_RESTRICT s
     int8_t best_dx = 0;
     int8_t best_dy = 0;
 
-    /* Evaluate (0, 0) first with slight bias to avoid unnecessary shifts */
+    /* Planes too small to hold a single sample row/column inside the search
+     * margin would compare nothing and report the first candidate. */
+    if (search_r < 0 || (int)width <= 2 * margin || (int)height <= 2 * margin) {
+        *out_dx = 0;
+        *out_dy = 0;
+        return;
+    }
+
+    /* Coarse step-2 search; (0, 0) gets a slight bias to avoid needless shifts */
     for (int dy = -search_r; dy <= search_r; dy += 2) {
         for (int dx = -search_r; dx <= search_r; dx += 2) {
             uint32_t sad = 0;
@@ -898,6 +944,9 @@ static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRI
                                                    uint16_t tile_sz,
                                                    int8_t search_r,
                                                    int8_t *out_mvs) {
+    if (tile_sz == 0U || search_r < 0) {
+        return;
+    }
     const uint16_t tx_cnt = (uint16_t)((width + tile_sz - 1U) / tile_sz);
     const uint16_t ty_cnt = (uint16_t)((height + tile_sz - 1U) / tile_sz);
 
@@ -1016,6 +1065,9 @@ static inline void zcrudp_ternary_apply_tile_mv(const uint8_t * ZCRUDP_RESTRICT 
                                                 uint16_t height,
                                                 uint16_t tile_sz,
                                                 const int8_t *mvs) {
+    if (tile_sz == 0U) {
+        return;
+    }
     const uint16_t tx_cnt = (uint16_t)((width + tile_sz - 1U) / tile_sz);
     const uint16_t ty_cnt = (uint16_t)((height + tile_sz - 1U) / tile_sz);
 
@@ -1145,7 +1197,7 @@ static inline size_t zcrudp_ternary_encode_nv12_rc(const uint8_t * ZCRUDP_RESTRI
 
 /**
  * @brief Disocclusion-aware Intra repair: scans a plane in 64-byte chunks and
- *        emits ZCRUDP_TERNARY_PKT_INTRA for any chunk where >= 8 pixels have
+ *        emits ZCRUDP_TERNARY_PKT_INTRA for any chunk where >= 2 pixels have
  *        |src - ref| > err_thresh (e.g. uncovered background or scene cut).
  *        Eliminates multi-frame ADM ramp-up ghosting, pushing 3D PSNR to 35-42+ dB.
  */

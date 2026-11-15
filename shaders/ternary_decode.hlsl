@@ -27,32 +27,64 @@ int LeakyDecay(int prev_val, int neutral) {
     return clamp(neutral + (diff * (int)gamma_q8) / 256, 0, 255);
 }
 
+// Motion-compensated reference word of a pixel (previous frame, tile MV applied).
+uint PrevShifted(uint idx) {
+    uint py = idx / width;
+    uint px = idx - py * width;
+    int2 mv = g_tile_mvs[(py >> 5) * tiles_x + (px >> 5)];
+    int sx = clamp((int)px - mv.x, 0, (int)width - 1);
+    int sy = clamp((int)py - mv.y, 0, (int)height - 1);
+    return g_prev_yuvd[(uint)sy * width + (uint)sx];
+}
+
+int StepOf(uint ref_w) {
+    return max((int)delta_min, (int)((ref_w >> 24) & 0xFFu));
+}
+
 // =========================================================================
 // Pass 1: Motion-Compensated Copy + Leaky Decay (1 thread per pixel)
+// This is the "all trits are zero" reconstruction, so the adaptive step is
+// halved here; CSApply overrides it where a non-zero luma trit arrives.
 // =========================================================================
 [numthreads(16, 16, 1)]
 void CSMotionDecay(uint3 dtid : SV_DispatchThreadID) {
     if (dtid.x >= width || dtid.y >= height) return;
 
-    uint tx = dtid.x >> 5;
-    uint ty = dtid.y >> 5;
-    int2 mv = g_tile_mvs[ty * tiles_x + tx];
-    int sx = clamp((int)dtid.x - mv.x, 0, (int)width - 1);
-    int sy = clamp((int)dtid.y - mv.y, 0, (int)height - 1);
-
-    uint w = g_prev_yuvd[(uint)sy * width + (uint)sx];
+    uint idx = dtid.y * width + dtid.x;
+    uint w = PrevShifted(idx);
     int y  = LeakyDecay((int)(w & 0xFFu), (int)neutral_y);
     int cb = LeakyDecay((int)((w >> 8) & 0xFFu), 128);
     int cr = LeakyDecay((int)((w >> 16) & 0xFFu), 128);
-    uint d = (w >> 24) & 0xFFu;
-    if (d < delta_min) d = delta_min;
+    uint d = (uint)max((int)delta_min, StepOf(w) >> 1);
 
-    g_cur_yuvd[dtid.y * width + dtid.x] = (uint)y | ((uint)cb << 8) | ((uint)cr << 16) | (d << 24);
+    g_cur_yuvd[idx] = (uint)y | ((uint)cb << 8) | ((uint)cr << 16) | (d << 24);
 }
 
 // =========================================================================
 // Pass 2: Apply Delta (Y/Cb/Cr) & Intra Records
+// Values are rebuilt from the read-only previous frame, never from
+// g_cur_yuvd, so a duplicated record is idempotent and threads working on
+// different planes of the same pixel only touch their own bytes.
 // =========================================================================
+void ApplyTrit(uint idx, int t, int d_used, uint tag) {
+    // No early return: the caller's loop must stay unrollable by fxc.
+    if (t != 0 && idx < width * height) {
+        uint shift = tag * 8u;
+        int neutral = (tag == 0u) ? (int)neutral_y : 128;
+        int prev = (int)((PrevShifted(idx) >> shift) & 0xFFu);
+        int v = clamp(LeakyDecay(prev, neutral) + t * d_used, 0, 255);
+
+        uint clear_mask = ~(0xFFu << shift);
+        uint set_bits = (uint)v << shift;
+        if (tag == 0u) {
+            clear_mask &= 0x00FFFFFFu;
+            set_bits |= (uint)min((int)delta_max, d_used << 1) << 24;
+        }
+        InterlockedAnd(g_cur_yuvd[idx], clear_mask);
+        InterlockedOr(g_cur_yuvd[idx], set_bits);
+    }
+}
+
 [numthreads(64, 1, 1)]
 void CSApply(uint3 dtid : SV_DispatchThreadID) {
     uint rec_idx = dtid.x * 2u;
@@ -63,76 +95,38 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
     uint tag   = (w0 >> 30) & 3u;
     uint is_2x = (w0 >> 29) & 1u;
     uint id    = w0 & 0x1FFFFFFFu;
+    uint num_px = width * height;
 
     if (tag == 3u) {
         // 2-pixel 4:2:2 Intra pair: [Y0 | Cb<<8 | Y1<<16 | Cr<<24]
-        uint y0  = w1 & 0xFFu;
-        uint cb0 = (w1 >> 8) & 0xFFu;
-        uint y1  = (w1 >> 16) & 0xFFu;
-        uint cr0 = (w1 >> 24) & 0xFFu;
-        if (id < width * height) {
-            g_cur_yuvd[id] = y0 | (cb0 << 8) | (cr0 << 16) | (delta_min << 24);
-        }
-        if (id + 1u < width * height) {
-            g_cur_yuvd[id + 1u] = y1 | (cb0 << 8) | (cr0 << 16) | (delta_min << 24);
-        }
+        uint y0 = w1 & 0xFFu;
+        uint cb = (w1 >> 8) & 0xFFu;
+        uint y1 = (w1 >> 16) & 0xFFu;
+        uint cr = (w1 >> 24) & 0xFFu;
+        uint chroma_d = (cb << 8) | (cr << 16) | (delta_min << 24);
+        if (id < num_px) g_cur_yuvd[id] = y0 | chroma_d;
+        if (id + 1u < num_px) g_cur_yuvd[id + 1u] = y1 | chroma_d;
         return;
     }
 
-    // Delta 10-trit block on plane = tag (0=Y, 1=Cb, 2=Cr)
-    uint step_px = (is_2x != 0u) ? 2u : 1u;
-    uint base_px = id * 10u * step_px;
-    uint lo = w1 % 243u;
-    uint hi = w1 / 243u;
-    uint shift = tag * 8u;
-    uint mask = ~(0xFFu << shift);
+    // Corrupt word (>= 3^10) or block index past the frame: ignore the record.
+    uint px_per_blk = (is_2x != 0u) ? 20u : 10u;
+    if (w1 >= 59049u || id >= (num_px + px_per_blk - 1u) / px_per_blk) return;
+
+    uint base_px = id * px_per_blk;
+    uint rem = w1;
 
     [unroll]
-    for (uint j = 0; j < 5u; j++) {
-        int t0 = (int)(lo % 3u) - 1; lo /= 3u;
-        int t1 = (int)(hi % 3u) - 1; hi /= 3u;
+    for (uint j = 0; j < 10u; j++) {
+        int t = (int)(rem % 3u) - 1;
+        rem /= 3u;
 
-        uint idx0 = base_px + j * step_px;
-        if (idx0 < width * height) {
-            // Read delta from read-only g_prev_yuvd to avoid race with tag==0 updating delta
-            int d0 = (int)((g_prev_yuvd[idx0] >> 24) & 0xFFu);
-            if (d0 < (int)delta_min) d0 = (int)delta_min;
-            if (t0 != 0) {
-                uint cur_w = g_cur_yuvd[idx0];
-                int v0 = clamp((int)((cur_w >> shift) & 0xFFu) + t0 * d0, 0, 255);
-                InterlockedAnd(g_cur_yuvd[idx0], mask);
-                InterlockedOr(g_cur_yuvd[idx0], (uint)v0 << shift);
-                if (is_2x != 0u && idx0 + 1u < width * height) {
-                    InterlockedAnd(g_cur_yuvd[idx0 + 1u], mask);
-                    InterlockedOr(g_cur_yuvd[idx0 + 1u], (uint)v0 << shift);
-                }
-            }
-            if (tag == 0u) {
-                int nd0 = (t0 == 0) ? max((int)delta_min, d0 >> 1) : min((int)delta_max, d0 << 1);
-                InterlockedAnd(g_cur_yuvd[idx0], 0x00FFFFFFu);
-                InterlockedOr(g_cur_yuvd[idx0], (uint)nd0 << 24);
-            }
-        }
-
-        uint idx1 = base_px + (5u + j) * step_px;
-        if (idx1 < width * height) {
-            int d1 = (int)((g_prev_yuvd[idx1] >> 24) & 0xFFu);
-            if (d1 < (int)delta_min) d1 = (int)delta_min;
-            if (t1 != 0) {
-                uint cur_w = g_cur_yuvd[idx1];
-                int v1 = clamp((int)((cur_w >> shift) & 0xFFu) + t1 * d1, 0, 255);
-                InterlockedAnd(g_cur_yuvd[idx1], mask);
-                InterlockedOr(g_cur_yuvd[idx1], (uint)v1 << shift);
-                if (is_2x != 0u && idx1 + 1u < width * height) {
-                    InterlockedAnd(g_cur_yuvd[idx1 + 1u], mask);
-                    InterlockedOr(g_cur_yuvd[idx1 + 1u], (uint)v1 << shift);
-                }
-            }
-            if (tag == 0u) {
-                int nd1 = (t1 == 0) ? max((int)delta_min, d1 >> 1) : min((int)delta_max, d1 << 1);
-                InterlockedAnd(g_cur_yuvd[idx1], 0x00FFFFFFu);
-                InterlockedOr(g_cur_yuvd[idx1], (uint)nd1 << 24);
-            }
+        // 2x: one trit drives the pair (idx, idx + 1) with the step of idx.
+        uint idx = base_px + j * ((is_2x != 0u) ? 2u : 1u);
+        if (t != 0 && idx < num_px) {
+            int d = StepOf(PrevShifted(idx));
+            ApplyTrit(idx, t, d, tag);
+            if (is_2x != 0u) ApplyTrit(idx + 1u, t, d, tag);
         }
     }
 }

@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Tests and benchmark (GCC, -O3 -mavx2)
+      run: make clean && make CC=gcc test
+
+    - name: Tests under ASan + UBSan (scalar path)
+      run: make clean && make CC=gcc sanitize
+
+    - name: Tests (Clang, -O3 -mavx2)
+      run: make clean && make CC=clang test
