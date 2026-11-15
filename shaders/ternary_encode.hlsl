@@ -21,8 +21,8 @@ cbuffer TernaryParams : register(b0) {
     uint tiles_x;        // ceil(width / 32)
     uint tiles_y;        // ceil(height / 32)
     uint search_r;       // e.g. 6
-    uint pad0;
-    uint pad1;
+    uint max_record_words; // Rate-control cap in uint32 words (0 = unlimited)
+    uint mode_flags;     // bit 0 = DELTA_2X mode (20 px per 10-trit block)
 };
 
 Texture2D<unorm float4>   g_src_rgba    : register(t0);
@@ -137,9 +137,12 @@ void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 [numthreads(64, 1, 1)]
 void CSEncode(uint3 dtid : SV_DispatchThreadID) {
     uint blk = dtid.x;
-    if (blk >= total_blocks) return;
+    uint is_2x = mode_flags & 1u;
+    uint eff_blocks = (is_2x != 0u) ? ((total_blocks + 1u) >> 1) : total_blocks;
+    if (blk >= eff_blocks) return;
 
-    uint base_px = blk * 10u;
+    uint step_px = (is_2x != 0u) ? 2u : 1u;
+    uint base_px = blk * 10u * step_px;
     uint packed_y  = 0;
     uint packed_cb = 0;
     uint packed_cr = 0;
@@ -152,9 +155,13 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
     uint intra_y0 = intra_slot * rows_per_slot;
     uint intra_y1 = intra_y0 + rows_per_slot;
 
+    uint cur_words = g_out_counter.Load(0);
+    bool allow_disocc = (max_record_words == 0u) || (cur_words < (max_record_words >> 1));
+    bool allow_chroma = (max_record_words == 0u) || (cur_words < max_record_words);
+
     [unroll]
     for (uint j = 0; j < 10u; j++) {
-        uint idx = base_px + j;
+        uint idx = base_px + j * step_px;
         if (idx >= width * height) {
             packed_y  += 1u * POW3[j];
             packed_cb += 1u * POW3[j];
@@ -164,7 +171,6 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
         uint py = idx / width;
         uint px = idx - py * width;
 
-        // Fetch motion-compensated reference from g_ref_yuvd
         uint tx = px >> 5;
         uint ty = py >> 5;
         int2 mv = g_tile_mvs[ty * tiles_x + tx];
@@ -182,16 +188,25 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
         int cy, ccb, ccr;
         RgbToYCbCr(src_c.rgb, cy, ccb, ccr);
 
-        bool force_intra = (py >= intra_y0 && py < intra_y1) ||
-                           (abs(cy - ry) > (int)intra_err_thr);
+        bool in_rolling_intra = (py >= intra_y0 && py < intra_y1);
+        bool in_disocc = allow_disocc && (abs(cy - ry) > (int)intra_err_thr);
 
-        if (force_intra) {
-            // Emit exact Intra pixel record & reset ref
-            uint slot = 0;
-            g_out_counter.InterlockedAdd(0, 2u, slot);
-            g_out_records[slot + 0u] = 0xC0000000u | (idx & 0x3FFFFFFFu);
-            g_out_records[slot + 1u] = (uint)cy | ((uint)ccb << 8) | ((uint)ccr << 16);
+        if (in_rolling_intra || in_disocc) {
+            // Emit 2-pixel 4:2:2 Intra pair (4 bytes/px instead of 8 bytes/px)
+            if ((idx & 1u) == 0u || is_2x != 0u) {
+                uint idx_next = min(idx + 1u, width * height - 1u);
+                uint py1 = idx_next / width;
+                uint px1 = idx_next - py1 * width;
+                float4 src_c1 = g_src_rgba.Load(int3(px1, py1, 0));
+                int cy1, ccb1, ccr1;
+                RgbToYCbCr(src_c1.rgb, cy1, ccb1, ccr1);
 
+                uint slot = 0;
+                g_out_counter.InterlockedAdd(0, 2u, slot);
+                g_out_records[slot + 0u] = 0xC0000000u | (idx & 0x1FFFFFFFu);
+                g_out_records[slot + 1u] = (uint)cy | ((uint)ccb << 8) | ((uint)cy1 << 16) | ((uint)ccr << 24);
+                g_cur_yuvd[idx_next] = (uint)cy1 | ((uint)ccb << 8) | ((uint)ccr << 16) | (delta_min << 24);
+            }
             g_cur_yuvd[idx] = (uint)cy | ((uint)ccb << 8) | ((uint)ccr << 16) | (delta_min << 24);
             packed_y  += 1u * POW3[j];
             packed_cb += 1u * POW3[j];
@@ -202,10 +217,9 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
             int ecr = ccr - rcr;
 
             int ty_val  = (ey  > (int)threshold) ? 1 : ((ey  < -(int)threshold) ? -1 : 0);
-            // Chroma uses slightly wider deadzone (threshold + 2) for Luma-first bitrate priority
             int c_thr   = (int)threshold + 2;
-            int tcb_val = (ecb > c_thr) ? 1 : ((ecb < -c_thr) ? -1 : 0);
-            int tcr_val = (ecr > c_thr) ? 1 : ((ecr < -c_thr) ? -1 : 0);
+            int tcb_val = allow_chroma ? ((ecb > c_thr) ? 1 : ((ecb < -c_thr) ? -1 : 0)) : 0;
+            int tcr_val = allow_chroma ? ((ecr > c_thr) ? 1 : ((ecr < -c_thr) ? -1 : 0)) : 0;
 
             if (ty_val  != 0) nz_y  = true;
             if (tcb_val != 0) nz_cb = true;
@@ -215,11 +229,14 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
             int ncb = LeakyStep(rcb, tcb_val, d, 128);
             int ncr = LeakyStep(rcr, tcr_val, d, 128);
 
-            // Jayant ADM update on Luma trit
             int next_d = (ty_val == 0) ? max((int)delta_min, d >> 1)
                                        : min((int)delta_max, d << 1);
 
-            g_cur_yuvd[idx] = (uint)ny | ((uint)ncb << 8) | ((uint)ncr << 16) | ((uint)next_d << 24);
+            uint yuvd_val = (uint)ny | ((uint)ncb << 8) | ((uint)ncr << 16) | ((uint)next_d << 24);
+            g_cur_yuvd[idx] = yuvd_val;
+            if (is_2x != 0u && idx + 1u < width * height) {
+                g_cur_yuvd[idx + 1u] = yuvd_val;
+            }
 
             packed_y  += (uint)(ty_val  + 1) * POW3[j];
             packed_cb += (uint)(tcb_val + 1) * POW3[j];
@@ -227,22 +244,23 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
         }
     }
 
+    uint hdr_base = (is_2x << 29) | (blk & 0x1FFFFFFFu);
     if (nz_y) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (0u << 30) | (blk & 0x3FFFFFFFu);
+        g_out_records[slot + 0u] = (0u << 30) | hdr_base;
         g_out_records[slot + 1u] = packed_y;
     }
-    if (nz_cb) {
+    if (nz_cb && allow_chroma) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (1u << 30) | (blk & 0x3FFFFFFFu);
+        g_out_records[slot + 0u] = (1u << 30) | hdr_base;
         g_out_records[slot + 1u] = packed_cb;
     }
-    if (nz_cr) {
+    if (nz_cr && allow_chroma) {
         uint slot = 0;
         g_out_counter.InterlockedAdd(0, 2u, slot);
-        g_out_records[slot + 0u] = (2u << 30) | (blk & 0x3FFFFFFFu);
+        g_out_records[slot + 0u] = (2u << 30) | hdr_base;
         g_out_records[slot + 1u] = packed_cr;
     }
 }

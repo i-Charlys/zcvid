@@ -60,19 +60,28 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
 
     uint w0 = g_in_records[rec_idx + 0u];
     uint w1 = g_in_records[rec_idx + 1u];
-    uint tag = (w0 >> 30) & 3u;
-    uint id  = w0 & 0x3FFFFFFFu;
+    uint tag   = (w0 >> 30) & 3u;
+    uint is_2x = (w0 >> 29) & 1u;
+    uint id    = w0 & 0x1FFFFFFFu;
 
     if (tag == 3u) {
-        // Intra pixel anchor
+        // 2-pixel 4:2:2 Intra pair: [Y0 | Cb<<8 | Y1<<16 | Cr<<24]
+        uint y0  = w1 & 0xFFu;
+        uint cb0 = (w1 >> 8) & 0xFFu;
+        uint y1  = (w1 >> 16) & 0xFFu;
+        uint cr0 = (w1 >> 24) & 0xFFu;
         if (id < width * height) {
-            g_cur_yuvd[id] = (w1 & 0x00FFFFFFu) | (delta_min << 24);
+            g_cur_yuvd[id] = y0 | (cb0 << 8) | (cr0 << 16) | (delta_min << 24);
+        }
+        if (id + 1u < width * height) {
+            g_cur_yuvd[id + 1u] = y1 | (cb0 << 8) | (cr0 << 16) | (delta_min << 24);
         }
         return;
     }
 
     // Delta 10-trit block on plane = tag (0=Y, 1=Cb, 2=Cr)
-    uint base_px = id * 10u;
+    uint step_px = (is_2x != 0u) ? 2u : 1u;
+    uint base_px = id * 10u * step_px;
     uint lo = w1 % 243u;
     uint hi = w1 / 243u;
     uint shift = tag * 8u;
@@ -83,14 +92,20 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
         int t0 = (int)(lo % 3u) - 1; lo /= 3u;
         int t1 = (int)(hi % 3u) - 1; hi /= 3u;
 
-        uint idx0 = base_px + j;
+        uint idx0 = base_px + j * step_px;
         if (idx0 < width * height) {
-            uint cur_w = g_cur_yuvd[idx0];
-            int d0 = (int)((cur_w >> 24) & 0xFFu);
+            // Read delta from read-only g_prev_yuvd to avoid race with tag==0 updating delta
+            int d0 = (int)((g_prev_yuvd[idx0] >> 24) & 0xFFu);
+            if (d0 < (int)delta_min) d0 = (int)delta_min;
             if (t0 != 0) {
+                uint cur_w = g_cur_yuvd[idx0];
                 int v0 = clamp((int)((cur_w >> shift) & 0xFFu) + t0 * d0, 0, 255);
                 InterlockedAnd(g_cur_yuvd[idx0], mask);
                 InterlockedOr(g_cur_yuvd[idx0], (uint)v0 << shift);
+                if (is_2x != 0u && idx0 + 1u < width * height) {
+                    InterlockedAnd(g_cur_yuvd[idx0 + 1u], mask);
+                    InterlockedOr(g_cur_yuvd[idx0 + 1u], (uint)v0 << shift);
+                }
             }
             if (tag == 0u) {
                 int nd0 = (t0 == 0) ? max((int)delta_min, d0 >> 1) : min((int)delta_max, d0 << 1);
@@ -99,14 +114,19 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
             }
         }
 
-        uint idx1 = base_px + 5u + j;
+        uint idx1 = base_px + (5u + j) * step_px;
         if (idx1 < width * height) {
-            uint cur_w = g_cur_yuvd[idx1];
-            int d1 = (int)((cur_w >> 24) & 0xFFu);
+            int d1 = (int)((g_prev_yuvd[idx1] >> 24) & 0xFFu);
+            if (d1 < (int)delta_min) d1 = (int)delta_min;
             if (t1 != 0) {
+                uint cur_w = g_cur_yuvd[idx1];
                 int v1 = clamp((int)((cur_w >> shift) & 0xFFu) + t1 * d1, 0, 255);
                 InterlockedAnd(g_cur_yuvd[idx1], mask);
                 InterlockedOr(g_cur_yuvd[idx1], (uint)v1 << shift);
+                if (is_2x != 0u && idx1 + 1u < width * height) {
+                    InterlockedAnd(g_cur_yuvd[idx1 + 1u], mask);
+                    InterlockedOr(g_cur_yuvd[idx1 + 1u], (uint)v1 << shift);
+                }
             }
             if (tag == 0u) {
                 int nd1 = (t1 == 0) ? max((int)delta_min, d1 >> 1) : min((int)delta_max, d1 << 1);

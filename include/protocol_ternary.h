@@ -14,6 +14,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifndef ZCRUDP_RESTRICT
+#ifdef __cplusplus
+#if defined(__GNUC__) || defined(__clang__)
+#define ZCRUDP_RESTRICT __restrict__
+#elif defined(_MSC_VER)
+#define ZCRUDP_RESTRICT __restrict
+#else
+#define ZCRUDP_RESTRICT
+#endif
+#else
+#define ZCRUDP_RESTRICT restrict
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -308,8 +322,8 @@ static inline uint8_t zcrudp_leaky_integrator_step(uint8_t prev_y,
  *
  * Uses restrict pointers so C11 compilers can auto-vectorize the loop.
  */
-static inline void zcrudp_leaky_integrator_batch(uint8_t * restrict canvas,
-                                                 const zcrudp_trit_t * restrict trits,
+static inline void zcrudp_leaky_integrator_batch(uint8_t * ZCRUDP_RESTRICT canvas,
+                                                 const zcrudp_trit_t * ZCRUDP_RESTRICT trits,
                                                  size_t count,
                                                  uint8_t delta,
                                                  uint8_t gamma_q8,

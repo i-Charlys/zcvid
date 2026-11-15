@@ -37,6 +37,10 @@ sanitize: tests/test_ternary_packing.c tests/test_ternary_codec.c include/protoc
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_ternary_codec_san$(EXE),./tests/test_ternary_codec_san$(EXE)))
 
 clean:
-	$(RM) $(subst /,\,$(TARGET_PACKING)) $(subst /,\,$(TARGET_CODEC)) tests/test_ternary_packing_san$(EXE) tests/test_ternary_codec_san$(EXE)
+ifeq ($(OS),Windows_NT)
+	@for %%f in ($(subst /,\,$(TARGET_PACKING) $(TARGET_CODEC) tests/test_ternary_packing_san.exe tests/test_ternary_codec_san.exe)) do @if exist "%%f" del /Q /F "%%f"
+else
+	$(RM) $(TARGET_PACKING) $(TARGET_CODEC) tests/test_ternary_packing_san tests/test_ternary_codec_san
+endif
 
 .PHONY: all test sanitize clean
