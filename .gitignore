@@ -1,5 +1,7 @@
 tests/test_ternary_packing
 tests/test_ternary_packing_san
+tests/test_ternary_codec
+tests/test_ternary_codec_san
 *.exe
 *.o
 *.so
