@@ -32,6 +32,15 @@ extern "C" {
 #define ZCRUDP_TERNARY_PKT_HDR_SZ  12U      /**< Wire size of zcrudp_ternary_pkt_hdr_t */
 #define ZCRUDP_TERNARY_MAX_SKIP    (65536U - ZCRUDP_TRIT_MAX_10P) /**< 6487 blocks */
 
+/** Packet sub-types packed into upper nibble of hdr.pixfmt (lower nibble = pixfmt) */
+#define ZCRUDP_TERNARY_PKT_DELTA    0U  /**< Standard 10-trit delta + RLE skip */
+#define ZCRUDP_TERNARY_PKT_INTRA    1U  /**< Raw 8-bit anchor slice (zero-drift Intra-Refresh) */
+#define ZCRUDP_TERNARY_PKT_DELTA_2X 2U  /**< 2x horizontal subsampled 10-trit delta (0.8 bpp) */
+
+#define ZCRUDP_TERNARY_HDR_FMT(h)   ((uint8_t)((h)->pixfmt & 0x0FU))
+#define ZCRUDP_TERNARY_HDR_TYPE(h)  ((uint8_t)(((h)->pixfmt >> 4) & 0x0FU))
+#define ZCRUDP_TERNARY_MAKE_PF(fmt, ptype) ((uint8_t)(((uint8_t)(fmt) & 0x0FU) | (((uint8_t)(ptype) & 0x0FU) << 4)))
+
 typedef enum {
     ZCRUDP_TERNARY_FMT_GRAY8 = 0, /**< 8-bit Luma only (W * H bytes) */
     ZCRUDP_TERNARY_FMT_NV12  = 1, /**< Y plane (W * H) + interleaved UV plane (W * H / 2) */
@@ -273,12 +282,17 @@ static inline size_t zcrudp_ternary_encode_plane_range(const uint8_t * restrict 
             zcrudp_trit_t t = zcrudp_encode_step(src[idx], &ref[idx],
                                                  cfg->threshold, d,
                                                  cfg->gamma_q8, cfg->neutral_y);
-            if (delta_buf != NULL) {
-                delta_buf[idx] = zcrudp_adm_update_delta(d, t, cfg->delta_min, cfg->delta_max);
-            }
             trits[j] = t;
             if (t != 0) {
                 any_nonzero = true;
+            }
+        }
+
+        if (any_nonzero && delta_buf != NULL) {
+            for (size_t j = 0; j < 10U && (base + j) < len; j++) {
+                size_t idx = base + j;
+                delta_buf[idx] = zcrudp_adm_update_delta(
+                    delta_buf[idx], trits[j], cfg->delta_min, cfg->delta_max);
             }
         }
 
@@ -420,15 +434,35 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
     if (!zcrudp_ternary_pkt_hdr_read_le(pkt_data, &hdr)) {
         return false;
     }
-    if (pkt_len < ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)hdr.num_tokens * 2U) {
-        return false;
-    }
+    uint8_t ptype = ZCRUDP_TERNARY_HDR_TYPE(&hdr);
     if (out_hdr != NULL) {
         *out_hdr = hdr;
     }
 
+    if (ptype == ZCRUDP_TERNARY_PKT_INTRA) {
+        /* num_tokens = byte length of raw anchor slice; start_block = byte offset */
+        size_t byte_off = (size_t)hdr.start_block;
+        size_t byte_len = (size_t)hdr.num_tokens;
+        if (pkt_len < ZCRUDP_TERNARY_PKT_HDR_SZ + byte_len || byte_off >= plane_len) {
+            return false;
+        }
+        if (byte_off + byte_len > plane_len) {
+            byte_len = plane_len - byte_off;
+        }
+        memcpy(canvas + byte_off, pkt_data + ZCRUDP_TERNARY_PKT_HDR_SZ, byte_len);
+        if (delta_buf != NULL) {
+            memset(delta_buf + byte_off, cfg->delta_min, byte_len);
+        }
+        return true;
+    }
+
+    if (pkt_len < ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)hdr.num_tokens * 2U) {
+        return false;
+    }
+
     size_t blk = hdr.start_block;
     const uint8_t *tok_ptr = pkt_data + ZCRUDP_TERNARY_PKT_HDR_SZ;
+    const size_t step_px = (ptype == ZCRUDP_TERNARY_PKT_DELTA_2X) ? 2U : 1U;
 
     for (uint16_t t = 0; t < hdr.num_tokens; t++) {
         uint16_t tok = zcrudp_ternary_read_u16_le(tok_ptr + (size_t)t * 2U);
@@ -439,10 +473,10 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
 
         zcrudp_trit_t trits[10];
         zcrudp_unpack_10trits(tok, trits);
-        size_t base = blk * 10U;
+        size_t base = blk * 10U * step_px;
 
         for (size_t j = 0; j < 10U; j++) {
-            size_t idx = base + j;
+            size_t idx = base + j * step_px;
             if (idx >= plane_len) {
                 break;
             }
@@ -456,15 +490,229 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
                     delta_buf[idx] = zcrudp_adm_update_delta(
                         d, trits[j], cfg->delta_min, cfg->delta_max);
                 }
+                if (step_px == 2U && (idx + 1U) < plane_len) {
+                    canvas[idx + 1U] = canvas[idx];
+                    if (delta_buf != NULL) {
+                        delta_buf[idx + 1U] = delta_buf[idx];
+                    }
+                }
             } else if (delta_buf != NULL) {
                 delta_buf[idx] = zcrudp_adm_update_delta(
                     delta_buf[idx], 0, cfg->delta_min, cfg->delta_max);
+                if (step_px == 2U && (idx + 1U) < plane_len) {
+                    delta_buf[idx + 1U] = zcrudp_adm_update_delta(
+                        delta_buf[idx + 1U], 0, cfg->delta_min, cfg->delta_max);
+                }
             }
         }
         blk++;
     }
 
     return true;
+}
+
+/* =========================================================================
+ * Rolling Intra-Refresh (Zero-Drift Anchor Slices) & 2x High-Motion Mode
+ * ========================================================================= */
+
+/**
+ * @brief Emits raw 8-bit anchor packets for byte range [byte_begin, byte_end)
+ *        of a plane, resetting encoder ref & delta_buf to exact source values.
+ *        Eliminates HUD/text wash-out and bounds worst-case drift to N frames.
+ */
+static inline size_t zcrudp_ternary_encode_intra_range(const uint8_t * restrict src,
+                                                       uint8_t * restrict ref,
+                                                       uint8_t * restrict delta_buf,
+                                                       size_t byte_begin,
+                                                       size_t byte_end,
+                                                       size_t plane_len,
+                                                       uint8_t plane_id,
+                                                       uint16_t frame_id,
+                                                       const zcrudp_ternary_config_t *cfg,
+                                                       uint8_t *pkt_buf,
+                                                       zcrudp_ternary_pkt_cb cb,
+                                                       void *user_ctx) {
+    if (byte_end > plane_len) byte_end = plane_len;
+    if (byte_begin >= byte_end) return 0;
+
+    const size_t max_payload = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
+        ? (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ)
+        : 64U;
+
+    size_t total_bytes = 0;
+    for (size_t off = byte_begin; off < byte_end; off += max_payload) {
+        size_t chunk = byte_end - off;
+        if (chunk > max_payload) chunk = max_payload;
+
+        memcpy(ref + off, src + off, chunk);
+        if (delta_buf != NULL) {
+            memset(delta_buf + off, cfg->delta_min, chunk);
+        }
+
+        zcrudp_ternary_pkt_hdr_t hdr = {
+            .magic = ZCRUDP_TERNARY_PKT_MAGIC,
+            .pixfmt = ZCRUDP_TERNARY_MAKE_PF(cfg->pixfmt, ZCRUDP_TERNARY_PKT_INTRA),
+            .plane = plane_id,
+            .frame_id = frame_id,
+            .start_block = (uint32_t)off,
+            .num_tokens = (uint16_t)chunk
+        };
+        zcrudp_ternary_pkt_hdr_write_le(pkt_buf, &hdr);
+        memcpy(pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, src + off, chunk);
+        size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + chunk;
+        cb(pkt_buf, psz, user_ctx);
+        total_bytes += psz;
+    }
+    return total_bytes;
+}
+
+/**
+ * @brief Encodes a plane in 2x horizontal subsampled delta mode (0.8 bpp max)
+ *        for high-entropy / 3D rotation scenes exceeding the bitrate budget.
+ */
+static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * restrict src,
+                                                    uint8_t * restrict ref,
+                                                    uint8_t * restrict delta_buf,
+                                                    size_t len,
+                                                    uint8_t plane_id,
+                                                    uint16_t frame_id,
+                                                    const zcrudp_ternary_config_t *cfg,
+                                                    uint8_t *pkt_buf,
+                                                    zcrudp_ternary_pkt_cb cb,
+                                                    void *user_ctx) {
+    const size_t max_tokens = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
+        ? ((size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ) / 2U)
+        : 1U;
+    const size_t total_blocks = (len + 19U) / 20U;
+
+    size_t total_bytes = 0;
+    uint32_t pkt_start_block = 0;
+    uint16_t pkt_tokens = 0;
+    uint32_t skip_run = 0;
+
+    for (size_t blk = 0; blk < total_blocks; blk++) {
+        size_t base = blk * 20U;
+        zcrudp_trit_t trits[10] = { 0 };
+        bool any_nonzero = false;
+
+        for (size_t j = 0; j < 10U; j++) {
+            size_t idx = base + j * 2U;
+            if (idx >= len) break;
+
+            uint8_t d = (delta_buf != NULL) ? delta_buf[idx] : cfg->delta_min;
+            zcrudp_trit_t t = zcrudp_encode_step(src[idx], &ref[idx],
+                                                 cfg->threshold, d,
+                                                 cfg->gamma_q8, cfg->neutral_y);
+            if (idx + 1U < len) {
+                if (t != 0) {
+                    ref[idx + 1U] = ref[idx];
+                } else {
+                    ref[idx + 1U] = zcrudp_leaky_integrator_step(
+                        ref[idx + 1U], 0, 0, cfg->gamma_q8, cfg->neutral_y);
+                }
+            }
+            trits[j] = t;
+            if (t != 0) any_nonzero = true;
+        }
+
+        if (any_nonzero && delta_buf != NULL) {
+            for (size_t j = 0; j < 10U; j++) {
+                size_t idx = base + j * 2U;
+                if (idx >= len) break;
+                delta_buf[idx] = zcrudp_adm_update_delta(
+                    delta_buf[idx], trits[j], cfg->delta_min, cfg->delta_max);
+                if (idx + 1U < len) {
+                    if (trits[j] != 0) {
+                        delta_buf[idx + 1U] = delta_buf[idx];
+                    } else {
+                        delta_buf[idx + 1U] = zcrudp_adm_update_delta(
+                            delta_buf[idx + 1U], 0, cfg->delta_min, cfg->delta_max);
+                    }
+                }
+            }
+        }
+
+        if (!any_nonzero) {
+            skip_run++;
+            if (skip_run < ZCRUDP_TERNARY_MAX_SKIP && (blk + 1U) < total_blocks) continue;
+            if (blk + 1U == total_blocks && pkt_tokens == 0) { skip_run = 0; break; }
+            uint16_t skip_tok = (uint16_t)(ZCRUDP_TRIT_MAX_10P + (skip_run - 1U));
+            if (pkt_tokens == 0) pkt_start_block = (uint32_t)(blk + 1U - skip_run);
+            zcrudp_ternary_write_u16_le(
+                pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U, skip_tok);
+            pkt_tokens++;
+            skip_run = 0;
+        } else {
+            if (skip_run > 0) {
+                if (pkt_tokens == 0) {
+                    pkt_start_block = (uint32_t)blk;
+                    skip_run = 0;
+                } else if ((size_t)pkt_tokens + 1U >= max_tokens) {
+                    zcrudp_ternary_pkt_hdr_t hdr = {
+                        .magic = ZCRUDP_TERNARY_PKT_MAGIC,
+                        .pixfmt = ZCRUDP_TERNARY_MAKE_PF(cfg->pixfmt, ZCRUDP_TERNARY_PKT_DELTA_2X),
+                        .plane = plane_id,
+                        .frame_id = frame_id,
+                        .start_block = pkt_start_block,
+                        .num_tokens = pkt_tokens
+                    };
+                    zcrudp_ternary_pkt_hdr_write_le(pkt_buf, &hdr);
+                    size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U;
+                    cb(pkt_buf, psz, user_ctx);
+                    total_bytes += psz;
+                    pkt_tokens = 0;
+                    pkt_start_block = (uint32_t)blk;
+                    skip_run = 0;
+                } else {
+                    uint16_t skip_tok = (uint16_t)(ZCRUDP_TRIT_MAX_10P + (skip_run - 1U));
+                    zcrudp_ternary_write_u16_le(
+                        pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U, skip_tok);
+                    pkt_tokens++;
+                    skip_run = 0;
+                }
+            } else if (pkt_tokens == 0) {
+                pkt_start_block = (uint32_t)blk;
+            }
+
+            uint16_t packed = zcrudp_pack_10trits(trits);
+            zcrudp_ternary_write_u16_le(
+                pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U, packed);
+            pkt_tokens++;
+        }
+
+        if ((size_t)pkt_tokens >= max_tokens) {
+            zcrudp_ternary_pkt_hdr_t hdr = {
+                .magic = ZCRUDP_TERNARY_PKT_MAGIC,
+                .pixfmt = ZCRUDP_TERNARY_MAKE_PF(cfg->pixfmt, ZCRUDP_TERNARY_PKT_DELTA_2X),
+                .plane = plane_id,
+                .frame_id = frame_id,
+                .start_block = pkt_start_block,
+                .num_tokens = pkt_tokens
+            };
+            zcrudp_ternary_pkt_hdr_write_le(pkt_buf, &hdr);
+            size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U;
+            cb(pkt_buf, psz, user_ctx);
+            total_bytes += psz;
+            pkt_tokens = 0;
+        }
+    }
+
+    if (pkt_tokens > 0) {
+        zcrudp_ternary_pkt_hdr_t hdr = {
+            .magic = ZCRUDP_TERNARY_PKT_MAGIC,
+            .pixfmt = ZCRUDP_TERNARY_MAKE_PF(cfg->pixfmt, ZCRUDP_TERNARY_PKT_DELTA_2X),
+            .plane = plane_id,
+            .frame_id = frame_id,
+            .start_block = pkt_start_block,
+            .num_tokens = pkt_tokens
+        };
+        zcrudp_ternary_pkt_hdr_write_le(pkt_buf, &hdr);
+        size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)pkt_tokens * 2U;
+        cb(pkt_buf, psz, user_ctx);
+        total_bytes += psz;
+    }
+
+    return total_bytes;
 }
 
 /* =========================================================================

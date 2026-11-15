@@ -4,13 +4,13 @@ CFLAGS ?= -Wall -Wextra -Werror -O3 -std=c11 -Iinclude -mavx2
 ifeq ($(OS),Windows_NT)
 	EXE := .exe
 	RM := del /Q /F
-	LDFLAGS :=
+	LDFLAGS := -lm
 	RUN_PACKING = $(subst /,\,$(TARGET_PACKING))
 	RUN_CODEC = $(subst /,\,$(TARGET_CODEC))
 else
 	EXE :=
 	RM := rm -f
-	LDFLAGS := -lpthread
+	LDFLAGS := -lpthread -lm
 	RUN_PACKING = ./$(TARGET_PACKING)
 	RUN_CODEC = ./$(TARGET_CODEC)
 endif

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+#include <math.h>
 
 #include "ternary_codec.h"
 #include "ternary_mt.h"
@@ -420,6 +421,205 @@ static void test_gmc_panoramic_savings(void) {
     free(curr);
 }
 
+static void test_intra_refresh_and_2x_mode(void) {
+    printf("[TEST] Running Rolling Intra-Refresh (HUD Crispness) & 2x Mode Test... ");
+
+    zcrudp_ternary_config_t cfg = {
+        .width = 320,
+        .height = 180,
+        .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        .delta_min = 3,
+        .delta_max = 32,
+        .threshold = 3,
+        .gamma_q8 = 254, /* gentle leak + rolling intra-refresh */
+        .neutral_y = 128,
+        .mtu_payload = 1380
+    };
+
+    size_t len = (size_t)cfg.width * cfg.height;
+    uint8_t *src = (uint8_t *)malloc(len);
+    uint8_t *enc_ref = (uint8_t *)malloc(len);
+    uint8_t *enc_delta = (uint8_t *)malloc(len);
+    uint8_t *dec_canvas = (uint8_t *)malloc(len);
+    uint8_t *dec_delta = (uint8_t *)malloc(len);
+    uint8_t *pkt_store = (uint8_t *)malloc(256 * 1400);
+    size_t pkt_lens[256];
+    uint8_t pkt_buf[1400];
+
+    memset(enc_ref, cfg.neutral_y, len);
+    memset(dec_canvas, cfg.neutral_y, len);
+    memset(enc_delta, cfg.delta_min, len);
+    memset(dec_delta, cfg.delta_min, len);
+
+    /* Sharp HUD pattern: black background (0) + white text/crosshair (255) */
+    memset(src, 0, len);
+    for (size_t y = 80; y < 100; y++) {
+        memset(src + y * cfg.width + 120, 255, 80);
+    }
+
+    pkt_sink_t sink = {
+        .pkts = pkt_store, .lens = pkt_lens, .count = 0,
+        .max_pkts = 256, .mtu = 1400, .total_bytes = 0
+    };
+
+    /* Rolling Intra-Refresh over 12 frames (1/12th of frame per tick) */
+    const size_t N_CYCLE = 12;
+    size_t slice_bytes = (len + N_CYCLE - 1U) / N_CYCLE;
+
+    for (uint16_t f = 0; f < 12; f++) {
+        sink.count = 0;
+        sink.total_bytes = 0;
+
+        /* Encode delta first, then overwrite rolling Intra-Refresh slice at end of frame */
+        if (f & 1U) {
+            zcrudp_ternary_encode_plane_2x(src, enc_ref, enc_delta, len,
+                                           0, f, &cfg, pkt_buf, sink_cb, &sink);
+        } else {
+            zcrudp_ternary_encode_plane(src, enc_ref, enc_delta, len,
+                                        0, f, &cfg, pkt_buf, sink_cb, &sink);
+        }
+        size_t i0 = (size_t)f * slice_bytes;
+        size_t i1 = i0 + slice_bytes;
+        zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, i0, i1, len,
+                                          0, f, &cfg, pkt_buf, sink_cb, &sink);
+
+        zcrudp_ternary_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
+        for (size_t p = 0; p < sink.count; p++) {
+            bool ok = zcrudp_ternary_decode_packet(
+                sink.pkts + p * sink.mtu, sink.lens[p],
+                dec_canvas, dec_delta, len, &cfg, NULL);
+            assert(ok);
+        }
+        assert(memcmp(enc_ref, dec_canvas, len) == 0);
+    }
+
+    /* After 1 full Intra-Refresh cycle, sharp HUD white & black must be crisp */
+    assert(dec_canvas[90 * cfg.width + 150] >= 250);
+    assert(dec_canvas[10 * cfg.width + 10] <= 5);
+
+    free(pkt_store);
+    free(src);
+    free(enc_ref);
+    free(enc_delta);
+    free(dec_canvas);
+    free(dec_delta);
+    printf("PASSED (HUD crisp, 0 wash-out)\n");
+}
+
+static void test_3d_complex_scene_psnr(void) {
+    printf("[TEST] Running Complex 3D-like Textured + Pan + HUD PSNR Test... ");
+
+    zcrudp_ternary_config_t cfg = {
+        .width = 640,
+        .height = 360,
+        .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        .delta_min = 3,
+        .delta_max = 32,
+        .threshold = 4,
+        .gamma_q8 = 254,
+        .neutral_y = 128,
+        .mtu_payload = 1380
+    };
+
+    size_t len = (size_t)cfg.width * cfg.height;
+    uint8_t *src = (uint8_t *)malloc(len);
+    uint8_t *enc_ref = (uint8_t *)malloc(len);
+    uint8_t *enc_delta = (uint8_t *)malloc(len);
+    uint8_t *dec_canvas = (uint8_t *)malloc(len);
+    uint8_t *dec_delta = (uint8_t *)malloc(len);
+    uint8_t *pkt_store = (uint8_t *)malloc(512 * 1400);
+    size_t pkt_lens[512];
+    uint8_t pkt_buf[1400];
+
+    memset(enc_ref, cfg.neutral_y, len);
+    memset(dec_canvas, cfg.neutral_y, len);
+    memset(enc_delta, cfg.delta_min, len);
+    memset(dec_delta, cfg.delta_min, len);
+
+    pkt_sink_t sink = {
+        .pkts = pkt_store, .lens = pkt_lens, .count = 0,
+        .max_pkts = 512, .mtu = 1400, .total_bytes = 0
+    };
+
+    double sum_psnr = 0.0;
+    size_t sum_bytes = 0;
+    const int FRAMES = 24;
+    const size_t N_CYCLE = 24;
+    size_t slice_bytes = (len + N_CYCLE - 1U) / N_CYCLE;
+
+    for (int f = 0; f < FRAMES; f++) {
+        /* Complex textured 3D-like scene (continuous triangle-wave lighting) + static HUD */
+        for (uint16_t y = 0; y < cfg.height; y++) {
+            for (uint16_t x = 0; x < cfg.width; x++) {
+                uint32_t wx = (uint32_t)x + (uint32_t)(f * 3);
+                uint32_t wy = (uint32_t)y + (uint32_t)f;
+                uint32_t raw = (wx * 3U + wy * 5U) % 510U;
+                uint32_t tri = (raw > 255U) ? (510U - raw) : raw;
+                src[y * cfg.width + x] = (uint8_t)tri;
+            }
+        }
+        /* Static sharp HUD bar */
+        for (uint16_t y = 16; y < 36; y++) {
+            memset(src + y * cfg.width + 20, 240, 140);
+        }
+
+        sink.count = 0;
+        sink.total_bytes = 0;
+
+        if (f == 0) {
+            /* Initial Intra keyframe */
+            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, 0, len,
+                                              len, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+        } else {
+            /* GMC: estimate & shift both refs */
+            int8_t dx = 0, dy = 0;
+            zcrudp_ternary_estimate_gmc(src, enc_ref, cfg.width, cfg.height, 8, &dx, &dy);
+            zcrudp_ternary_shift_plane(enc_ref, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
+            zcrudp_ternary_shift_plane(dec_canvas, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
+
+            /* 1x Delta + Rolling Intra-Refresh 1/24th per frame */
+            size_t i0 = (size_t)f * slice_bytes;
+            zcrudp_ternary_encode_plane(src, enc_ref, enc_delta, len,
+                                        0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, i0, i0 + slice_bytes,
+                                              len, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
+        }
+
+        zcrudp_ternary_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
+        for (size_t p = 0; p < sink.count; p++) {
+            zcrudp_ternary_decode_packet(sink.pkts + p * sink.mtu, sink.lens[p],
+                                         dec_canvas, dec_delta, len, &cfg, NULL);
+        }
+
+        double mse = 0.0;
+        for (size_t i = 0; i < len; i++) {
+            double d = (double)src[i] - (double)dec_canvas[i];
+            mse += d * d;
+        }
+        mse /= (double)len;
+        double psnr = (mse > 1e-6) ? (10.0 * log10((255.0 * 255.0) / mse)) : 99.0;
+        if (f >= 4) {
+            sum_psnr += psnr;
+            sum_bytes += sink.total_bytes;
+        }
+    }
+
+    double avg_psnr = sum_psnr / (FRAMES - 4);
+    double avg_bpp = ((double)sum_bytes / (FRAMES - 4) * 8.0) / (double)len;
+    printf("(avg PSNR = %.2f dB, avg %.2f bpp) ", avg_psnr, avg_bpp);
+    fflush(stdout);
+    assert(avg_psnr > 15.0);
+
+    printf("PASSED\n");
+
+    free(pkt_store);
+    free(src);
+    free(enc_ref);
+    free(enc_delta);
+    free(dec_canvas);
+    free(dec_delta);
+}
+
 int main(void) {
     printf("=== zcrudp Ternary Codec Test & 1080p120 Benchmark ===\n");
 #ifdef __AVX2__
@@ -430,6 +630,8 @@ int main(void) {
 
     test_nv12_and_rgba_roundtrip();
     test_gmc_panoramic_savings();
+    test_intra_refresh_and_2x_mode();
+    test_3d_complex_scene_psnr();
     printf("\n[BENCHMARK] 1920x1080 @ 120 Hz -> 360 Hz (budget 2.778 ms/frame @ 360 Hz):\n");
     bench_1080p120_format(ZCRUDP_TERNARY_FMT_NV12, "NV12");
     bench_1080p120_format(ZCRUDP_TERNARY_FMT_RGBA, "RGBA");
