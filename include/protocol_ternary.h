@@ -131,12 +131,16 @@ static inline uint8_t zcrudp_pack_5trits(const zcrudp_trit_t trits[5]) {
  * @param trits Output array for 5 signed trits {-1, 0, +1}.
  */
 static inline void zcrudp_unpack_5trits(uint8_t byte, zcrudp_trit_t trits[5]) {
-    uint32_t v = byte;
-    trits[0] = (zcrudp_trit_t)(v % 3U) - 1; v /= 3U;
-    trits[1] = (zcrudp_trit_t)(v % 3U) - 1; v /= 3U;
-    trits[2] = (zcrudp_trit_t)(v % 3U) - 1; v /= 3U;
-    trits[3] = (zcrudp_trit_t)(v % 3U) - 1; v /= 3U;
-    trits[4] = (zcrudp_trit_t)(v % 3U) - 1;
+    uint32_t v  = byte;
+    uint32_t q1 = (v * 21846U) >> 16;
+    uint32_t q2 = (v * 7282U)  >> 16;
+    uint32_t q3 = (v * 2428U)  >> 16;
+    uint32_t q4 = (v * 810U)   >> 16;
+    trits[0] = (zcrudp_trit_t)(v  - q1 * 3U) - 1;
+    trits[1] = (zcrudp_trit_t)(q1 - q2 * 3U) - 1;
+    trits[2] = (zcrudp_trit_t)(q2 - q3 * 3U) - 1;
+    trits[3] = (zcrudp_trit_t)(q3 - q4 * 3U) - 1;
+    trits[4] = (zcrudp_trit_t)q4 - 1;
 }
 
 /**
@@ -185,8 +189,9 @@ static inline uint16_t zcrudp_pack_10trits(const zcrudp_trit_t trits[10]) {
  * @param trits Output array for 10 signed trits {-1, 0, +1}.
  */
 static inline void zcrudp_unpack_10trits(uint16_t word, zcrudp_trit_t trits[10]) {
-    uint32_t lo = (uint32_t)word % ZCRUDP_TRIT_MAX_5P;
-    uint32_t hi = (uint32_t)word / ZCRUDP_TRIT_MAX_5P;
+    uint32_t w  = word;
+    uint32_t hi = (w * 69043U) >> 24;
+    uint32_t lo = w - hi * ZCRUDP_TRIT_MAX_5P;
     zcrudp_unpack_5trits((uint8_t)lo, &trits[0]);
     zcrudp_unpack_5trits((uint8_t)hi, &trits[5]);
 }

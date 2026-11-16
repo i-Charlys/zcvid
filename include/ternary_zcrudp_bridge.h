@@ -18,8 +18,8 @@ extern "C" {
 #endif
 
 typedef enum {
-    ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO = 0, /**< Fast-path RIO batch TX (DELTA / DELTA_2X) */
-    ZCRUDP_TERNARY_CHAN_RELIABLE_FEC   = 1  /**< FEC/Reliable TX (INTRA / TILE_MV) */
+    ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO = 0, /**< Fast-path RIO batch TX (DELTA / DELTA_2X, raw or range-coded) */
+    ZCRUDP_TERNARY_CHAN_RELIABLE_FEC   = 1  /**< FEC/Reliable TX (INTRA / INTRA_EC / TILE_MV) */
 } zcrudp_ternary_channel_t;
 
 /**
@@ -36,7 +36,9 @@ static inline zcrudp_ternary_channel_t zcrudp_ternary_route_packet(const uint8_t
         return ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO;
     }
     uint8_t ptype = ZCRUDP_TERNARY_HDR_TYPE(&hdr);
-    if (ptype == ZCRUDP_TERNARY_PKT_INTRA || ptype == ZCRUDP_TERNARY_PKT_TILE_MV) {
+    if (ptype == ZCRUDP_TERNARY_PKT_INTRA || ptype == ZCRUDP_TERNARY_PKT_INTRA_EC ||
+        ptype == ZCRUDP_TERNARY_PKT_INTRA_Q_EC || ptype == ZCRUDP_TERNARY_PKT_TILE_MV ||
+        ptype == ZCRUDP_TERNARY_PKT_TILE_MV_DPCM) {
         return ZCRUDP_TERNARY_CHAN_RELIABLE_FEC;
     }
     return ZCRUDP_TERNARY_CHAN_UNRELIABLE_RIO;

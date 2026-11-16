@@ -42,7 +42,8 @@ typedef enum {
     ZCRUDP_MT_OP_ENCODE_PLANE = 1,
     ZCRUDP_MT_OP_DECAY_PLANE  = 2,
     ZCRUDP_MT_OP_DECODE_PKTS  = 3,
-    ZCRUDP_MT_OP_QUIT         = 4
+    ZCRUDP_MT_OP_ENCODE_INTRA = 4,
+    ZCRUDP_MT_OP_QUIT         = 5
 } zcrudp_mt_op_t;
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
     size_t   max_pkts;
     size_t   count;
     size_t   total_bytes;
+    size_t   dropped_pkts;
 } zcrudp_mt_slice_sink_t;
 
 typedef struct zcrudp_ternary_mt_pool zcrudp_ternary_mt_pool_t;
@@ -76,12 +78,22 @@ struct zcrudp_ternary_mt_pool {
     atomic_uint_fast32_t active_workers;
     atomic_int           op;
 
+#if defined(_WIN32)
+    SRWLOCK              work_lock;
+    CONDITION_VARIABLE   work_cv;
+#else
+    pthread_mutex_t      work_lock;
+    pthread_cond_t       work_cv;
+#endif
+
     /* Shared per-dispatch job descriptor */
     const uint8_t               *src;
     uint8_t                     *ref_or_canvas;
     uint8_t                     *delta_buf;
     size_t                       plane_len;
     size_t                       total_blocks;
+    size_t                       intra_begin;
+    size_t                       intra_end;
     uint8_t                      plane_id;
     uint16_t                     frame_id;
     const zcrudp_ternary_config_t *cfg;
@@ -100,8 +112,22 @@ static inline void zcrudp_mt_slice_cb(const uint8_t *data, size_t len, void *ctx
         memcpy(s->pkts_base + s->count * s->mtu_stride, data, len);
         s->lens_base[s->count] = len;
         s->count++;
+        s->total_bytes += len;
+    } else {
+        s->dropped_pkts++;
     }
-    s->total_bytes += len;
+}
+
+static inline void zcrudp_mt_wake_workers(zcrudp_ternary_mt_pool_t *p) {
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&p->work_lock);
+    ReleaseSRWLockExclusive(&p->work_lock);
+    WakeAllConditionVariable(&p->work_cv);
+#else
+    pthread_mutex_lock(&p->work_lock);
+    pthread_cond_broadcast(&p->work_cv);
+    pthread_mutex_unlock(&p->work_lock);
+#endif
 }
 
 static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid) {
@@ -114,19 +140,22 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         blks_per = ((blks_per + 7U) / 8U) * 8U;
         size_t b0 = (size_t)tid * blks_per;
         size_t b1 = b0 + blks_per;
+        zcrudp_mt_worker_t *w = &p->workers[tid];
+        w->sink.count = 0;
+        w->sink.total_bytes = 0;
+        w->sink.dropped_pkts = 0;
         if (b0 < p->total_blocks) {
             if (b1 > p->total_blocks) b1 = p->total_blocks;
-            zcrudp_mt_worker_t *w = &p->workers[tid];
-            w->sink.count = 0;
-            w->sink.total_bytes = 0;
+            zcrudp_ternary_config_t slice_cfg = *p->cfg;
+            if (slice_cfg.ec_max_blocks > 0U && n > 1U) {
+                uint32_t share = (slice_cfg.ec_max_blocks + n - 1U) / n;
+                slice_cfg.ec_max_blocks = (share > 0U) ? share : 1U;
+            }
             zcrudp_ternary_encode_plane_range(
                 p->src, p->ref_or_canvas, p->delta_buf,
                 p->plane_len, b0, b1,
-                p->plane_id, p->frame_id, p->cfg,
+                p->plane_id, p->frame_id, &slice_cfg,
                 w->pkt_scratch, zcrudp_mt_slice_cb, &w->sink);
-        } else {
-            p->workers[tid].sink.count = 0;
-            p->workers[tid].sink.total_bytes = 0;
         }
     } else if (op == ZCRUDP_MT_OP_DECAY_PLANE) {
         size_t chunk = (p->plane_len + n - 1U) / n;
@@ -164,6 +193,23 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
                 p->delta_buf ? (p->delta_buf + plane_off) : NULL,
                 plane_len, p->cfg, NULL);
         }
+    } else if (op == ZCRUDP_MT_OP_ENCODE_INTRA) {
+        size_t span = (p->intra_end > p->intra_begin) ? (p->intra_end - p->intra_begin) : 0U;
+        size_t per = (span + n - 1U) / n;
+        size_t b0 = p->intra_begin + (size_t)tid * per;
+        size_t b1 = b0 + per;
+        if (b1 > p->intra_end) b1 = p->intra_end;
+        zcrudp_mt_worker_t *w = &p->workers[tid];
+        w->sink.count = 0;
+        w->sink.total_bytes = 0;
+        w->sink.dropped_pkts = 0;
+        if (b0 < b1) {
+            zcrudp_ternary_encode_intra_range(
+                p->src, p->ref_or_canvas, p->delta_buf,
+                b0, b1, p->plane_len,
+                p->plane_id, p->frame_id, p->cfg,
+                w->pkt_scratch, zcrudp_mt_slice_cb, &w->sink);
+        }
     }
 }
 
@@ -180,14 +226,23 @@ static void *zcrudp_mt_worker_entry(void *arg) {
         uint32_t cur_gen;
         uint32_t spins = 0;
         while ((cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire)) == seen_gen) {
-            if (++spins < 2000U) {
+            if (++spins < 256U) {
                 ZCRUDP_MT_CPU_RELAX();
             } else {
 #if defined(_WIN32)
-                SwitchToThread();
+                AcquireSRWLockExclusive(&p->work_lock);
+                while ((cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire)) == seen_gen) {
+                    SleepConditionVariableSRW(&p->work_cv, &p->work_lock, INFINITE, 0);
+                }
+                ReleaseSRWLockExclusive(&p->work_lock);
 #else
-                sched_yield();
+                pthread_mutex_lock(&p->work_lock);
+                while ((cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire)) == seen_gen) {
+                    pthread_cond_wait(&p->work_cv, &p->work_lock);
+                }
+                pthread_mutex_unlock(&p->work_lock);
 #endif
+                break;
             }
         }
         seen_gen = cur_gen;
@@ -210,6 +265,7 @@ static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
     if (p->num_threads > 1U) {
         atomic_store_explicit(&p->active_workers, p->num_threads - 1U, memory_order_release);
         atomic_fetch_add_explicit(&p->gen, 1U, memory_order_release);
+        zcrudp_mt_wake_workers(p);
     }
     zcrudp_mt_run_task(p, 0);
     if (p->num_threads > 1U) {
@@ -239,6 +295,13 @@ static inline void zcrudp_ternary_mt_init(zcrudp_ternary_mt_pool_t *p,
     atomic_init(&p->gen, 0U);
     atomic_init(&p->active_workers, 0U);
     atomic_init(&p->op, ZCRUDP_MT_OP_NONE);
+#if defined(_WIN32)
+    InitializeSRWLock(&p->work_lock);
+    InitializeConditionVariable(&p->work_cv);
+#else
+    pthread_mutex_init(&p->work_lock, NULL);
+    pthread_cond_init(&p->work_cv, NULL);
+#endif
 
     for (uint32_t t = 0; t < num_threads; t++) {
         p->workers[t].pool = p;
@@ -271,6 +334,7 @@ static inline void zcrudp_ternary_mt_destroy(zcrudp_ternary_mt_pool_t *p) {
     if (p->num_threads > 1U) {
         atomic_store_explicit(&p->op, ZCRUDP_MT_OP_QUIT, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->gen, 1U, memory_order_release);
+        zcrudp_mt_wake_workers(p);
         for (uint32_t t = 1; t < p->num_threads; t++) {
 #if defined(_WIN32)
             WaitForSingleObject(p->workers[t].handle, INFINITE);
@@ -280,6 +344,10 @@ static inline void zcrudp_ternary_mt_destroy(zcrudp_ternary_mt_pool_t *p) {
 #endif
         }
     }
+#if !defined(_WIN32)
+    pthread_cond_destroy(&p->work_cv);
+    pthread_mutex_destroy(&p->work_lock);
+#endif
 }
 
 static inline size_t zcrudp_ternary_mt_encode_plane(zcrudp_ternary_mt_pool_t *p,
@@ -327,6 +395,29 @@ static inline void zcrudp_ternary_mt_decay_plane(zcrudp_ternary_mt_pool_t *p,
     zcrudp_mt_dispatch(p, ZCRUDP_MT_OP_DECAY_PLANE);
 }
 
+/** True for packets that overwrite samples (anchors) rather than add to them. */
+static inline bool zcrudp_mt_pkt_is_anchor(const uint8_t *pkt, size_t len) {
+    if (len < ZCRUDP_TERNARY_PKT_HDR_SZ) {
+        return false;
+    }
+    uint8_t ptype = (uint8_t)((pkt[2] >> 4) & 0x0FU);
+    return ptype == ZCRUDP_TERNARY_PKT_INTRA || ptype == ZCRUDP_TERNARY_PKT_INTRA_EC ||
+           ptype == ZCRUDP_TERNARY_PKT_INTRA_Q_EC;
+}
+
+/**
+ * @brief Decodes a batch of packets with the same result as decoding them one
+ *        by one in batch order.
+ *
+ * Within a frame, two delta packets never cover the same samples, nor do two
+ * anchor packets, but an anchor does overwrite the deltas of its region. The
+ * batch is therefore cut where the kind of packet changes (delta <-> anchor):
+ * each run is decoded in parallel, the runs one after the other. A frame sent
+ * as "deltas, then anchors" costs two dispatches.
+ *
+ * Range-coded packets carry many more blocks each, so a frame has fewer of
+ * them to spread over the threads.
+ */
 static inline void zcrudp_ternary_mt_decode_packets(zcrudp_ternary_mt_pool_t *p,
                                                     uint8_t *canvas,
                                                     uint8_t *delta_buf,
@@ -340,11 +431,66 @@ static inline void zcrudp_ternary_mt_decode_packets(zcrudp_ternary_mt_pool_t *p,
     p->delta_buf = delta_buf;
     p->y_sz = y_sz;
     p->cfg = cfg;
-    p->pkt_in_base = pkts_base;
-    p->pkt_in_lens = pkt_lens;
     p->pkt_in_stride = mtu_stride;
-    p->pkt_in_count = pkt_count;
-    zcrudp_mt_dispatch(p, ZCRUDP_MT_OP_DECODE_PKTS);
+
+    size_t run_begin = 0;
+    while (run_begin < pkt_count) {
+        bool anchor = zcrudp_mt_pkt_is_anchor(pkts_base + run_begin * mtu_stride,
+                                              pkt_lens[run_begin]);
+        size_t run_end = run_begin + 1U;
+        while (run_end < pkt_count &&
+               zcrudp_mt_pkt_is_anchor(pkts_base + run_end * mtu_stride,
+                                       pkt_lens[run_end]) == anchor) {
+            run_end++;
+        }
+        p->pkt_in_base = pkts_base + run_begin * mtu_stride;
+        p->pkt_in_lens = pkt_lens + run_begin;
+        p->pkt_in_count = run_end - run_begin;
+        zcrudp_mt_dispatch(p, ZCRUDP_MT_OP_DECODE_PKTS);
+        run_begin = run_end;
+    }
+}
+
+/**
+ * @brief Parallelizes zcrudp_ternary_encode_intra_range across worker threads.
+ *        Each thread encodes an independent contiguous byte slice into its own
+ *        per-thread sink buffer (disjoint ref/delta_buf writes, zero data race).
+ */
+static inline size_t zcrudp_ternary_mt_encode_intra_range(zcrudp_ternary_mt_pool_t *p,
+                                                          const uint8_t *src,
+                                                          uint8_t *ref,
+                                                          uint8_t *delta_buf,
+                                                          size_t byte_begin,
+                                                          size_t byte_end,
+                                                          size_t plane_len,
+                                                          uint8_t plane_id,
+                                                          uint16_t frame_id,
+                                                          const zcrudp_ternary_config_t *cfg,
+                                                          size_t *out_total_pkts) {
+    if (cfg->mtu_payload > sizeof(p->workers[0].pkt_scratch)) {
+        if (out_total_pkts) *out_total_pkts = 0U;
+        return 0U;
+    }
+    if (byte_end > plane_len) byte_end = plane_len;
+    p->src = src;
+    p->ref_or_canvas = ref;
+    p->delta_buf = delta_buf;
+    p->intra_begin = byte_begin;
+    p->intra_end = byte_end;
+    p->plane_len = plane_len;
+    p->plane_id = plane_id;
+    p->frame_id = frame_id;
+    p->cfg = cfg;
+
+    zcrudp_mt_dispatch(p, ZCRUDP_MT_OP_ENCODE_INTRA);
+
+    size_t bytes = 0U, pkts = 0U;
+    for (uint32_t t = 0U; t < p->num_threads; t++) {
+        bytes += p->workers[t].sink.total_bytes;
+        pkts += p->workers[t].sink.count;
+    }
+    if (out_total_pkts) *out_total_pkts = pkts;
+    return bytes;
 }
 
 #ifdef __cplusplus

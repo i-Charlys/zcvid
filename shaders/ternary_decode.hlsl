@@ -132,19 +132,30 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
     if (w1 >= 59049u || id >= (num_px + px_per_blk - 1u) / px_per_blk) return;
 
     uint base_px = id * px_per_blk;
-    uint rem = w1;
+    uint hi = (w1 * 69043u) >> 24;
+    uint lo = mad(-hi, 243u, w1);
+    uint step_px = (is_2x != 0u) ? 2u : 1u;
+
+    static const uint RECIP[5] = { 21846u, 7282u, 2428u, 810u, 0u };
+    uint halves[2] = { lo, hi };
 
     [unroll]
-    for (uint j = 0; j < 10u; j++) {
-        int t = (int)(rem % 3u) - 1;
-        rem /= 3u;
+    for (uint h = 0; h < 2u; h++) {
+        uint v = halves[h];
+        uint prev_q = v;
+        [unroll]
+        for (uint k = 0; k < 5u; k++) {
+            uint q = (v * RECIP[k]) >> 16;
+            int t = (int)(prev_q - q * 3u) - 1;
+            prev_q = q;
 
-        // 2x: one trit drives the pair (idx, idx + 1) with the step of idx.
-        uint idx = base_px + j * ((is_2x != 0u) ? 2u : 1u);
-        if (t != 0 && idx < num_px) {
-            int d = StepOf(PrevShifted(idx));
-            ApplyTrit(idx, t, d, tag);
-            if (is_2x != 0u) ApplyTrit(idx + 1u, t, d, tag);
+            uint j = h * 5u + k;
+            uint idx = base_px + j * step_px;
+            if (t != 0 && idx < num_px) {
+                int d = StepOf(PrevShifted(idx));
+                ApplyTrit(idx, t, d, tag);
+                if (is_2x != 0u) ApplyTrit(idx + 1u, t, d, tag);
+            }
         }
     }
 }

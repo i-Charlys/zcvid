@@ -72,6 +72,35 @@ int LeakyStep(int prev_val, int trit, int delta_val, int neutral) {
 groupshared uint gs_best_sad;
 groupshared int2 gs_best_mv;
 
+uint EvalTileSad(uint x0, uint y0, int dx, int dy) {
+    uint sad = 0;
+    uint cnt = 0;
+    for (uint ly = 2; ly < 32; ly += 4) {
+        uint py = y0 + ly;
+        int sy = (int)py - dy;
+        if (py >= height || sy < 0 || sy >= (int)height) continue;
+        for (uint lx = 2; lx < 32; lx += 4) {
+            uint px = x0 + lx;
+            int sx = (int)px - dx;
+            if (px >= width || sx < 0 || sx >= (int)width) continue;
+
+            float4 src_c = g_src_rgba.Load(int3(px, py, 0));
+            int cy, ccb, ccr;
+            RgbToYCbCr(src_c.rgb, cy, ccb, ccr);
+            uint ref_w = g_prev_yuvd[(uint)sy * width + (uint)sx];
+            int ry = (int)(ref_w & 0xFFu);
+            sad += (uint)abs(cy - ry);
+            cnt++;
+        }
+    }
+    if (cnt == 0) return 0xFFFFFFFFu;
+    uint norm_sad = (sad * 64u) / cnt;
+    if (dx == 0 && dy == 0) {
+        norm_sad = (norm_sad > 4u) ? (norm_sad - 4u) : 0u;
+    }
+    return norm_sad;
+}
+
 [numthreads(16, 1, 1)]
 void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tx = gid.x;
@@ -87,7 +116,7 @@ void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint x0 = tx * 32u;
     uint y0 = ty * 32u;
 
-    // Each of 16 threads evaluates candidate offsets in [-search_r, +search_r] (step 2)
+    // Coarse step-2 evaluation in [-search_r, +search_r]
     int r = (int)search_r;
     int span = 2 * r + 1;
     int total_cands = span * span;
@@ -95,39 +124,30 @@ void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     for (int c = (int)gtid.x; c < total_cands; c += 16) {
         int dy = (c / span) - r;
         int dx = (c % span) - r;
-        // Coarse step-2 filter except around (0,0)
         if ((dx != 0 || dy != 0) && ((dx & 1) != 0 || (dy & 1) != 0)) {
             continue;
         }
-
-        uint sad = 0;
-        uint cnt = 0;
-        for (uint ly = 2; ly < 32; ly += 4) {
-            uint py = y0 + ly;
-            int sy = (int)py - dy;
-            if (py >= height || sy < 0 || sy >= (int)height) continue;
-            for (uint lx = 2; lx < 32; lx += 4) {
-                uint px = x0 + lx;
-                int sx = (int)px - dx;
-                if (px >= width || sx < 0 || sx >= (int)width) continue;
-
-                float4 src_c = g_src_rgba.Load(int3(px, py, 0));
-                int cy, ccb, ccr;
-                RgbToYCbCr(src_c.rgb, cy, ccb, ccr);
-                uint ref_w = g_prev_yuvd[(uint)sy * width + (uint)sx];
-                int ry = (int)(ref_w & 0xFFu);
-                sad += (uint)abs(cy - ry);
-                cnt++;
-            }
-        }
-        if (cnt > 0) {
-            uint norm_sad = (sad * 64u) / cnt;
-            if (dx == 0 && dy == 0) {
-                norm_sad = (norm_sad > 32u) ? (norm_sad - 32u) : 0u;
-            }
-            // SAD in the high bits, MV in the low bits: one atomic min picks both.
+        uint norm_sad = EvalTileSad(x0, y0, dx, dy);
+        if (norm_sad != 0xFFFFFFFFu) {
             uint key = (norm_sad << 10) | ((uint)(dy + 16) << 5) | (uint)(dx + 16);
             InterlockedMin(gs_best_sad, key);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Fine +-1 refinement around coarse winner (handles odd-pixel / 1-px pans)
+    if (gtid.x < 9u && gs_best_sad != 0xFFFFFFFFu) {
+        uint best_coarse = gs_best_sad;
+        int cdx = (int)(best_coarse & 31u) - 16;
+        int cdy = (int)((best_coarse >> 5) & 31u) - 16;
+        int dx = cdx + ((int)(gtid.x % 3u) - 1);
+        int dy = cdy + ((int)(gtid.x / 3u) - 1);
+        if (dx >= -r && dx <= r && dy >= -r && dy <= r && (dx != cdx || dy != cdy)) {
+            uint norm_sad = EvalTileSad(x0, y0, dx, dy);
+            if (norm_sad != 0xFFFFFFFFu) {
+                uint key = (norm_sad << 10) | ((uint)(dy + 16) << 5) | (uint)(dx + 16);
+                InterlockedMin(gs_best_sad, key);
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -179,8 +199,16 @@ PixState LoadPix(uint idx, uint num_px, uint intra_y0, uint intra_y1, bool allow
     return s;
 }
 
-int Quant(int err, int thr) {
-    return (err > thr) ? 1 : ((err < -thr) ? -1 : 0);
+// A step is only taken when it brings the reference closer to the source:
+// the error must exceed the threshold and half the step d. Stepping with a
+// step larger than twice the error overshoots, and since a non-zero luma trit
+// doubles the step, the reference then swings around its target. Declining
+// codes a 0, which lets the step halve. Encoder-only decision: the decoder
+// applies whatever trits it receives.
+int Quant(int err, int thr, int d) {
+    int mag = abs(err);
+    if (mag <= thr || 2 * mag <= d) return 0;
+    return (err > 0) ? 1 : -1;
 }
 
 // Writes the reconstructed reference exactly as the decoder will rebuild it.
@@ -304,9 +332,9 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
                 int ey  = b.valid ? (((a.cy  - a.ry)  + (b.cy  - b.ry))  >> 1) : (a.cy  - a.ry);
                 int ecb = b.valid ? (((a.ccb - a.rcb) + (b.ccb - b.rcb)) >> 1) : (a.ccb - a.rcb);
                 int ecr = b.valid ? (((a.ccr - a.rcr) + (b.ccr - b.rcr)) >> 1) : (a.ccr - a.rcr);
-                ty_a  = Quant(ey, y_thr);
-                tcb_a = allow_chroma ? Quant(ecb, c_thr) : 0;
-                tcr_a = allow_chroma ? Quant(ecr, c_thr) : 0;
+                ty_a  = Quant(ey, y_thr, a.d);
+                tcb_a = allow_chroma ? Quant(ecb, c_thr, a.d) : 0;
+                tcr_a = allow_chroma ? Quant(ecr, c_thr, a.d) : 0;
 
                 int up = min((int)delta_max, a.d << 1);
                 StoreDelta(idx_a, a, ty_a, tcb_a, tcr_a, a.d,
@@ -316,16 +344,16 @@ void CSEncode(uint3 dtid : SV_DispatchThreadID) {
                                (ty_a == 0) ? max((int)delta_min, b.d >> 1) : up);
                 }
             } else {
-                ty_a  = Quant(a.cy - a.ry, y_thr);
-                tcb_a = allow_chroma ? Quant(a.ccb - a.rcb, c_thr) : 0;
-                tcr_a = allow_chroma ? Quant(a.ccr - a.rcr, c_thr) : 0;
+                ty_a  = Quant(a.cy - a.ry, y_thr, a.d);
+                tcb_a = allow_chroma ? Quant(a.ccb - a.rcb, c_thr, a.d) : 0;
+                tcr_a = allow_chroma ? Quant(a.ccr - a.rcr, c_thr, a.d) : 0;
                 StoreDelta(idx_a, a, ty_a, tcb_a, tcr_a, a.d,
                            (ty_a == 0) ? max((int)delta_min, a.d >> 1)
                                        : min((int)delta_max, a.d << 1));
                 if (b.valid) {
-                    ty_b  = Quant(b.cy - b.ry, y_thr);
-                    tcb_b = allow_chroma ? Quant(b.ccb - b.rcb, c_thr) : 0;
-                    tcr_b = allow_chroma ? Quant(b.ccr - b.rcr, c_thr) : 0;
+                    ty_b  = Quant(b.cy - b.ry, y_thr, b.d);
+                    tcb_b = allow_chroma ? Quant(b.ccb - b.rcb, c_thr, b.d) : 0;
+                    tcr_b = allow_chroma ? Quant(b.ccr - b.rcr, c_thr, b.d) : 0;
                     StoreDelta(idx_b, b, ty_b, tcb_b, tcr_b, b.d,
                                (ty_b == 0) ? max((int)delta_min, b.d >> 1)
                                            : min((int)delta_max, b.d << 1));

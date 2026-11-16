@@ -280,3 +280,137 @@ La bibliothèque C11 doit respecter les contraintes suivantes :
 1. **Compaction** : Utiliser l'encodage 10 trits dans 16 bits (`uint16_t`) comme format primaire de charge utile TFV pour atteindre $90.1\%$ d'efficacité spatiale théorique.
 2. **Résilience** : Implémenter l'atténuation exponentielle (Leaky Integrator, $\gamma = 0.95$) sur le canal non fiable par défaut pour garantir la tolérance aux pertes de paquets sans retransmission.
 3. **Architecture C11** : Conserver un design header-only/inline zero-allocation compatible avec les contraintes temps réel de `zcrudp`.
+
+---
+
+## 8. Addendum : passer sous $\log_2 3$ bits par trit
+
+### 8.1 Ce que la borne de la section 2 dit vraiment
+
+Les $90{,}1\,\%$ d'efficacité de la section 2.4 comparent $1{,}6$ bit par trit à $\log_2 3 \approx 1{,}585$ bit. Cette borne n'est la limite que si les trois valeurs sont équiprobables et indépendantes. Ce n'est pas le cas d'une vidéo :
+
+* dans un bloc transmis, la majorité des trits valent encore $0$ ;
+* les trits non nuls se regroupent le long des contours en mouvement, et leurs voisins portent le plus souvent le même signe.
+
+La limite de Shannon est l'entropie conditionnelle $H(T \mid \text{voisinage})$, pas $\log_2 3$. Rien n'est violé : le format à jetons laissait simplement cette marge inutilisée.
+
+### 8.2 Codeur retenu
+
+`include/ternary_entropy.h` implémente un codeur d'intervalles binaire adaptatif (plage 32 bits, probabilités 12 bits, adaptation en $1/32$).
+
+| Élément | Codage |
+| :--- | :--- |
+| Blocs nuls entre deux blocs codés | longueur en Exp-Golomb adaptatif, contexte = longueur précédente |
+| Trit nul ou non | 1 décision, 24 contextes : 2 voisins de gauche, 3 voisins de la ligne du dessus |
+| Signe | 1 décision, 9 contextes : signe à gauche et signe au-dessus |
+| Ancres (`INTRA_EC`) | prédiction gauche puis prédicteur médian JPEG-LS, erreur codée sans perte |
+
+**Contrainte de résilience.** Le codeur et toutes les probabilités repartent de zéro à chaque paquet, et les contextes ne lisent que des trits du même paquet. Deux sources de contexte plus efficaces ont été écartées pour cette raison : le trit de la trame précédente et le pas ADM courant. Toutes deux dépendent de l'état du récepteur ; après une perte, le décodeur arithmétique se désynchroniserait et le reste du paquet serait décodé en bruit. Le contrat de la section 3 est donc conservé : un paquet perdu ne coûte que sa propre étendue (vérifié par `test_entropy_packet_loss_is_isolated`).
+
+### 8.3 Mesures
+
+Image reconstruite identique au bit près dans les deux modes (`test_entropy_matches_tokens`). Scène de test : texture lissée en panoramique, objet mobile, HUD fixe.
+
+| Configuration | Deltas, jetons | Deltas, codés | Bits par trit codé | Ancres |
+| :--- | ---: | ---: | ---: | ---: |
+| GRAY8, ADM | 96 488 o | 53 759 o | 0,92 | ÷ 2,70 |
+| NV12, ADM, chroma 2x | 123 188 o | 66 960 o | 0,91 | ÷ 3,19 |
+| RGBA, pas fixe | 324 616 o | 135 423 o | 0,69 | ÷ 2,72 |
+| NV12, MTU 300 octets | 62 216 o | 36 430 o | 1,02 | ÷ 2,86 |
+| GRAY8, largeur 8200 (sans ligne du dessus) | 79 522 o | 53 889 o | 1,12 | ÷ 2,32 |
+
+Ablation sur du 720p NV12 dense : sans le contexte de la ligne du dessus, le flux delta grossit d'environ $7\,\%$. Un estimateur de probabilité à deux vitesses n'a rien apporté par rapport à l'estimateur simple ; il a été retiré.
+
+**Sur de vraies photographies.** `make bench-image IMG=photo.pgm` rejoue une fenêtre 1280x720 sur une image réelle. Cinq photographies 4K ramenées à 1920x1200, panoramique de 1 px par trame, bruit de $\pm 1$, seuil 3 :
+
+| Flux | Jetons ou brut | Codé | Gain |
+| :--- | ---: | ---: | ---: |
+| Image clé | 8,07 bpp | 2,44 à 3,40 bpp | ÷ 2,4 à 3,3 |
+| Ancres glissantes | 0,336 bpp | 0,102 à 0,146 bpp | ÷ 2,3 à 3,3 |
+| Deltas | 1,48 à 1,52 bpp | 0,84 à 1,06 bpp | ÷ 1,4 à 1,8 |
+
+Avec un bruit de $\pm 3$ et sans mouvement, les gains tombent à ÷ 1,5 sur les deltas et ÷ 1,9 à 2,2 sur les ancres : le bruit ne se compresse pas. Les scènes générées surestimaient donc le gain d'environ un quart ; la scène du benchmark 1080p (rectangle uni, 22,3 Mbit/s vers 0,57 Mbit/s) reste un cas extrême qui ne représente pas un contenu réel.
+
+### 8.4 Coût et plafond CPU
+
+**Chemin jetons.** Avec AVX2, l'encodeur et le décodeur traitent un bloc de 10 échantillons par étape : quantification, référence en boucle fermée et pas ADM d'un côté ; dépaquetage du jeton (une multiplication haute par $1/3$, $1/9$, $1/27$, $1/81$, exacte sous 243) et application de l'autre. `test_avx2_block_matches_scalar` compare 200 000 blocs aléatoires au code scalaire, et les deux compilations produisent les mêmes octets sur toutes les scènes.
+
+| Un cœur, luma 1280x720, tous les blocs actifs (photographie) | Encodage | Décodage |
+| :--- | ---: | ---: |
+| Jetons, scalaire | 4,8 ms | 2,4 ms |
+| Jetons, AVX2 | 1,2 ms | 0,5 ms |
+| Codage entropique, AVX2 | 7,6 à 9,6 ms | 6,7 à 8,5 ms |
+
+**Codeur entropique.** Son coût est proportionnel aux blocs codés : 55 à 70 ns par bloc et par côté sur un cœur, soit environ 4 ns par décision binaire, l'ordre de grandeur d'un codeur de type CABAC. Ce qui a été essayé :
+
+| Essai | Effet mesuré | Décision |
+| :--- | :--- | :--- |
+| État du codeur en registres pendant un bloc | décodage $-10\,\%$ | gardé |
+| Contextes de la ligne du dessus calculés une fois par bloc (3 chargements de 16 octets) | encodage $-12\,\%$, décodage $-10\,\%$ | gardé |
+| Mise à jour d'intervalle sans branchement, isolée dans une boucle | $-30\,\%$ (2,9 ns contre 4,1 par bit) | voir ligne suivante |
+| La même dans le codec, signes dans un second flux codé en parallèle | encodage $+20\,\%$ | retiré |
+| Deux codeurs avancés en alternance | aucun gain | retiré |
+
+L'écart entre les lignes 3 et 4 est instructif. Le drapeau « trit nul » décide s'il faut coder un signe : supprimer le branchement dans le codeur le fait réapparaître une ligne plus bas, avec la même erreur de prédiction. Le supprimer là aussi oblige à exécuter un pas de codeur « à vide » pour les 60 % de trits nuls, ce qui coûte plus que les erreurs de prédiction évitées. Le coût est le nombre de décisions codées ; il n'y a pas de facteur 2 à attendre d'un réglage fin. Au-delà il faudrait une autre famille de codeur (rANS à flux entrelacés et probabilités figées par paquet), qui perdrait l'essentiel du gain apporté par les contextes.
+
+Pour que le pire cas ne dépasse jamais le budget de trame, `cfg.ec_max_blocks` plafonne le nombre de blocs codés par appel : au-delà, le reste de l'appel part en jetons, désormais très bon marché. La bascule se fait en frontière de paquet et le décodeur la suit grâce au type de paquet, donc le plafond borne aussi le décodage. Les trames calmes gardent tout le gain, les trames chargées retombent vers le débit des jetons au lieu de déborder (`test_entropy_cpu_cap`).
+
+### 8.5 Quantification côté encodeur
+
+En balayant le seuil, le PSNR baissait quand le seuil baissait (35,6 dB au seuil 3, 28,6 dB au seuil 1 sur la scène 720p). Cause : avec l'ADM le pas double à chaque trit non nul, et l'encodeur émettait un trit dès que l'erreur dépassait le seuil, même quand le pas était plus grand que deux fois l'erreur. La référence oscillait alors autour de la cible avec un pas croissant.
+
+Règle actuelle : un trit non nul n'est émis que si $|e| > \theta$ et $2|e| > \delta$, c'est-à-dire seulement si le pas rapproche la référence de la source. Sinon le trit vaut $0$, ce qui divise le pas par deux ; un bloc dont un pas doit décroître est transmis même si ses dix trits sont nuls. Le décodeur et le format ne changent pas.
+
+| Test | Avant | Après (jetons) | Après (codage entropique) |
+| :--- | :--- | :--- | :--- |
+| Tile MV, luma | 36,08 dB à 2,20 bpp | 40,06 dB à 1,62 bpp | 40,06 dB à 0,50 bpp |
+| 720p NV12, seuil 1 | 28,6 dB | 37,1 dB | 37,1 dB |
+| Shader HLSL (GPU, `--synth --psnr`) | 35,8 dB à 20,1 Mbit/s | 37,0 à 37,3 dB à 17,3 Mbit/s | sans objet |
+
+La même règle est appliquée dans `ternary_encode.hlsl` (`Quant()`), vérifiée sur GPU avec 0 pixel d'écart entre la référence de l'encodeur et la sortie du décodeur.
+
+### 8.6 Ordre des ancres et compensation de mouvement
+
+La scène 3D restait à 27 dB. La cause n'était pas la modulation delta : le décalage global découvre une bande de bord remplie de gris neutre et entraîne le HUD fixe avec le fond, et le test n'appelait pas la réparation par ancres. Les deltas seuls mettent plusieurs trames à rattraper une erreur de 100 niveaux, et le décalage la recrée à chaque trame.
+
+| Scène 3D, GMC | PSNR | Débit (jetons) | Débit (codé) |
+| :--- | ---: | ---: | ---: |
+| Deltas seuls | 26,89 dB | 1,04 bpp | 0,26 bpp |
+| Deltas puis `repair_disocclusions` | 37,93 dB | 1,79 bpp | 0,57 bpp |
+
+Ce diagnostic a aussi révélé une règle d'ordre. Le récepteur applique la fuite une fois, avant tout paquet ; l'encodeur l'applique à chaque échantillon visité par la passe delta. Une ancre émise avant la passe delta est donc atténuée côté encodeur seulement, et les deux références divergent dès que $\gamma < 1$ (reproduit avec `gamma_q8 = 254`). Règle : les ancres d'une trame sont émises après ses deltas. Les deux tests de scène vérifient maintenant l'égalité bit à bit des références à chaque trame.
+
+Le décodage multi-thread respecte le même ordre : `zcrudp_ternary_mt_decode_packets()` découpe le lot là où deltas et ancres alternent et décode chaque série en parallèle (`test_mt_decode_keeps_packet_order`).
+
+Limite restante levée (Section 9) : sur une photographie détaillée en panoramique, la combinaison de la compensation de mouvement `TileMV` (amorçage spatial + recherche logarithmique `2×2` + raffinement `±1` sur CPU et GPU `CSTileMV`), du décalage cohérent de `delta_buf` (`apply_tile_mv_state`), et de la réparation spatiale quantifiée `INTRA_Q_EC` (`cfg.intra_qstep >= 2`) élimine le plafond des 25 dB.
+
+---
+
+## 9. Levée de la limite 25 dB, optimisation 360 Hz et preuves formelles
+
+### 9.1 Prédiction avancée et borne analytique universelle
+* **`INTRA_Q_EC` (`ZCRUDP_TERNARY_PKT_INTRA_Q_EC`)** : prédiction spatiale JPEG-LS MED quantifiée au pas `qstep >= 2` sur le tampon reconstruit `ref`, suivie du range coder réinitialisé par paquet. Réduit le coût des ancres de réparation de ~44 % tout en bornant l'erreur ponctuelle à $\lfloor q/2 \rfloor$ pour tout couple `(src, pred)`.
+* **Borne pire cas universelle** : `zcrudp_ternary_repair_disocclusions()` déclenche une ancre dès que `bad >= 2 || max_err > 2 * err_thresh`, garantissant analytiquement $\text{MSE}_{\max} \le \max(\lfloor q/2 \rfloor^2, \frac{67}{64} E^2)$ pour toute image possible ($\ge 35{,}89\text{ dB}$ pour $E=4, q=4$).
+* **JND fermé arête-vs-texture (`cfg.jnd_boost`)** : `zcrudp_ternary_block_jnd_threshold()` sépare sur `ref` les arêtes alignées (UI/texte, cohérence directionnelle élevée $\rightarrow$ seuil inchangé) des textures désordonnées (énergie élevée et faible cohérence $\rightarrow$ relèvement du seuil sans dérive ni bit de signalisation).
+
+### 9.2 Optimisations débit/latence 1080p360
+* **Décompactage sans division (CPU, AVX2 16 voies, HLSL)** : factorisation 32 bits (`69043U >> 24`) et Granlund-Montgomery 16 bits (`3507`) dans `protocol_ternary.h`, `ternary_codec.h` (`zcrudp_ternary_unpack10_x16_avx2`) et `ternary_decode.hlsl`.
+* **rANS statique 4 voies (`ternary_rans.h`, `DELTA_RANS`)** : 4 états `uint32_t` entrelacés sur 4 profils CDF 12 bits avec repli automatique vers `DELTA` si le paquet ne rétrécit pas.
+* **Realloc v2 (`DELTA_RV2`)** : réalloue les 6 487 codes `[59049..65535]` en RLE double résolution (`1..384` + puissances de 2 `512..32768`) et fusion saut + bloc de poids 1 (`W1`) ou 2 (`W2`) sans division.
+* **Flux auxiliaires & décodage fusionné** : compression `TILE_MV_DPCM`, partage `Y -> UV` en NV12 avec alignement pair strict (`apply_tile_mv_nv12_state`), décodage en une passe (`decode_packets_fused`), sommeil OS dans `ternary_mt.h`, et parallélisation `zcrudp_ternary_mt_encode_intra_range()`.
+
+### 9.3 Suite de preuves exhaustives (`tests/test_ternary_proofs.c`)
+Exécutée automatiquement par `make test` et `make sanitize` (ASan + UBSan) :
+1. Descente stricte du quantificateur (`20 971 520` tuples).
+2. Borne d'erreur `INTRA_Q_EC` sur tous les `4 128 768` triplets `(src, pred, q)`.
+3. Parité extrême `q = 2, err = ±255` (`q_res = ±128`, `0` pixel d'écart).
+4. Borne adversariale universelle ($\ge 35{,}89\text{ dB}$ sur bruit blanc, damier inversé et impulsions 64 octets).
+5. Récupération `TileMV` sur 8 directions/vitesses de panoramique ($\ge 38\text{ dB}$, `0` pixel d'écart).
+6. Parité décroissance AVX2 vs scalaire sur tous les `16 777 216` triplets `(px, neutral_y, gamma_q8)`.
+7. Décompactage sans division sur les `59 049` mots et formule Granlund-Montgomery `/ 243` sur les `65 536` valeurs `uint16_t`.
+8. Parité `DELTA_RANS` + `decode_packets_fused` et sûreté sur paquets hostiles.
+9. JND fermé (`-79,4 %` octets sur texture bruitée, `0,00` d'écart MSE sur UI nette).
+10. Résilience et récupération sous pertes UDP en rafale Gilbert–Elliott (`38,17 dB`).
+11. Parité exhaustive `Realloc v2` (`W1`, `W2`, RLE puissances de 2, `-45,3 %` sur blocs dispersés).
+12. Compression `TILE_MV_DPCM` (`-91,8 %`) et alignement NV12 `Y -> UV` (`dx = 7` impair, `0` inversion U/V).
+13. Parité `INTRA_Q_EC` multi-thread (`4` threads, `0` pixel d'écart).
