@@ -38,9 +38,9 @@ $(TARGET_PROOFS): tests/test_ternary_proofs.c include/ternary_codec.h include/te
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 sanitize: tests/test_ternary_packing.c tests/test_ternary_codec.c tests/test_ternary_proofs.c include/protocol_ternary.h include/ternary_codec.h include/ternary_entropy.h
-	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_ternary_packing.c -o tests/test_ternary_packing_san$(EXE)
-	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_ternary_codec.c -o tests/test_ternary_codec_san$(EXE) $(LDFLAGS)
-	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_ternary_proofs.c -o tests/test_ternary_proofs_san$(EXE) $(LDFLAGS)
+	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -mavx2 -fsanitize=address,undefined tests/test_ternary_packing.c -o tests/test_ternary_packing_san$(EXE)
+	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -mavx2 -fsanitize=address,undefined tests/test_ternary_codec.c -o tests/test_ternary_codec_san$(EXE) $(LDFLAGS)
+	$(CC) -Wall -Wextra -Werror -O1 -g -std=c11 -Iinclude -mavx2 -fsanitize=address,undefined tests/test_ternary_proofs.c -o tests/test_ternary_proofs_san$(EXE) $(LDFLAGS)
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_ternary_packing_san$(EXE),./tests/test_ternary_packing_san$(EXE)))
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_ternary_codec_san$(EXE),./tests/test_ternary_codec_san$(EXE)))
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_ternary_proofs_san$(EXE),./tests/test_ternary_proofs_san$(EXE)))

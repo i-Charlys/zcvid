@@ -308,18 +308,34 @@ static inline void zcrudp_slice_header_read_le(const uint8_t src[8],
  * @param neutral_y Neutral gray background reference (default 128).
  * @return uint8_t Reconstructed pixel value clamped to [0, 255].
  */
+/**
+ * @brief Applies leaky integration update step with extended Q0.8 gamma (>=256 = no decay).
+ */
+static inline uint8_t zcrudp_leaky_integrator_step_ex(uint8_t prev_y,
+                                                      zcrudp_trit_t trit,
+                                                      uint8_t delta,
+                                                      uint16_t gamma_q8,
+                                                      uint8_t neutral_y) {
+    int32_t decayed_val;
+    if (gamma_q8 >= 256U) {
+        decayed_val = (int32_t)prev_y;
+    } else {
+        int32_t diff = (int32_t)prev_y - (int32_t)neutral_y;
+        decayed_val = (int32_t)neutral_y + (diff * (int32_t)gamma_q8) / 256;
+    }
+    int32_t new_val = decayed_val + ((int32_t)trit * (int32_t)delta);
+
+    if (new_val < 0) return 0;
+    if (new_val > 255) return 255;
+    return (uint8_t)new_val;
+}
+
 static inline uint8_t zcrudp_leaky_integrator_step(uint8_t prev_y,
                                                    zcrudp_trit_t trit,
                                                    uint8_t delta,
                                                    uint8_t gamma_q8,
                                                    uint8_t neutral_y) {
-    int32_t diff = (int32_t)prev_y - (int32_t)neutral_y;
-    int32_t decayed_diff = (diff * (int32_t)gamma_q8) / 256;
-    int32_t new_val = (int32_t)neutral_y + decayed_diff + ((int32_t)trit * (int32_t)delta);
-
-    if (new_val < 0) return 0;
-    if (new_val > 255) return 255;
-    return (uint8_t)new_val;
+    return zcrudp_leaky_integrator_step_ex(prev_y, trit, delta, (uint16_t)gamma_q8, neutral_y);
 }
 
 /**

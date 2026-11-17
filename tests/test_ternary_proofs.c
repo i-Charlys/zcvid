@@ -702,19 +702,26 @@ static void prove_realloc_v2_exhaustive(void) {
     memset(ed_a, cfg_a.delta_min, len); memset(ed_b, cfg_b.delta_min, len);
     memset(dd_a, cfg_a.delta_min, len); memset(dd_b, cfg_b.delta_min, len);
 
-    /* Place scattered W1 and W2 perturbations separated by skips 1..150 and >512 */
+    /* Place all 20 W1 patterns (both 1..128 and 129..160 gaps) and all 180 W2 patterns */
     size_t pos = 0U;
-    for (int i = 0; i < 20; i++) {
-        size_t p0 = (size_t)(i & 9);
-        src[pos * 10U + p0] = (i & 1) ? 100U : 156U;
-        pos += (size_t)(2 + (i * 7) % 150);
+    for (int p0 = 0; p0 < 10; p0++) {
+        for (int s0 = 0; s0 < 2; s0++) {
+            size_t gap = (s0 == 0) ? (size_t)(2 + p0 * 11) : (size_t)(130 + p0 * 3);
+            pos += gap;
+            assert(pos * 10U + 10U < len);
+            src[pos * 10U + (size_t)p0] = (s0 == 0) ? 160U : 96U;
+        }
     }
-    for (int i = 0; i < 45; i++) {
-        size_t p0 = (size_t)(i % 9);
-        size_t p1 = p0 + 1U;
-        src[pos * 10U + p0] = (i & 1) ? 100U : 156U;
-        src[pos * 10U + p1] = (i & 2) ? 100U : 156U;
-        pos += (size_t)(2 + (i % 14));
+    for (int p0 = 0; p0 < 9; p0++) {
+        for (int p1 = p0 + 1; p1 < 10; p1++) {
+            for (int signs = 0; signs < 4; signs++) {
+                size_t gap = (size_t)(2 + ((p0 + p1 + signs) % 15));
+                pos += gap;
+                assert(pos * 10U + 10U < len);
+                src[pos * 10U + (size_t)p0] = (signs & 2) ? 96U : 160U;
+                src[pos * 10U + (size_t)p1] = (signs & 1) ? 96U : 160U;
+            }
+        }
     }
     /* Power-of-2 large skip > 1024 blocks */
     pos += 1100U;
@@ -849,6 +856,175 @@ static void prove_mt_parallel_intra(void) {
     printf("PROVEN (%zu pkts, %zu B, 0 px differ)\n", total_pkts, bytes);
 }
 
+/*
+ * Proof 14: NO_DECAY Zero-Leak Mode + P0 Bounds Guards (odd NV12 width, small MTU).
+ */
+static void prove_no_decay_and_safety_guards(void) {
+    printf("[PROOF 14] NO_DECAY Zero-Leak + Odd NV12 & Small MTU Guards... ");
+    const uint16_t W = 160, H = 80;
+    const size_t len = (size_t)W * H;
+    uint8_t *src = (uint8_t *)malloc(len);
+    uint8_t *ref = (uint8_t *)malloc(len), *can = (uint8_t *)malloc(len), *can_f = (uint8_t *)malloc(len);
+    uint8_t *ed = (uint8_t *)malloc(len), *dd = (uint8_t *)malloc(len), *dd_f = (uint8_t *)malloc(len);
+    proof_sink_t s = { malloc(128U * 1400U), malloc(128U * sizeof(size_t)), 0, 128 };
+    assert(src && ref && can && can_f && ed && dd && dd_f && s.pkts && s.lens);
+
+    zcrudp_ternary_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        .delta_min = 2, .delta_max = 32, .threshold = 2,
+        .gamma_q8 = 200, .neutral_y = 128, .mtu_payload = 1380,
+        .entropy = 0U, .no_decay = 1U
+    };
+    memset(src, 220, len);
+    memset(ref, 220, len); memset(can, 220, len); memset(can_f, 220, len);
+    memset(ed, cfg.delta_min, len); memset(dd, cfg.delta_min, len); memset(dd_f, cfg.delta_min, len);
+
+    uint8_t pkt_buf[1400];
+    for (int f = 0; f < 50; f++) {
+        for (uint16_t y = 10; y < 30; y++) {
+            for (uint16_t x = 10; x < 50; x++) {
+                src[(size_t)y * W + x] = (uint8_t)(40 + (f * 3) % 180);
+            }
+        }
+        s.count = 0;
+        zcrudp_ternary_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
+        zcrudp_ternary_decay_plane_cfg(can, len, &cfg);
+        for (size_t i = 0; i < s.count; i++) {
+            assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+        }
+        const uint8_t *ptrs[128];
+        for (size_t i = 0; i < s.count; i++) ptrs[i] = s.pkts[i];
+        assert(zcrudp_ternary_decode_packets_fused(ptrs, s.lens, s.count, can_f, dd_f, len, &cfg));
+        assert(memcmp(ref, can, len) == 0);
+        assert(memcmp(ref, can_f, len) == 0);
+        assert(memcmp(ed, dd, len) == 0);
+        assert(memcmp(ed, dd_f, len) == 0);
+        /* Stationary pixel at (0,0) must stay exactly 220 (zero leak toward neutral_y=128) */
+        assert(can[0] == 220U && can_f[0] == 220U);
+    }
+
+    /* Odd width NV12 UV TileMV must not write out of bounds */
+    const uint16_t OW = 65U, OH = 34U, OTILE = 32U;
+    const size_t ouv_sz = (size_t)OW * (OH / 2U);
+    uint8_t *uv_p = (uint8_t *)malloc(ouv_sz);
+    uint8_t *uv_m = (uint8_t *)malloc(ouv_sz);
+    int8_t omvs[2 * 3 * 2] = { 3, 2, -5, 4, 1, -2, 0, 0, 7, 3, -3, -1 };
+    assert(uv_p && uv_m);
+    memset(uv_p, 128, ouv_sz);
+    zcrudp_ternary_apply_tile_mv_nv12_state(uv_p, uv_m, NULL, NULL, OW, OH, OTILE, omvs);
+    free(uv_p); free(uv_m);
+
+    /* Guard small mtu_payload (<= 13) in all packet emitters */
+    uint8_t tiny_pkt[16];
+    for (uint16_t mtu = 0; mtu <= 13U; mtu++) {
+        zcrudp_ternary_config_t tcfg = cfg;
+        tcfg.mtu_payload = mtu;
+        s.count = 0;
+        assert(zcrudp_ternary_encode_plane(src, ref, ed, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_ternary_encode_tile_mv_pkts(omvs, 6, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_ternary_encode_tile_mv_dpcm(omvs, 6, 3, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(s.count == 0U);
+    }
+
+    free(src); free(ref); free(can); free(can_f); free(ed); free(dd); free(dd_f);
+    free(s.pkts); free(s.lens);
+    printf("PROVEN (50 frames 0 leak, odd NV12 & MTU<=13 safe)\n");
+}
+
+/*
+ * Proof 15: JND MT Race-Free + NV12 UV lstep=2 + 1-2px Thin UI Line Protection + MT dropped_pkts.
+ */
+static void prove_jnd_mt_and_nv12(void) {
+    printf("[PROOF 15] JND MT (4T) + NV12 UV lstep=2 + Thin UI Line Protection... ");
+    /* 1. Verify 1-2px thin UI line is protected (returns base_thr, not boosted) */
+    uint8_t ui_line[32];
+    memset(ui_line, 20, sizeof(ui_line));
+    ui_line[14] = 240; /* 1px vertical thin line */
+    assert(zcrudp_ternary_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
+    ui_line[15] = 240; /* 2px vertical thin line */
+    assert(zcrudp_ternary_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
+
+    /* 2. Verify MT JND on NV12 (Y + interleaved UV plane 1) matches sequential bit-for-bit */
+    const uint16_t W = 320, H = 160;
+    const size_t y_sz = (size_t)W * H;
+    const size_t uv_sz = y_sz / 2U;
+    uint8_t *src = (uint8_t *)malloc(y_sz + uv_sz);
+    uint8_t *ref_s = (uint8_t *)malloc(y_sz + uv_sz), *ref_m = (uint8_t *)malloc(y_sz + uv_sz);
+    uint8_t *can_s = (uint8_t *)malloc(y_sz + uv_sz), *can_m = (uint8_t *)malloc(y_sz + uv_sz);
+    uint8_t *ed_s = (uint8_t *)malloc(y_sz + uv_sz), *ed_m = (uint8_t *)malloc(y_sz + uv_sz);
+    uint8_t *dd_s = (uint8_t *)malloc(y_sz + uv_sz), *dd_m = (uint8_t *)malloc(y_sz + uv_sz);
+    uint8_t *slice_pkts = (uint8_t *)malloc(4U * 64U * 1400U);
+    size_t *slice_lens = (size_t *)malloc(4U * 64U * sizeof(size_t));
+    proof_sink_t ss = { malloc(256U * 1400U), malloc(256U * sizeof(size_t)), 0, 256 };
+    assert(src && ref_s && ref_m && can_s && can_m && ed_s && ed_m && dd_s && dd_m &&
+           slice_pkts && slice_lens && ss.pkts && ss.lens);
+
+    uint32_t rng = 0x12345678U;
+    for (size_t i = 0; i < y_sz + uv_sz; i++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        src[i] = (uint8_t)(90U + (rng % 80U));
+    }
+    zcrudp_ternary_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        .delta_min = 3, .delta_max = 32, .threshold = 3,
+        .gamma_q8 = 250, .neutral_y = 128, .mtu_payload = 1380,
+        .entropy = ZCRUDP_TERNARY_EC_RANS, .jnd_boost = 6U
+    };
+    memset(ref_s, 128, y_sz + uv_sz); memset(ref_m, 128, y_sz + uv_sz);
+    memset(can_s, 128, y_sz + uv_sz); memset(can_m, 128, y_sz + uv_sz);
+    memset(ed_s, cfg.delta_min, y_sz + uv_sz); memset(ed_m, cfg.delta_min, y_sz + uv_sz);
+    memset(dd_s, cfg.delta_min, y_sz + uv_sz); memset(dd_m, cfg.delta_min, y_sz + uv_sz);
+
+    zcrudp_ternary_mt_pool_t pool;
+    zcrudp_ternary_mt_init(&pool, 4U, slice_pkts, slice_lens, 64U, 1400U);
+
+    uint8_t pkt_buf[1400];
+    for (uint8_t pl = 0; pl < 2U; pl++) {
+        size_t off = (pl == 0U) ? 0U : y_sz;
+        size_t plen = (pl == 0U) ? y_sz : uv_sz;
+        ss.count = 0;
+        zcrudp_ternary_encode_plane(src + off, ref_s + off, ed_s + off, plen, pl, 1, &cfg, pkt_buf, proof_cb, &ss);
+        zcrudp_ternary_decay_plane_cfg(can_s + off, plen, &cfg);
+        for (size_t i = 0; i < ss.count; i++) {
+            assert(zcrudp_ternary_decode_packet(ss.pkts[i], ss.lens[i], can_s + off, dd_s + off, plen, &cfg, NULL));
+        }
+
+        size_t mpkts = 0U;
+        zcrudp_ternary_mt_encode_plane(&pool, src + off, ref_m + off, ed_m + off, plen, pl, 1, &cfg, &mpkts);
+        assert(zcrudp_ternary_mt_dropped_pkts(&pool) == 0U);
+        zcrudp_ternary_mt_decay_plane(&pool, can_m + off, plen, &cfg);
+        for (uint32_t t = 0; t < pool.num_threads; t++) {
+            for (size_t k = 0; k < pool.workers[t].sink.count; k++) {
+                const uint8_t *pd = pool.workers[t].sink.pkts_base + k * pool.workers[t].sink.mtu_stride;
+                assert(zcrudp_ternary_decode_packet(pd, pool.workers[t].sink.lens_base[k],
+                                                    can_m + off, dd_m + off, plen, &cfg, NULL));
+            }
+        }
+        assert(memcmp(ref_s + off, ref_m + off, plen) == 0);
+        assert(memcmp(can_s + off, can_m + off, plen) == 0);
+        assert(memcmp(ed_s + off, ed_m + off, plen) == 0);
+    }
+
+    /* 3. Verify dropped_pkts is surfaced when max_pkts_per_thread is too small */
+    zcrudp_ternary_mt_pool_t tiny_pool;
+    zcrudp_ternary_mt_init(&tiny_pool, 2U, slice_pkts, slice_lens, 1U, 1400U);
+    zcrudp_ternary_config_t tok_cfg = cfg;
+    tok_cfg.entropy = 0U;
+    tok_cfg.mtu_payload = 64U;
+    memset(ref_m, 128, y_sz);
+    size_t tpkts = 0U;
+    zcrudp_ternary_mt_encode_plane(&tiny_pool, src, ref_m, ed_m, y_sz, 0, 2, &tok_cfg, &tpkts);
+    assert(zcrudp_ternary_mt_dropped_pkts(&tiny_pool) > 0U);
+    zcrudp_ternary_mt_destroy(&tiny_pool);
+
+    zcrudp_ternary_mt_destroy(&pool);
+    free(src); free(ref_s); free(ref_m); free(can_s); free(can_m);
+    free(ed_s); free(ed_m); free(dd_s); free(dd_m);
+    free(slice_pkts); free(slice_lens); free(ss.pkts); free(ss.lens);
+    printf("PROVEN (4T NV12 JND 0 px drift, thin UI protected)\n");
+}
+
 int main(void) {
     printf("=== zcrudp Ternary Formal & Exhaustive Proof Suite ===\n\n");
     prove_quant_strict_descent();
@@ -864,6 +1040,8 @@ int main(void) {
     prove_realloc_v2_exhaustive();
     prove_tile_mv_dpcm_and_uv_sharing();
     prove_mt_parallel_intra();
+    prove_no_decay_and_safety_guards();
+    prove_jnd_mt_and_nv12();
     printf("\n=== ALL PROOFS VERIFIED ===\n");
     return 0;
 }

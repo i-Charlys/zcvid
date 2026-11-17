@@ -19,6 +19,15 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define ZCRUDP_MT_ALIGNAS64 _Alignas(64)
+#elif defined(_MSC_VER)
+#define ZCRUDP_MT_ALIGNAS64 __declspec(align(64))
+#else
+#define ZCRUDP_MT_ALIGNAS64 __attribute__((aligned(64)))
 #endif
 
 #ifdef __cplusplus
@@ -59,7 +68,7 @@ typedef struct {
 typedef struct zcrudp_ternary_mt_pool zcrudp_ternary_mt_pool_t;
 
 typedef struct {
-    zcrudp_ternary_mt_pool_t *pool;
+    ZCRUDP_MT_ALIGNAS64 zcrudp_ternary_mt_pool_t *pool;
     uint32_t tid;
     uint8_t  pkt_scratch[1500];
     zcrudp_mt_slice_sink_t sink;
@@ -72,10 +81,11 @@ typedef struct {
 
 struct zcrudp_ternary_mt_pool {
     uint32_t num_threads;
+    size_t   last_dropped_pkts;
     zcrudp_mt_worker_t workers[ZCRUDP_TERNARY_MT_MAX_THREADS];
 
-    atomic_uint_fast32_t gen;
-    atomic_uint_fast32_t active_workers;
+    ZCRUDP_MT_ALIGNAS64 atomic_uint_fast32_t gen;
+    ZCRUDP_MT_ALIGNAS64 atomic_uint_fast32_t active_workers;
     atomic_int           op;
 
 #if defined(_WIN32)
@@ -164,8 +174,10 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         size_t i1 = i0 + chunk;
         if (i0 < p->plane_len) {
             if (i1 > p->plane_len) i1 = p->plane_len;
-            zcrudp_ternary_decay_plane(p->ref_or_canvas + i0, i1 - i0,
-                                       p->cfg->gamma_q8, p->cfg->neutral_y);
+            if (!p->cfg->no_decay) {
+                zcrudp_ternary_decay_plane(p->ref_or_canvas + i0, i1 - i0,
+                                           p->cfg->gamma_q8, p->cfg->neutral_y);
+            }
         }
     } else if (op == ZCRUDP_MT_OP_DECODE_PKTS) {
         size_t cnt = p->pkt_in_count;
@@ -269,8 +281,18 @@ static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
     }
     zcrudp_mt_run_task(p, 0);
     if (p->num_threads > 1U) {
+        uint32_t spins = 0U;
         while (atomic_load_explicit(&p->active_workers, memory_order_acquire) != 0U) {
-            ZCRUDP_MT_CPU_RELAX();
+            if (++spins < 512U) {
+                ZCRUDP_MT_CPU_RELAX();
+            } else {
+#if defined(_WIN32)
+                SwitchToThread();
+#else
+                sched_yield();
+#endif
+                spins = 0U;
+            }
         }
     }
 }
@@ -377,18 +399,28 @@ static inline size_t zcrudp_ternary_mt_encode_plane(zcrudp_ternary_mt_pool_t *p,
 
     size_t bytes = 0;
     size_t pkts = 0;
+    size_t dropped = 0;
     for (uint32_t t = 0; t < p->num_threads; t++) {
         bytes += p->workers[t].sink.total_bytes;
         pkts += p->workers[t].sink.count;
+        dropped += p->workers[t].sink.dropped_pkts;
     }
+    p->last_dropped_pkts = dropped;
     if (out_total_pkts) *out_total_pkts = pkts;
     return bytes;
+}
+
+static inline size_t zcrudp_ternary_mt_dropped_pkts(const zcrudp_ternary_mt_pool_t *p) {
+    return p ? p->last_dropped_pkts : 0U;
 }
 
 static inline void zcrudp_ternary_mt_decay_plane(zcrudp_ternary_mt_pool_t *p,
                                                  uint8_t *canvas,
                                                  size_t len,
                                                  const zcrudp_ternary_config_t *cfg) {
+    if (cfg->no_decay) {
+        return;
+    }
     p->ref_or_canvas = canvas;
     p->plane_len = len;
     p->cfg = cfg;
@@ -484,11 +516,13 @@ static inline size_t zcrudp_ternary_mt_encode_intra_range(zcrudp_ternary_mt_pool
 
     zcrudp_mt_dispatch(p, ZCRUDP_MT_OP_ENCODE_INTRA);
 
-    size_t bytes = 0U, pkts = 0U;
+    size_t bytes = 0U, pkts = 0U, dropped = 0U;
     for (uint32_t t = 0U; t < p->num_threads; t++) {
         bytes += p->workers[t].sink.total_bytes;
         pkts += p->workers[t].sink.count;
+        dropped += p->workers[t].sink.dropped_pkts;
     }
+    p->last_dropped_pkts = dropped;
     if (out_total_pkts) *out_total_pkts = pkts;
     return bytes;
 }

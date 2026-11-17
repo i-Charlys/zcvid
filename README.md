@@ -22,15 +22,15 @@ photographs the delta stream shrinks by 1.4x to 1.8x and anchors by 1.9x to
 | `include/ternary_rans.h` | 4-way interleaved 12-bit static rANS coder (`DELTA_RANS`) with 4 compile-time CDF profiles |
 | `include/ternary_mt.h` | Persistent worker pool (OS sleep/wake) for sliced delta/intra encode, decay, and ordered decode |
 | `include/ternary_zcrudp_bridge.h` | Routes packets to a reliable (`INTRA*`, `TILE_MV*`) or unreliable (`DELTA*`) channel |
-| `shaders/ternary_encode.hlsl`, `shaders/ternary_decode.hlsl` | D3D11 compute (`cs_5_0`) YCbCr encoder (`CSTileMV` ±1) and division-free decoder, used by [`streaming`](../streaming) |
-| `tests/test_ternary_proofs.c` | Exhaustive & adversarial formal proof suite (13 proofs) run by `make test` and `make sanitize` |
+| `shaders/ternary_encode.hlsl`, `shaders/ternary_decode.hlsl` | D3D11 compute (`cs_5_0`) YCbCr encoder and decoder used by [`streaming`](../streaming): pyramid motion search with quarter-pel refinement and 4-tap interpolation, ternary deltas, transform blocks (4x4 integer transform, intra and motion residual), display deblocking. Encoder and decoder share the integer interpolation and inverse transform code word for word, so they stay bit-exact on any GPU. Results and design notes: [`streaming/README.md`](../streaming/README.md) |
+| `tests/test_ternary_proofs.c` | Exhaustive & adversarial formal proof suite (15 proofs) run by `make test` and `make sanitize` |
 | `docs/research/TERNARY_VIDEO_TRANSPORT.md` | Design study (French) |
 
 ## Build and test
 
 ```sh
 make test       # packing + codec tests and the 1080p benchmark (-O3 -mavx2)
-make sanitize   # same tests under ASan + UBSan, scalar path
+make sanitize   # same tests under ASan + UBSan, AVX2 path included
 make bench-image IMG=photo.pgm   # token vs entropy-coded size on a real picture
 ```
 

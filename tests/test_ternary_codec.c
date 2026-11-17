@@ -1745,13 +1745,35 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
     uint8_t bad_pkt[64];
     memcpy(bad_pkt, sq.pkts, sq.lens[0] < sizeof(bad_pkt) ? sq.lens[0] : sizeof(bad_pkt));
     bad_pkt[2] = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8, ZCRUDP_TERNARY_PKT_INTRA_Q_EC);
-    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 1U, can_loss, NULL, len, &cfg_q, NULL));
+    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ, can_loss, NULL, len, &cfg_q, NULL));
     bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 0U;
     assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
     bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 1U;
     assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
     bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 65U;
     assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
+
+    /* A picture equal to its prediction (flat 128) quantizes to all-zero
+     * residuals: the range-coded stream is empty and each packet carries the
+     * step alone. The decoder must take those packets, not reject them. */
+    {
+        pkt_sink_t sf = { (uint8_t *)malloc(256U * 1400U), (size_t *)malloc(256U * sizeof(size_t)), 0, 256, 1400, 0 };
+        assert(sf.pkts && sf.lens);
+        memset(src, 128, len);
+        memset(ref_q, 128, len);
+        memset(can_q, 77, len); /* stale decoder picture the anchor must replace */
+        memset(ed, cfg_q.delta_min, len);
+        memset(dd, cfg_q.delta_min, len);
+        zcrudp_ternary_encode_intra_range(src, ref_q, ed, 0, len, len, 0, 0, &cfg_q,
+                                          pkt_buf, sink_cb, &sf);
+        assert(sf.count > 0U);
+        for (size_t i = 0; i < sf.count; i++) {
+            assert(zcrudp_ternary_decode_packet(sf.pkts + i * sf.mtu, sf.lens[i], can_q, dd, len,
+                                                &cfg_q, NULL));
+        }
+        assert(memcmp(ref_q, can_q, len) == 0);
+        free(sf.pkts); free(sf.lens);
+    }
 
     free(sq.pkts); free(sq.lens); free(sl.pkts); free(sl.lens);
     free(can_loss); free(src); free(ref_q); free(can_q); free(ref_l); free(ed); free(dd);

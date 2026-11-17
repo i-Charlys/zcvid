@@ -97,6 +97,7 @@ typedef struct {
                                INTRA_EC; >= 2 = near-lossless INTRA_Q_EC when
                                ZCRUDP_TERNARY_EC_INTRA is enabled). */
     uint8_t  jnd_boost;   /**< Closed-loop edge-preserving JND deadzone boost (0 = off). */
+    uint8_t  no_decay;    /**< Non-zero: true zero-leak mode (no decay toward neutral_y). */
 } zcrudp_ternary_config_t;
 
 typedef struct {
@@ -231,6 +232,16 @@ static inline void zcrudp_ternary_decay_plane(uint8_t * ZCRUDP_RESTRICT canvas,
     }
 }
 
+/** @brief Config-aware plane decay (no-op when cfg->no_decay is non-zero). */
+static inline void zcrudp_ternary_decay_plane_cfg(uint8_t * ZCRUDP_RESTRICT canvas,
+                                                  size_t len,
+                                                  const zcrudp_ternary_config_t *cfg) {
+    if (cfg->no_decay) {
+        return;
+    }
+    zcrudp_ternary_decay_plane(canvas, len, cfg->gamma_q8, cfg->neutral_y);
+}
+
 /* =========================================================================
  * DELTA_2X Sample Geometry
  * ========================================================================= */
@@ -297,7 +308,8 @@ ZCRUDP_TERNARY_INLINE zcrudp_trit_t zcrudp_ternary_encode_sample(uint8_t cur,
             *shrink = true;
         }
     }
-    *ref = zcrudp_leaky_integrator_step(*ref, t, step, cfg->gamma_q8, cfg->neutral_y);
+    uint16_t gamma = cfg->no_decay ? 256U : (uint16_t)cfg->gamma_q8;
+    *ref = zcrudp_leaky_integrator_step_ex(*ref, t, step, gamma, cfg->neutral_y);
     return t;
 }
 
@@ -359,12 +371,17 @@ static inline bool zcrudp_ternary_encode_block_avx2(const uint8_t *src,
     }
 
     /* leaky integrator in 16-bit lanes: neutral + trunc((ref - neutral) * gamma / 256) + trit * step */
-    const __m256i v_neutral = _mm256_set1_epi16((int16_t)cfg->neutral_y);
-    const __m256i v_gamma = _mm256_set1_epi16((int16_t)cfg->gamma_q8);
-    const __m256i df = _mm256_sub_epi16(_mm256_cvtepu8_epi16(r), v_neutral);
-    const __m256i q = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_abs_epi16(df), v_gamma), 8);
     const __m256i move = _mm256_sign_epi16(_mm256_cvtepu8_epi16(d), _mm256_cvtepi8_epi16(t8));
-    const __m256i nv = _mm256_add_epi16(_mm256_add_epi16(v_neutral, _mm256_sign_epi16(q, df)), move);
+    __m256i nv;
+    if (cfg->no_decay) {
+        nv = _mm256_add_epi16(_mm256_cvtepu8_epi16(r), move);
+    } else {
+        const __m256i v_neutral = _mm256_set1_epi16((int16_t)cfg->neutral_y);
+        const __m256i v_gamma = _mm256_set1_epi16((int16_t)cfg->gamma_q8);
+        const __m256i df = _mm256_sub_epi16(_mm256_cvtepu8_epi16(r), v_neutral);
+        const __m256i q = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_abs_epi16(df), v_gamma), 8);
+        nv = _mm256_add_epi16(_mm256_add_epi16(v_neutral, _mm256_sign_epi16(q, df)), move);
+    }
     const __m256i pk = _mm256_permute4x64_epi64(_mm256_packus_epi16(nv, nv), 0xD8);
     zcrudp_ternary_store10(ref, _mm256_castsi256_si128(pk));
 
@@ -661,6 +678,9 @@ ZCRUDP_TERNARY_INLINE void zcrudp_ternary_ec_get_block(zcrudp_rc_dec_t *rc_io,
  * fixed 16-bit tokens with RLE skips or as a range-coded stream.
  * ========================================================================= */
 
+#define ZCRUDP_RANS_MAX_BLOCKS 2048U
+#define ZCRUDP_RANS_MAX_SYMS   8192U
+
 typedef struct {
     const zcrudp_ternary_config_t *cfg;
     uint8_t *pkt_buf;
@@ -673,7 +693,7 @@ typedef struct {
     size_t max_payload;     /**< bytes available after the header */
     size_t next_blk;        /**< block that follows the last one emitted */
     uint32_t pkt_start_block;
-    uint32_t pkt_count;     /**< token mode: tokens, range-coded: blocks */
+    uint32_t pkt_count;     /**< token mode: tokens, range-coded/rANS: blocks */
     uint16_t frame_id;
     uint8_t plane_id;
     bool is_2x;
@@ -684,6 +704,17 @@ typedef struct {
     size_t ec_blocks_left;  /**< range-coded blocks still allowed (CPU cap) */
     zcrudp_rc_enc_t rc;
     zcrudp_tec_model_t model; /**< only touched when ec is set */
+    /* Direct rANS accumulator (used when rans is set) */
+    uint16_t rans_num_nz;
+    uint16_t rans_num_syms;
+    uint16_t rans_skip_len;
+    uint16_t rans_next_chk;
+    uint32_t rans_raw_toks;
+    uint32_t rans_zrun;
+    uint8_t  rans_syms[ZCRUDP_RANS_MAX_SYMS];
+    uint8_t  rans_sign_buf[(ZCRUDP_RANS_MAX_BLOCKS * 10U + 7U) / 8U + 4U];
+    uint8_t  rans_skip_mask[ZCRUDP_RANS_MAX_BLOCKS / 8U];
+    uint8_t  rans_skip_vals[ZCRUDP_RANS_MAX_BLOCKS * 3U];
 } zcrudp_ternary_emit_t;
 
 static inline void zcrudp_ternary_emit_init(zcrudp_ternary_emit_t *e,
@@ -704,7 +735,7 @@ static inline void zcrudp_ternary_emit_init(zcrudp_ternary_emit_t *e,
     e->span = is_2x ? ZCRUDP_TERNARY_2X_SPAN : 10U;
     e->max_payload = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
         ? (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ) : 0U;
-    e->max_tokens = (e->max_payload >= 2U) ? (e->max_payload / 2U) : 1U;
+    e->max_tokens = (e->max_payload >= 2U) ? (e->max_payload / 2U) : 0U;
     e->next_blk = 0;
     e->pkt_start_block = 0;
     e->pkt_count = 0;
@@ -721,6 +752,12 @@ static inline void zcrudp_ternary_emit_init(zcrudp_ternary_emit_t *e,
     e->rv2 = !e->rans && !is_2x &&
              (cfg->entropy & ZCRUDP_TERNARY_EC_REALLOC_V2) != 0U;
     e->ec_blocks_left = (cfg->ec_max_blocks != 0U) ? (size_t)cfg->ec_max_blocks : SIZE_MAX;
+    e->rans_num_nz = 0U;
+    e->rans_num_syms = 0U;
+    e->rans_skip_len = 0U;
+    e->rans_next_chk = 1U;
+    e->rans_raw_toks = 0U;
+    e->rans_zrun = 0U;
 }
 
 static inline size_t zcrudp_ternary_try_rans_pack(uint8_t *payload_io,
@@ -732,7 +769,9 @@ static inline size_t zcrudp_ternary_try_rans_pack(uint8_t *payload_io,
     }
     const size_t tok_bytes = tok_count * 2U;
     uint8_t syms[4096];
-    uint8_t sign_buf[1024];
+    /* 10 sign bits per token at most, plus the byte the memset below adds:
+     * 1281 bytes for 1024 tokens. */
+    uint8_t sign_buf[(1024U * 10U + 7U) / 8U + 4U];
     uint8_t skip_mask[128];
     uint8_t skip_vals[2048];
     uint8_t rans_out[2048];
@@ -830,28 +869,40 @@ static inline size_t zcrudp_ternary_try_rans_pack(uint8_t *payload_io,
     return hdr_len + rans_len;
 }
 
-static inline void zcrudp_ternary_emit_flush(zcrudp_ternary_emit_t *e) {
-    if (e->pkt_count == 0U) {
-        return;
+static inline size_t zcrudp_ternary_emit_rans_pack(zcrudp_ternary_emit_t *e,
+                                                   uint8_t *payload) {
+    const size_t k = (size_t)e->pkt_count;
+    const size_t mask_len = (k + 7U) / 8U;
+    const size_t sign_len = ((size_t)e->rans_num_nz + 7U) / 8U;
+    const size_t hdr_len  = 6U + mask_len + (size_t)e->rans_skip_len + sign_len;
+    if (hdr_len + 17U > e->max_payload) {
+        return 0U;
     }
-    uint8_t ptype = e->ec
-        ? (e->is_2x ? ZCRUDP_TERNARY_PKT_DELTA_2X_EC : ZCRUDP_TERNARY_PKT_DELTA_EC)
-        : (e->rv2 ? ZCRUDP_TERNARY_PKT_DELTA_RV2
-                  : (e->is_2x ? ZCRUDP_TERNARY_PKT_DELTA_2X : ZCRUDP_TERNARY_PKT_DELTA));
-    size_t payload = e->ec ? zcrudp_rc_enc_finish(&e->rc) : (size_t)e->pkt_count * 2U;
-    uint32_t out_count = e->pkt_count;
-
-    if (e->rans) {
-        uint16_t k_blocks = 0U;
-        size_t rlen = zcrudp_ternary_try_rans_pack(
-            e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, e->pkt_count, e->max_payload, &k_blocks);
-        if (rlen > 0U) {
-            ptype = ZCRUDP_TERNARY_PKT_DELTA_RANS;
-            payload = rlen;
-            out_count = k_blocks;
-        }
+    uint8_t rans_scratch[2048];
+    uint8_t profile = zcrudp_rans_pick_profile(e->rans_num_nz, k * 10U);
+    size_t rans_len = zcrudp_rans_encode_syms(
+        e->rans_syms, e->rans_num_syms, profile,
+        payload + hdr_len, e->max_payload - hdr_len,
+        rans_scratch, sizeof(rans_scratch));
+    if (rans_len == 0U) {
+        return 0U;
     }
+    payload[0] = (uint8_t)(e->rans_num_nz & 0xFFU);
+    payload[1] = (uint8_t)((e->rans_num_nz >> 8) & 0xFFU);
+    payload[2] = (uint8_t)(e->rans_num_syms & 0xFFU);
+    payload[3] = (uint8_t)((e->rans_num_syms >> 8) & 0xFFU);
+    payload[4] = (uint8_t)(e->rans_skip_len & 0xFFU);
+    payload[5] = (uint8_t)((e->rans_skip_len >> 8) & 0xFFU);
+    memcpy(payload + 6U, e->rans_skip_mask, mask_len);
+    if (e->rans_skip_len > 0U) memcpy(payload + 6U + mask_len, e->rans_skip_vals, e->rans_skip_len);
+    if (sign_len > 0U) memcpy(payload + 6U + mask_len + e->rans_skip_len, e->rans_sign_buf, sign_len);
+    return hdr_len + rans_len;
+}
 
+static inline void zcrudp_ternary_emit_send(zcrudp_ternary_emit_t *e,
+                                            uint8_t ptype,
+                                            size_t payload_len,
+                                            uint32_t out_count) {
     zcrudp_ternary_pkt_hdr_t hdr = {
         .magic = ZCRUDP_TERNARY_PKT_MAGIC,
         .pixfmt = ZCRUDP_TERNARY_MAKE_PF(e->cfg->pixfmt, ptype),
@@ -861,16 +912,71 @@ static inline void zcrudp_ternary_emit_flush(zcrudp_ternary_emit_t *e) {
         .num_tokens = (uint16_t)out_count
     };
     zcrudp_ternary_pkt_hdr_write_le(e->pkt_buf, &hdr);
-    size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + payload;
+    size_t psz = ZCRUDP_TERNARY_PKT_HDR_SZ + payload_len;
     e->cb(e->pkt_buf, psz, e->user_ctx);
     e->total_bytes += psz;
     e->pkt_count = 0;
+    e->rans_num_nz = 0U;
+    e->rans_num_syms = 0U;
+    e->rans_skip_len = 0U;
+    e->rans_next_chk = 1U;
+    e->rans_raw_toks = 0U;
+    e->rans_zrun = 0U;
+}
+
+static inline void zcrudp_ternary_emit_flush(zcrudp_ternary_emit_t *e) {
+    if (e->pkt_count == 0U) {
+        return;
+    }
+    if (e->rans) {
+        if (e->rans_raw_toks > 0U && e->rans_raw_toks <= e->max_tokens) {
+            uint8_t tmp_rans[2048];
+            const size_t k = (size_t)e->pkt_count;
+            const size_t mask_len = (k + 7U) / 8U;
+            const size_t sign_len = ((size_t)e->rans_num_nz + 7U) / 8U;
+            const size_t hdr_len  = 6U + mask_len + (size_t)e->rans_skip_len + sign_len;
+            if (hdr_len + 17U < e->rans_raw_toks * 2U && hdr_len + 17U <= e->max_payload &&
+                e->max_payload <= sizeof(tmp_rans)) {
+                size_t rlen = zcrudp_ternary_emit_rans_pack(e, tmp_rans);
+                if (rlen > 0U && rlen < e->rans_raw_toks * 2U) {
+                    memcpy(e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, tmp_rans, rlen);
+                    zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
+                    return;
+                }
+            }
+            zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA,
+                                     (size_t)e->rans_raw_toks * 2U, e->rans_raw_toks);
+            return;
+        }
+        size_t rlen = zcrudp_ternary_emit_rans_pack(e, e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ);
+        if (rlen > 0U) {
+            zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
+            return;
+        }
+        e->pkt_count = 0;
+        e->rans_num_nz = 0U;
+        e->rans_num_syms = 0U;
+        e->rans_skip_len = 0U;
+        e->rans_next_chk = 1U;
+        e->rans_raw_toks = 0U;
+        e->rans_zrun = 0U;
+        return;
+    }
+    uint8_t ptype = e->ec
+        ? (e->is_2x ? ZCRUDP_TERNARY_PKT_DELTA_2X_EC : ZCRUDP_TERNARY_PKT_DELTA_EC)
+        : (e->rv2 ? ZCRUDP_TERNARY_PKT_DELTA_RV2
+                  : (e->is_2x ? ZCRUDP_TERNARY_PKT_DELTA_2X : ZCRUDP_TERNARY_PKT_DELTA));
+    size_t payload = e->ec ? zcrudp_rc_enc_finish(&e->rc) : (size_t)e->pkt_count * 2U;
+    zcrudp_ternary_emit_send(e, ptype, payload, e->pkt_count);
 }
 
 /** Emits one coded block. Blocks must be passed in increasing order. */
 static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
                                              size_t blk,
                                              const zcrudp_trit_t trits[10]) {
+    if (e->max_payload < 2U) {
+        return;
+    }
     uint8_t *payload = e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ;
 
     if (e->ec && e->ec_blocks_left == 0U) {
@@ -898,6 +1004,159 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
         zcrudp_ternary_ec_put_block(&e->rc, &e->model, blk * e->span, e->plane_len,
                                     e->is_2x, e->il, trits);
         e->pkt_count++;
+        e->next_blk = blk + 1U;
+        return;
+    }
+
+    if (e->rans) {
+    retry_rans:
+        if (e->pkt_count > 0U) {
+            size_t gap = blk - e->next_blk;
+            if (gap > 65535U ||
+                e->pkt_count >= ZCRUDP_RANS_MAX_BLOCKS ||
+                (size_t)e->rans_skip_len + 3U > sizeof(e->rans_skip_vals)) {
+                zcrudp_ternary_emit_flush(e);
+            }
+        }
+        const uint32_t ck_k    = e->pkt_count;
+        const uint16_t ck_nz   = e->rans_num_nz;
+        const uint16_t ck_syms = e->rans_num_syms;
+        const uint16_t ck_skip = e->rans_skip_len;
+        const uint32_t ck_raw  = e->rans_raw_toks;
+        const uint32_t ck_zrun = e->rans_zrun;
+        const uint8_t  ck_mask = e->rans_skip_mask[ck_k >> 3];
+        const uint8_t  ck_sign = e->rans_sign_buf[ck_nz >> 3];
+
+        if (ck_k == 0U) {
+            e->pkt_start_block = (uint32_t)blk;
+            e->rans_skip_mask[0] = 0U;
+            e->rans_sign_buf[0] = 0U;
+            e->rans_raw_toks = 0U;
+        } else {
+            if ((ck_k & 7U) == 0U) {
+                e->rans_skip_mask[ck_k >> 3] = 0U;
+            }
+            size_t gap = blk - e->next_blk;
+            if (gap > 0U) {
+                e->rans_skip_mask[ck_k >> 3] |= (uint8_t)(1U << (ck_k & 7U));
+                if (gap < 255U) {
+                    e->rans_skip_vals[e->rans_skip_len++] = (uint8_t)gap;
+                } else {
+                    e->rans_skip_vals[e->rans_skip_len++] = 255U;
+                    e->rans_skip_vals[e->rans_skip_len++] = (uint8_t)(gap & 0xFFU);
+                    e->rans_skip_vals[e->rans_skip_len++] = (uint8_t)((gap >> 8) & 0xFFU);
+                }
+                if (e->rans_raw_toks <= e->max_tokens) {
+                    size_t nskip = (gap + ZCRUDP_TERNARY_MAX_SKIP - 1U) / ZCRUDP_TERNARY_MAX_SKIP;
+                    if ((size_t)e->rans_raw_toks + nskip + 1U <= e->max_tokens) {
+                        size_t g = gap;
+                        while (g > 0U) {
+                            size_t run = (g > ZCRUDP_TERNARY_MAX_SKIP) ? ZCRUDP_TERNARY_MAX_SKIP : g;
+                            zcrudp_ternary_write_u16_le(
+                                payload + (size_t)e->rans_raw_toks * 2U,
+                                (uint16_t)(ZCRUDP_TRIT_MAX_10P + (run - 1U)));
+                            e->rans_raw_toks++;
+                            g -= run;
+                        }
+                    } else {
+                        e->rans_raw_toks = (uint32_t)e->max_tokens + 1U;
+                    }
+                }
+            }
+        }
+        if (e->rans_raw_toks < e->max_tokens) {
+            zcrudp_ternary_write_u16_le(
+                payload + (size_t)e->rans_raw_toks * 2U,
+                zcrudp_pack_10trits(trits));
+            e->rans_raw_toks++;
+        } else {
+            e->rans_raw_toks = (uint32_t)e->max_tokens + 1U;
+        }
+
+        bool overflow = false;
+        for (size_t j = 0U; j < 10U; j++) {
+            zcrudp_trit_t t = trits[j];
+            if (t == 0) {
+                e->rans_zrun++;
+            } else {
+                while (e->rans_zrun >= 128U) {
+                    if (e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) { overflow = true; break; }
+                    e->rans_syms[e->rans_num_syms++] = 15U;
+                    e->rans_zrun -= 128U;
+                }
+                while (!overflow && e->rans_zrun >= 14U) {
+                    if (e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) { overflow = true; break; }
+                    e->rans_syms[e->rans_num_syms++] = 14U;
+                    e->rans_zrun -= 14U;
+                }
+                if (overflow || e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) {
+                    overflow = true;
+                    break;
+                }
+                e->rans_syms[e->rans_num_syms++] = (uint8_t)e->rans_zrun;
+                e->rans_zrun = 0U;
+                if ((e->rans_num_nz & 7U) == 0U) {
+                    e->rans_sign_buf[e->rans_num_nz >> 3] = 0U;
+                }
+                if (t < 0) {
+                    e->rans_sign_buf[e->rans_num_nz >> 3] |= (uint8_t)(1U << (e->rans_num_nz & 7U));
+                }
+                e->rans_num_nz++;
+            }
+        }
+        if (overflow) {
+            e->pkt_count = ck_k;
+            e->rans_num_nz = ck_nz;
+            e->rans_num_syms = ck_syms;
+            e->rans_skip_len = ck_skip;
+            e->rans_raw_toks = ck_raw;
+            e->rans_zrun = ck_zrun;
+            e->rans_skip_mask[ck_k >> 3] = ck_mask;
+            e->rans_sign_buf[ck_nz >> 3] = ck_sign;
+            zcrudp_ternary_emit_flush(e);
+            goto retry_rans;
+        }
+        e->pkt_count++;
+
+        if (e->pkt_count >= e->rans_next_chk) {
+            /* Pack into temporary buffer when raw tokens are still buffered so we don't clobber them */
+            uint8_t tmp_rans[2048];
+            uint8_t *dst_buf = (e->rans_raw_toks <= e->max_tokens && e->max_payload <= sizeof(tmp_rans))
+                ? tmp_rans : payload;
+            size_t rlen = zcrudp_ternary_emit_rans_pack(e, dst_buf);
+            if (rlen == 0U) {
+                if (ck_k > 0U) {
+                    e->pkt_count = ck_k;
+                    e->rans_num_nz = ck_nz;
+                    e->rans_num_syms = ck_syms;
+                    e->rans_skip_len = ck_skip;
+                    e->rans_raw_toks = ck_raw;
+                    e->rans_zrun = ck_zrun;
+                    e->rans_skip_mask[ck_k >> 3] = ck_mask;
+                    e->rans_sign_buf[ck_nz >> 3] = ck_sign;
+                    zcrudp_ternary_emit_flush(e);
+                    goto retry_rans;
+                }
+            } else if (rlen + 16U >= e->max_payload) {
+                if (dst_buf == tmp_rans) {
+                    if (e->rans_raw_toks <= e->max_tokens && rlen >= e->rans_raw_toks * 2U) {
+                        zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA,
+                                                 (size_t)e->rans_raw_toks * 2U, e->rans_raw_toks);
+                        e->next_blk = blk + 1U;
+                        return;
+                    }
+                    memcpy(payload, tmp_rans, rlen);
+                }
+                zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
+                e->next_blk = blk + 1U;
+                return;
+            } else {
+                size_t rem = e->max_payload - rlen;
+                size_t step = rem / 4U;
+                if (step < 8U) step = 8U;
+                e->rans_next_chk = (uint16_t)(e->pkt_count + step);
+            }
+        }
         e->next_blk = blk + 1U;
         return;
     }
@@ -1001,16 +1260,17 @@ static inline size_t zcrudp_ternary_emit_finish(zcrudp_ternary_emit_t *e) {
  * ========================================================================= */
 
 /**
- * @brief Computes a per-block deadzone threshold from the synchronized ref
- *        buffer only (zero wire overhead, zero encoder/decoder drift).
- *        Distinguishes aligned UI/text edges (high directional coherence ->
- *        keeps base_thr) from disorderly high-frequency textures (high energy
- *        with low coherence -> raises threshold up to base_thr + jnd_boost).
+ * @brief Computes a per-block deadzone threshold from the read-only src buffer
+ *        (zero MT data race across worker slices, zero wire overhead).
+ *        Distinguishes aligned UI/text edges and 1-2px thin UI lines (keeps
+ *        base_thr) from disorderly high-frequency textures (high energy with
+ *        low coherence -> raises threshold up to base_thr + jnd_boost).
  */
-static inline uint8_t zcrudp_ternary_block_jnd_threshold(const uint8_t *ref,
+static inline uint8_t zcrudp_ternary_block_jnd_threshold(const uint8_t *src,
                                                          size_t base,
                                                          size_t len,
                                                          uint16_t width,
+                                                         size_t lstep,
                                                          uint8_t base_thr,
                                                          uint8_t jnd_boost) {
     if (jnd_boost == 0U || base + 10U > len) {
@@ -1021,23 +1281,29 @@ static inline uint8_t zcrudp_ternary_block_jnd_threshold(const uint8_t *ref,
     }
     int32_t gx_sum = 0, gy_sum = 0;
     uint32_t gx_abs = 0, gy_abs = 0;
-    for (size_t j = 0U; j < 9U; j++) {
-        int32_t g = (int32_t)ref[base + j + 1U] - (int32_t)ref[base + j];
+    uint32_t nz_gx = 0, nz_gy = 0;
+    if (lstep == 0U) lstep = 1U;
+    for (size_t j = 0U; j + lstep < 10U; j++) {
+        int32_t g = (int32_t)src[base + j + lstep] - (int32_t)src[base + j];
+        uint32_t ag = (uint32_t)(g < 0 ? -g : g);
         gx_sum += g;
-        gx_abs += (uint32_t)(g < 0 ? -g : g);
+        gx_abs += ag;
+        if (ag > (uint32_t)base_thr) nz_gx++;
     }
     if (width > 0U && base >= (size_t)width) {
         for (size_t j = 0U; j < 10U; j++) {
-            int32_t g = (int32_t)ref[base + j] - (int32_t)ref[base + j - width];
+            int32_t g = (int32_t)src[base + j] - (int32_t)src[base + j - width];
+            uint32_t ag = (uint32_t)(g < 0 ? -g : g);
             gy_sum += g;
-            gy_abs += (uint32_t)(g < 0 ? -g : g);
+            gy_abs += ag;
+            if (ag > (uint32_t)base_thr) nz_gy++;
         }
     }
     uint32_t energy = gx_abs + gy_abs;
     uint32_t coh = (uint32_t)(gx_sum < 0 ? -gx_sum : gx_sum) +
                    (uint32_t)(gy_sum < 0 ? -gy_sum : gy_sum);
-    /* Only boost when gradient energy is both significant and non-coherent. */
-    if (energy < 80U || energy <= 2U * coh) {
+    /* Protect 1-2px thin UI lines (sparse high-contrast transitions) and coherent edges. */
+    if ((nz_gx + nz_gy) < 8U || energy < 80U || energy <= 2U * coh) {
         return base_thr;
     }
     uint32_t disorder = energy - 2U * coh;
@@ -1103,7 +1369,9 @@ static inline size_t zcrudp_ternary_encode_plane_range(const uint8_t * ZCRUDP_RE
 
             if (_mm256_testz_si256(over01, over01) &&
                 _mm_testz_si128(over2, over2)) {
-                zcrudp_ternary_decay_plane(ref + base, 80U, cfg->gamma_q8, cfg->neutral_y);
+                if (!cfg->no_decay) {
+                    zcrudp_ternary_decay_plane(ref + base, 80U, cfg->gamma_q8, cfg->neutral_y);
+                }
                 blk += 7U; /* loop increments +1 -> total +8 */
                 continue;
             }
@@ -1112,8 +1380,9 @@ static inline size_t zcrudp_ternary_encode_plane_range(const uint8_t * ZCRUDP_RE
 
         zcrudp_ternary_config_t bcfg = *cfg;
         if (cfg->jnd_boost > 0U) {
+            size_t jnd_lstep = zcrudp_ternary_2x_interleaved(cfg, plane_id) ? 2U : 1U;
             bcfg.threshold = zcrudp_ternary_block_jnd_threshold(
-                ref, base, len, cfg->width, cfg->threshold, cfg->jnd_boost);
+                src, base, len, cfg->width, jnd_lstep, cfg->threshold, cfg->jnd_boost);
         }
 
 #ifdef __AVX2__
@@ -1248,6 +1517,9 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_tokens(const uint8_t *payload,
     const size_t span = is_2x ? ZCRUDP_TERNARY_2X_SPAN : 10U;
     const size_t total_blocks = (plane_len + span - 1U) / span;
     size_t blk = hdr->start_block;
+    if (blk > total_blocks) {
+        return false;
+    }
 
     for (uint16_t t = 0; t < hdr->num_tokens; t++) {
 #ifdef __AVX2__
@@ -1280,10 +1552,11 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_tokens(const uint8_t *payload,
 #endif
         uint16_t tok = zcrudp_ternary_read_u16_le(payload + (size_t)t * 2U);
         if (tok >= ZCRUDP_TRIT_MAX_10P) {
-            blk += (size_t)(tok - ZCRUDP_TRIT_MAX_10P) + 1U;
-            if (blk > total_blocks) {
+            size_t skip = (size_t)(tok - ZCRUDP_TRIT_MAX_10P) + 1U;
+            if (skip > total_blocks - blk) {
                 return false;
             }
+            blk += skip;
             continue;
         }
         if (blk >= total_blocks) {
@@ -1332,6 +1605,7 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rv2(const uint8_t *payload,
     }
     const size_t total_blocks = (plane_len + 9U) / 10U;
     size_t blk = hdr->start_block;
+    if (blk > total_blocks) return false;
 
     for (uint16_t t = 0; t < hdr->num_tokens; t++) {
         uint16_t tok = zcrudp_ternary_read_u16_le(payload + (size_t)t * 2U);
@@ -1355,33 +1629,38 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rv2(const uint8_t *payload,
             continue;
         }
         if (tok <= 59432U) {
-            blk += (size_t)(tok - 59049U) + 1U;
-            if (blk > total_blocks) return false;
+            size_t skip = (size_t)(tok - 59049U) + 1U;
+            if (skip > total_blocks - blk) return false;
+            blk += skip;
             continue;
         }
         if (tok <= 59439U) {
-            blk += (size_t)(512U << (tok - 59433U));
-            if (blk > total_blocks) return false;
+            size_t skip = (size_t)(512U << (tok - 59433U));
+            if (skip > total_blocks - blk) return false;
+            blk += skip;
             continue;
         }
         zcrudp_trit_t trits[10] = { 0 };
         if (tok <= 61999U) {
             uint32_t off = (uint32_t)(tok - 59440U);
             uint32_t pat = off >> 7;
-            blk += (size_t)((off & 127U) + 1U);
-            if (blk >= total_blocks) return false;
+            size_t skip = (size_t)((off & 127U) + 1U);
+            if (skip >= total_blocks - blk) return false;
+            blk += skip;
             trits[pat >> 1] = (pat & 1U) ? (zcrudp_trit_t)-1 : (zcrudp_trit_t)1;
         } else if (tok <= 62639U) {
             uint32_t off = (uint32_t)(tok - 62000U);
             uint32_t pat = off >> 5;
-            blk += (size_t)(129U + (off & 31U));
-            if (blk >= total_blocks) return false;
+            size_t skip = (size_t)(129U + (off & 31U));
+            if (skip >= total_blocks - blk) return false;
+            blk += skip;
             trits[pat >> 1] = (pat & 1U) ? (zcrudp_trit_t)-1 : (zcrudp_trit_t)1;
         } else if (tok <= 65519U) {
             uint32_t off = (uint32_t)(tok - 62640U);
             uint32_t pat = off >> 4;
-            blk += (size_t)((off & 15U) + 1U);
-            if (blk >= total_blocks) return false;
+            size_t skip = (size_t)((off & 15U) + 1U);
+            if (skip >= total_blocks - blk) return false;
+            blk += skip;
             uint8_t pair = ZCRUDP_RV2_W2_PAIR[pat >> 2];
             trits[pair >> 4]  = (pat & 2U) ? (zcrudp_trit_t)-1 : (zcrudp_trit_t)1;
             trits[pair & 15U] = (pat & 1U) ? (zcrudp_trit_t)-1 : (zcrudp_trit_t)1;
@@ -1414,10 +1693,13 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_ec(const uint8_t *payload,
                            zcrudp_ternary_ec_lstep(cfg, hdr->plane, is_2x));
 
     size_t blk = hdr->start_block;
+    if (blk > total_blocks) {
+        return false;
+    }
     for (uint16_t t = 0; t < hdr->num_tokens; t++) {
         if (t > 0U) {
             uint64_t run = zcrudp_tec_dec_run(&rc, &model);
-            if (run >= (uint64_t)total_blocks) {
+            if (run >= (uint64_t)(total_blocks - blk)) {
                 return false;
             }
             zcrudp_tec_hist_clear(&model, blk * span, (blk + (size_t)run) * span);
@@ -1459,7 +1741,7 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rans(const uint8_t *payload,
         return false;
     }
     const size_t k = (size_t)hdr->num_tokens;
-    if (k == 0U || k > 1024U) {
+    if (k == 0U || k > ZCRUDP_RANS_MAX_BLOCKS) {
         return false;
     }
     const size_t num_nz   = (size_t)zcrudp_ternary_read_u16_le(payload + 0U);
@@ -1469,7 +1751,7 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rans(const uint8_t *payload,
     const size_t sign_len = (num_nz + 7U) / 8U;
     const size_t hdr_len  = 6U + mask_len + skip_len + sign_len;
 
-    if (num_syms > 4096U || num_nz > k * 10U || hdr_len + 17U > payload_len) {
+    if (num_syms > ZCRUDP_RANS_MAX_SYMS || num_nz > k * 10U || hdr_len + 17U > payload_len) {
         return false;
     }
 
@@ -1479,15 +1761,15 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rans(const uint8_t *payload,
     const uint8_t *rans_in   = payload + hdr_len;
     const size_t   rans_len  = payload_len - hdr_len;
 
-    uint8_t syms[4096];
+    uint8_t syms[ZCRUDP_RANS_MAX_SYMS];
     if (!zcrudp_rans_decode_syms(rans_in, rans_len, syms, num_syms)) {
         return false;
     }
 
 #ifdef __AVX2__
-    ZCRUDP_ALIGNAS32 zcrudp_trit_t trits[1024U * 10U + 16U];
+    ZCRUDP_ALIGNAS32 zcrudp_trit_t trits[ZCRUDP_RANS_MAX_BLOCKS * 10U + 16U];
 #else
-    zcrudp_trit_t trits[1024U * 10U + 16U];
+    zcrudp_trit_t trits[ZCRUDP_RANS_MAX_BLOCKS * 10U + 16U];
 #endif
     const size_t total_trits = k * 10U;
     memset(trits, 0, total_trits);
@@ -1517,6 +1799,7 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rans(const uint8_t *payload,
 
     const size_t total_blocks = (plane_len + 9U) / 10U;
     size_t blk = hdr->start_block;
+    if (blk > total_blocks) return false;
     size_t s_off = 0U;
 
     for (size_t bi = 0U; bi < k; bi++) {
@@ -1528,6 +1811,9 @@ ZCRUDP_TERNARY_INLINE bool zcrudp_ternary_decode_rans(const uint8_t *payload,
                     if (s_off + 2U > skip_len) return false;
                     sk = (uint32_t)zcrudp_ternary_read_u16_le(skip_vals + s_off);
                     s_off += 2U;
+                }
+                if ((size_t)sk >= total_blocks - blk) {
+                    return false;
                 }
                 blk += (size_t)sk;
             }
@@ -1615,7 +1901,10 @@ static inline bool zcrudp_ternary_decode_packet(const uint8_t *pkt_data,
         const uint8_t *rc_in = payload;
         size_t rc_len = payload_len;
         if (ptype == ZCRUDP_TERNARY_PKT_INTRA_Q_EC) {
-            if (payload_len < 2U) {
+            /* The step alone is a whole packet: the encoder drops trailing
+             * zero bytes of the range-coded stream, and a slice equal to its
+             * prediction codes to nothing but zeros. */
+            if (payload_len < 1U) {
                 return false;
             }
             qstep = payload[0];
@@ -1702,7 +1991,7 @@ static inline bool zcrudp_ternary_decode_packets_fused(const uint8_t * const *pk
                                                          uint8_t * ZCRUDP_RESTRICT delta_buf,
                                                          size_t plane_len,
                                                          const zcrudp_ternary_config_t *cfg) {
-    size_t decayed_until = 0U;
+    size_t decayed_until = cfg->no_decay ? plane_len : 0U;
 
     for (size_t i = 0U; i < count; i++) {
         zcrudp_ternary_pkt_hdr_t hdr;
@@ -1806,11 +2095,9 @@ static inline size_t zcrudp_ternary_encode_intra_range(const uint8_t * ZCRUDP_RE
                                                        zcrudp_ternary_pkt_cb cb,
                                                        void *user_ctx) {
     if (byte_end > plane_len) byte_end = plane_len;
-    if (byte_begin >= byte_end) return 0;
+    if (byte_begin >= byte_end || cfg->mtu_payload <= ZCRUDP_TERNARY_PKT_HDR_SZ + 1U) return 0;
 
-    size_t max_payload = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
-        ? (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ)
-        : 64U;
+    size_t max_payload = (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ);
     if (max_payload > 65535U) max_payload = 65535U;
 
     const uint8_t qstep = (cfg->intra_qstep > 1U)
@@ -1955,7 +2242,7 @@ static inline size_t zcrudp_ternary_encode_plane_2x(const uint8_t * ZCRUDP_RESTR
             if (idx + pair < len) {
                 if (t != 0) {
                     ref[idx + pair] = ref[idx];
-                } else {
+                } else if (!cfg->no_decay) {
                     ref[idx + pair] = zcrudp_leaky_integrator_step(
                         ref[idx + pair], 0, 0, cfg->gamma_q8, cfg->neutral_y);
                 }
@@ -2178,6 +2465,33 @@ static inline uint32_t zcrudp_ternary_tile_sad(const uint8_t * ZCRUDP_RESTRICT s
                                                  uint16_t height,
                                                  int x0, int y0, int x1, int y1,
                                                  int dx, int dy) {
+#ifdef __AVX2__
+    if (x0 - dx >= 0 && x1 - dx <= (int)width &&
+        y0 - dy >= 0 && y1 - dy <= (int)height &&
+        (x1 - x0) >= 32) {
+        uint64_t sad = 0U;
+        uint32_t cnt = (uint32_t)((x1 - x0) * (y1 - y0));
+        __m256i acc = _mm256_setzero_si256();
+        for (int y = y0; y < y1; y++) {
+            const uint8_t *sp = src + (size_t)y * width + (size_t)x0;
+            const uint8_t *rp = ref + (size_t)(y - dy) * width + (size_t)(x0 - dx);
+            int x = x0;
+            for (; x + 32 <= x1; x += 32, sp += 32, rp += 32) {
+                __m256i vs = _mm256_loadu_si256((const __m256i *)sp);
+                __m256i vr = _mm256_loadu_si256((const __m256i *)rp);
+                acc = _mm256_add_epi64(acc, _mm256_sad_epu8(vs, vr));
+            }
+            for (; x < x1; x++, sp++, rp++) {
+                int d = (int)*sp - (int)*rp;
+                sad += (uint64_t)(d < 0 ? -d : d);
+            }
+        }
+        uint64_t lanes[4];
+        _mm256_storeu_si256((__m256i *)lanes, acc);
+        sad += lanes[0] + lanes[1] + lanes[2] + lanes[3];
+        return (cnt > 0U) ? (uint32_t)((sad * 256ULL) / cnt) : UINT32_MAX;
+    }
+#endif
     uint32_t sad = 0;
     uint32_t cnt = 0;
     for (int y = y0; y < y1; y += 2) {
@@ -2196,13 +2510,93 @@ static inline uint32_t zcrudp_ternary_tile_sad(const uint8_t * ZCRUDP_RESTRICT s
     return (cnt > 0U) ? ((sad * 256U) / cnt) : UINT32_MAX;
 }
 
-static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRICT src,
-                                                   const uint8_t * ZCRUDP_RESTRICT ref,
-                                                   uint16_t width,
-                                                   uint16_t height,
-                                                   uint16_t tile_sz,
-                                                   int8_t search_r,
-                                                   int8_t *out_mvs) {
+static inline uint32_t zcrudp_ternary_tile_sad_pyramid(const uint8_t * ZCRUDP_RESTRICT src,
+                                                         const uint8_t * ZCRUDP_RESTRICT ref,
+                                                         uint16_t width,
+                                                         uint16_t height,
+                                                         int x0, int y0, int x1, int y1,
+                                                         int dx, int dy,
+                                                         int level) {
+#ifdef __AVX2__
+    if (x0 - dx >= 0 && x1 - dx <= (int)width &&
+        y0 - dy >= 0 && y1 - dy <= (int)height &&
+        (x1 - x0) >= 32) {
+        if (level >= 4 && (y1 - y0) >= 4) {
+            uint64_t sad = 0U;
+            uint32_t cnt = 0U;
+            const __m256i ones8  = _mm256_set1_epi8(1);
+            const __m256i ones16 = _mm256_set1_epi16(1);
+            __m256i acc = _mm256_setzero_si256();
+            for (int y = y0; y + 4 <= y1; y += 4) {
+                const uint8_t *sp = src + (size_t)y * width + (size_t)x0;
+                const uint8_t *rp = ref + (size_t)(y - dy) * width + (size_t)(x0 - dx);
+                for (int x = x0; x + 32 <= x1; x += 32, sp += 32, rp += 32) {
+                    __m256i s01 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)sp),
+                                                  _mm256_loadu_si256((const __m256i *)(sp + width)));
+                    __m256i s23 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)(sp + (size_t)width * 2U)),
+                                                  _mm256_loadu_si256((const __m256i *)(sp + (size_t)width * 3U)));
+                    __m256i s4  = _mm256_avg_epu8(s01, s23);
+                    __m256i r01 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)rp),
+                                                  _mm256_loadu_si256((const __m256i *)(rp + width)));
+                    __m256i r23 = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)(rp + (size_t)width * 2U)),
+                                                  _mm256_loadu_si256((const __m256i *)(rp + (size_t)width * 3U)));
+                    __m256i r4  = _mm256_avg_epu8(r01, r23);
+                    __m256i sh2 = _mm256_srli_epi16(_mm256_maddubs_epi16(s4, ones8), 1);
+                    __m256i rh2 = _mm256_srli_epi16(_mm256_maddubs_epi16(r4, ones8), 1);
+                    __m256i sh4 = _mm256_srli_epi32(_mm256_madd_epi16(sh2, ones16), 1);
+                    __m256i rh4 = _mm256_srli_epi32(_mm256_madd_epi16(rh2, ones16), 1);
+                    acc = _mm256_add_epi32(acc, _mm256_abs_epi32(_mm256_sub_epi32(sh4, rh4)));
+                    cnt += 8U;
+                }
+            }
+            if (cnt > 0U) {
+                uint32_t lanes[8];
+                _mm256_storeu_si256((__m256i *)lanes, acc);
+                for (int l = 0; l < 8; l++) sad += lanes[l];
+                return (uint32_t)((sad * 256ULL) / cnt);
+            }
+        } else if (level >= 2 && (y1 - y0) >= 2) {
+            uint64_t sad = 0U;
+            uint32_t cnt = 0U;
+            const __m256i ones8 = _mm256_set1_epi8(1);
+            __m256i acc = _mm256_setzero_si256();
+            for (int y = y0; y + 2 <= y1; y += 2) {
+                const uint8_t *sp = src + (size_t)y * width + (size_t)x0;
+                const uint8_t *rp = ref + (size_t)(y - dy) * width + (size_t)(x0 - dx);
+                for (int x = x0; x + 32 <= x1; x += 32, sp += 32, rp += 32) {
+                    __m256i s2  = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)sp),
+                                                  _mm256_loadu_si256((const __m256i *)(sp + width)));
+                    __m256i r2  = _mm256_avg_epu8(_mm256_loadu_si256((const __m256i *)rp),
+                                                  _mm256_loadu_si256((const __m256i *)(rp + width)));
+                    __m256i sh2 = _mm256_srli_epi16(_mm256_maddubs_epi16(s2, ones8), 1);
+                    __m256i rh2 = _mm256_srli_epi16(_mm256_maddubs_epi16(r2, ones8), 1);
+                    __m256i df  = _mm256_abs_epi16(_mm256_sub_epi16(sh2, rh2));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(df, _mm256_set1_epi16(1)));
+                    cnt += 16U;
+                }
+            }
+            if (cnt > 0U) {
+                uint32_t lanes[8];
+                _mm256_storeu_si256((__m256i *)lanes, acc);
+                for (int l = 0; l < 8; l++) sad += lanes[l];
+                return (uint32_t)((sad * 256ULL) / cnt);
+            }
+        }
+    }
+#else
+    (void)level;
+#endif
+    return zcrudp_ternary_tile_sad(src, ref, width, height, x0, y0, x1, y1, dx, dy);
+}
+
+static inline void zcrudp_ternary_estimate_tile_mv_ex(const uint8_t * ZCRUDP_RESTRICT src,
+                                                      const uint8_t * ZCRUDP_RESTRICT ref,
+                                                      uint16_t width,
+                                                      uint16_t height,
+                                                      uint16_t tile_sz,
+                                                      int8_t search_r,
+                                                      const int8_t *prev_mvs,
+                                                      int8_t *out_mvs) {
     if (tile_sz == 0U || search_r < 0) {
         return;
     }
@@ -2230,11 +2624,27 @@ static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRI
                 continue;
             }
 
+            /* Temporal predictor from previous frame's MV at the same tile */
+            if (prev_mvs != NULL) {
+                int pdx = prev_mvs[tidx + 0U];
+                int pdy = prev_mvs[tidx + 1U];
+                if ((pdx != 0 || pdy != 0) &&
+                    pdx >= -search_r && pdx <= search_r &&
+                    pdy >= -search_r && pdy <= search_r) {
+                    uint32_t psad = zcrudp_ternary_tile_sad(src, ref, width, height, x0, y0, x1, y1, pdx, pdy);
+                    if (psad + 2U < best_sad) {
+                        best_sad = psad;
+                        best_dx = (int8_t)pdx;
+                        best_dy = (int8_t)pdy;
+                    }
+                }
+            }
+
             /* Spatial predictors from already-estimated left / top neighbor tiles */
             if (tx > 0U) {
                 int pdx = out_mvs[tidx - 2U];
                 int pdy = out_mvs[tidx - 1U];
-                if ((pdx != 0 || pdy != 0) &&
+                if ((pdx != 0 || pdy != 0) && (pdx != best_dx || pdy != best_dy) &&
                     pdx >= -search_r && pdx <= search_r &&
                     pdy >= -search_r && pdy <= search_r) {
                     uint32_t psad = zcrudp_ternary_tile_sad(src, ref, width, height, x0, y0, x1, y1, pdx, pdy);
@@ -2261,15 +2671,18 @@ static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRI
                 }
             }
 
-            /* Coarse-to-fine logarithmic search unless a spatial predictor already locked onto <= 4.0/px */
+            /* Coarse-to-fine box-filtered pyramid search unless a predictor already locked on */
             if (best_sad > 1024U) {
                 int step = 1;
                 while (step * 2 <= (int)search_r) {
                     step *= 2;
                 }
                 for (; step >= 2; step >>= 1) {
+                    int pyr_lvl = (step >= 4) ? 4 : 2;
                     int cx = best_dx;
                     int cy = best_dy;
+                    uint32_t cur_pyr_sad = zcrudp_ternary_tile_sad_pyramid(
+                        src, ref, width, height, x0, y0, x1, y1, cx, cy, pyr_lvl);
                     for (int oy = -1; oy <= 1; oy++) {
                         for (int ox = -1; ox <= 1; ox++) {
                             if (ox == 0 && oy == 0) continue;
@@ -2278,16 +2691,18 @@ static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRI
                             if (dx < -search_r || dx > search_r || dy < -search_r || dy > search_r) {
                                 continue;
                             }
-                            uint32_t norm_sad = zcrudp_ternary_tile_sad(
-                                src, ref, width, height, x0, y0, x1, y1, dx, dy);
-                            if (norm_sad != UINT32_MAX && norm_sad + 2U < best_sad) {
-                                best_sad = norm_sad;
+                            uint32_t norm_sad = zcrudp_ternary_tile_sad_pyramid(
+                                src, ref, width, height, x0, y0, x1, y1, dx, dy, pyr_lvl);
+                            if (norm_sad != UINT32_MAX && norm_sad + 2U < cur_pyr_sad) {
+                                cur_pyr_sad = norm_sad;
                                 best_dx = (int8_t)dx;
                                 best_dy = (int8_t)dy;
                             }
                         }
                     }
                 }
+                best_sad = zcrudp_ternary_tile_sad(
+                    src, ref, width, height, x0, y0, x1, y1, best_dx, best_dy);
             }
 
             /* Fine +-1 refinement */
@@ -2312,6 +2727,16 @@ static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRI
             out_mvs[tidx + 1U] = best_dy;
         }
     }
+}
+
+static inline void zcrudp_ternary_estimate_tile_mv(const uint8_t * ZCRUDP_RESTRICT src,
+                                                   const uint8_t * ZCRUDP_RESTRICT ref,
+                                                   uint16_t width,
+                                                   uint16_t height,
+                                                   uint16_t tile_sz,
+                                                   int8_t search_r,
+                                                   int8_t *out_mvs) {
+    zcrudp_ternary_estimate_tile_mv_ex(src, ref, width, height, tile_sz, search_r, NULL, out_mvs);
 }
 
 /**
@@ -2475,12 +2900,20 @@ static inline void zcrudp_ternary_apply_tile_mv_nv12_state(const uint8_t * ZCRUD
                     for (size_t j = 0; j < cw; j += 2U) {
                         int cx = x0 + (int)j - dx_bytes;
                         if (cx < 0) cx = 0;
-                        if (cx + 1 >= (int)width) cx = (int)width - 2;
-                        uv_mc[dst_off + j] = uv_prev[src_off + (size_t)cx];
-                        uv_mc[dst_off + j + 1U] = uv_prev[src_off + (size_t)cx + 1U];
-                        if (copy_delta) {
-                            uv_delta_mc[dst_off + j] = uv_delta_prev[src_off + (size_t)cx];
-                            uv_delta_mc[dst_off + j + 1U] = uv_delta_prev[src_off + (size_t)cx + 1U];
+                        if (j + 1U < cw) {
+                            if (cx + 1 >= (int)width) cx = (int)width - 2;
+                            uv_mc[dst_off + j] = uv_prev[src_off + (size_t)cx];
+                            uv_mc[dst_off + j + 1U] = uv_prev[src_off + (size_t)cx + 1U];
+                            if (copy_delta) {
+                                uv_delta_mc[dst_off + j] = uv_delta_prev[src_off + (size_t)cx];
+                                uv_delta_mc[dst_off + j + 1U] = uv_delta_prev[src_off + (size_t)cx + 1U];
+                            }
+                        } else {
+                            if (cx >= (int)width) cx = (int)width - 1;
+                            uv_mc[dst_off + j] = uv_prev[src_off + (size_t)cx];
+                            if (copy_delta) {
+                                uv_delta_mc[dst_off + j] = uv_delta_prev[src_off + (size_t)cx];
+                            }
                         }
                     }
                 }
@@ -2506,9 +2939,10 @@ static inline size_t zcrudp_ternary_encode_tile_mv_dpcm(const int8_t *mvs,
                                                          uint8_t *pkt_buf,
                                                          zcrudp_ternary_pkt_cb cb,
                                                          void *user_ctx) {
-    const size_t max_payload = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
-        ? (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ)
-        : 64U;
+    if (cfg->mtu_payload <= ZCRUDP_TERNARY_PKT_HDR_SZ + 1U) {
+        return 0U;
+    }
+    const size_t max_payload = (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ);
     uint8_t *payload = pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ;
     size_t total_bytes = 0U;
     size_t off = 0U;
@@ -2684,9 +3118,10 @@ static inline size_t zcrudp_ternary_encode_tile_mv_pkts(const int8_t *mvs,
                                                         uint8_t *pkt_buf,
                                                         zcrudp_ternary_pkt_cb cb,
                                                         void *user_ctx) {
-    const size_t max_tiles_per_pkt = (cfg->mtu_payload > ZCRUDP_TERNARY_PKT_HDR_SZ)
-        ? ((size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ) / 2U)
-        : 1U;
+    if (cfg->mtu_payload <= ZCRUDP_TERNARY_PKT_HDR_SZ + 1U) {
+        return 0U;
+    }
+    const size_t max_tiles_per_pkt = (size_t)(cfg->mtu_payload - ZCRUDP_TERNARY_PKT_HDR_SZ) / 2U;
     size_t total_bytes = 0;
 
     for (size_t off = 0; off < num_tiles; off += max_tiles_per_pkt) {
