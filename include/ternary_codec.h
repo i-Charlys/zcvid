@@ -18,6 +18,7 @@
 #include "protocol_ternary.h"
 #include "ternary_entropy.h"
 #include "ternary_rans.h"
+#include <assert.h>
 #include <string.h>
 
 #ifdef __AVX2__
@@ -298,7 +299,9 @@ ZCRUDP_TERNARY_INLINE zcrudp_trit_t zcrudp_ternary_encode_sample(uint8_t cur,
                                                                  bool adm,
                                                                  const zcrudp_ternary_config_t *cfg,
                                                                  bool *shrink) {
-    int32_t err = (int32_t)cur - (int32_t)*ref;
+    uint16_t gamma = cfg->no_decay ? 256U : (uint16_t)cfg->gamma_q8;
+    uint8_t dec = zcrudp_leaky_integrator_step_ex(*ref, 0, 0, gamma, cfg->neutral_y);
+    int32_t err = (int32_t)cur - (int32_t)dec;
     int32_t mag = (err < 0) ? -err : err;
     zcrudp_trit_t t = 0;
     if (mag > (int32_t)cfg->threshold) {
@@ -308,8 +311,8 @@ ZCRUDP_TERNARY_INLINE zcrudp_trit_t zcrudp_ternary_encode_sample(uint8_t cur,
             *shrink = true;
         }
     }
-    uint16_t gamma = cfg->no_decay ? 256U : (uint16_t)cfg->gamma_q8;
-    *ref = zcrudp_leaky_integrator_step_ex(*ref, t, step, gamma, cfg->neutral_y);
+    int32_t nv = (int32_t)dec + ((int32_t)t * (int32_t)step);
+    *ref = (uint8_t)(nv < 0 ? 0 : (nv > 255 ? 255 : nv));
     return t;
 }
 
@@ -346,16 +349,32 @@ static inline bool zcrudp_ternary_encode_block_avx2(const uint8_t *src,
     const __m128i r = _mm_loadu_si128((const __m128i *)ref);
     const __m128i d = (delta_buf != NULL) ? _mm_loadu_si128((const __m128i *)delta_buf) : v_dmin;
 
-    /* |src - ref| and its direction, unsigned 8-bit */
-    const __m128i up = _mm_subs_epu8(s, r);
-    const __m128i dn = _mm_subs_epu8(r, s);
+    /* Post-decay reference (PDQ): quantize against decayed r_dec */
+    __m256i dec16;
+    __m128i r_dec;
+    if (cfg->no_decay) {
+        dec16 = _mm256_cvtepu8_epi16(r);
+        r_dec = r;
+    } else {
+        const __m256i v_neutral = _mm256_set1_epi16((int16_t)cfg->neutral_y);
+        const __m256i v_gamma = _mm256_set1_epi16((int16_t)cfg->gamma_q8);
+        const __m256i df = _mm256_sub_epi16(_mm256_cvtepu8_epi16(r), v_neutral);
+        const __m256i q = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_abs_epi16(df), v_gamma), 8);
+        dec16 = _mm256_add_epi16(v_neutral, _mm256_sign_epi16(q, df));
+        const __m256i pk_dec = _mm256_permute4x64_epi64(_mm256_packus_epi16(dec16, dec16), 0xD8);
+        r_dec = _mm256_castsi256_si128(pk_dec);
+    }
+
+    /* |src - r_dec| and its direction, unsigned 8-bit */
+    const __m128i up = _mm_subs_epu8(s, r_dec);
+    const __m128i dn = _mm_subs_epu8(r_dec, s);
     const __m128i mag = _mm_or_si128(up, dn);
 
     /* step taken when mag > threshold and 2 * mag > step, i.e. mag > step >> 1 */
     const __m128i half = _mm_and_si128(_mm_srli_epi16(d, 1), _mm_set1_epi8(0x7F));
     const __m128i lim = _mm_max_epu8(v_thr, half);
     const __m128i nz = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_subs_epu8(mag, lim), zero), lane10);
-    const __m128i neg = _mm_andnot_si128(_mm_cmpeq_epi8(dn, zero), nz); /* ref above src */
+    const __m128i neg = _mm_andnot_si128(_mm_cmpeq_epi8(dn, zero), nz); /* r_dec above src */
 
     /* trit = +1, -1 or 0 */
     const __m128i t8 = _mm_or_si128(_mm_and_si128(nz, _mm_set1_epi8(1)), neg);
@@ -363,25 +382,16 @@ static inline bool zcrudp_ternary_encode_block_avx2(const uint8_t *src,
 
     bool coded = !_mm_testz_si128(nz, nz);
     if (delta_buf != NULL) {
-        /* off target, step too coarse and still above its floor: ask for a halving */
+        /* off target, step too coarse and still above its floor: ask for a shrink */
         const __m128i over = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_subs_epu8(mag, v_thr), zero), lane10);
-        const __m128i can_halve = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_subs_epu8(d, v_dmin), zero), over);
-        const __m128i shrink = _mm_andnot_si128(nz, can_halve);
+        const __m128i can_shrink = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_subs_epu8(d, v_dmin), zero), over);
+        const __m128i shrink = _mm_andnot_si128(nz, can_shrink);
         coded = coded || !_mm_testz_si128(shrink, shrink);
     }
 
-    /* leaky integrator in 16-bit lanes: neutral + trunc((ref - neutral) * gamma / 256) + trit * step */
+    /* closed-loop update: clamp(dec16 + trit * step, 0, 255) */
     const __m256i move = _mm256_sign_epi16(_mm256_cvtepu8_epi16(d), _mm256_cvtepi8_epi16(t8));
-    __m256i nv;
-    if (cfg->no_decay) {
-        nv = _mm256_add_epi16(_mm256_cvtepu8_epi16(r), move);
-    } else {
-        const __m256i v_neutral = _mm256_set1_epi16((int16_t)cfg->neutral_y);
-        const __m256i v_gamma = _mm256_set1_epi16((int16_t)cfg->gamma_q8);
-        const __m256i df = _mm256_sub_epi16(_mm256_cvtepu8_epi16(r), v_neutral);
-        const __m256i q = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_abs_epi16(df), v_gamma), 8);
-        nv = _mm256_add_epi16(_mm256_add_epi16(v_neutral, _mm256_sign_epi16(q, df)), move);
-    }
+    const __m256i nv = _mm256_add_epi16(dec16, move);
     const __m256i pk = _mm256_permute4x64_epi64(_mm256_packus_epi16(nv, nv), 0xD8);
     zcrudp_ternary_store10(ref, _mm256_castsi256_si128(pk));
 
@@ -708,9 +718,14 @@ typedef struct {
     uint16_t rans_num_nz;
     uint16_t rans_num_syms;
     uint16_t rans_skip_len;
-    uint16_t rans_next_chk;
+    uint16_t rans_rem_est;
+    uint16_t rans_last_hdr;
+    uint32_t rans_worst_bits;
+    uint32_t rans_last_bits;
+    uint8_t  rans_last_prof;
     uint32_t rans_raw_toks;
     uint32_t rans_zrun;
+    uint32_t rans_dropped_blocks; /**< Non-zero only if unreachable rANS drop branch triggers */
     uint8_t  rans_syms[ZCRUDP_RANS_MAX_SYMS];
     uint8_t  rans_sign_buf[(ZCRUDP_RANS_MAX_BLOCKS * 10U + 7U) / 8U + 4U];
     uint8_t  rans_skip_mask[ZCRUDP_RANS_MAX_BLOCKS / 8U];
@@ -755,9 +770,14 @@ static inline void zcrudp_ternary_emit_init(zcrudp_ternary_emit_t *e,
     e->rans_num_nz = 0U;
     e->rans_num_syms = 0U;
     e->rans_skip_len = 0U;
-    e->rans_next_chk = 1U;
+    e->rans_rem_est = 0U;
+    e->rans_last_hdr = 0U;
+    e->rans_worst_bits = 0U;
+    e->rans_last_bits = 0U;
+    e->rans_last_prof = 0xFFU;
     e->rans_raw_toks = 0U;
     e->rans_zrun = 0U;
+    e->rans_dropped_blocks = 0U;
 }
 
 static inline size_t zcrudp_ternary_try_rans_pack(uint8_t *payload_io,
@@ -869,20 +889,25 @@ static inline size_t zcrudp_ternary_try_rans_pack(uint8_t *payload_io,
     return hdr_len + rans_len;
 }
 
+static inline size_t zcrudp_ternary_rans_cap(const zcrudp_ternary_emit_t *e) {
+    return (e->max_payload > 2048U) ? 2048U : e->max_payload;
+}
+
 static inline size_t zcrudp_ternary_emit_rans_pack(zcrudp_ternary_emit_t *e,
                                                    uint8_t *payload) {
+    const size_t rcap = zcrudp_ternary_rans_cap(e);
     const size_t k = (size_t)e->pkt_count;
     const size_t mask_len = (k + 7U) / 8U;
     const size_t sign_len = ((size_t)e->rans_num_nz + 7U) / 8U;
     const size_t hdr_len  = 6U + mask_len + (size_t)e->rans_skip_len + sign_len;
-    if (hdr_len + 17U > e->max_payload) {
+    if (hdr_len + 17U > rcap) {
         return 0U;
     }
     uint8_t rans_scratch[2048];
     uint8_t profile = zcrudp_rans_pick_profile(e->rans_num_nz, k * 10U);
     size_t rans_len = zcrudp_rans_encode_syms(
         e->rans_syms, e->rans_num_syms, profile,
-        payload + hdr_len, e->max_payload - hdr_len,
+        payload + hdr_len, rcap - hdr_len,
         rans_scratch, sizeof(rans_scratch));
     if (rans_len == 0U) {
         return 0U;
@@ -919,7 +944,11 @@ static inline void zcrudp_ternary_emit_send(zcrudp_ternary_emit_t *e,
     e->rans_num_nz = 0U;
     e->rans_num_syms = 0U;
     e->rans_skip_len = 0U;
-    e->rans_next_chk = 1U;
+    e->rans_rem_est = 0U;
+    e->rans_last_hdr = 0U;
+    e->rans_worst_bits = 0U;
+    e->rans_last_bits = 0U;
+    e->rans_last_prof = 0xFFU;
     e->rans_raw_toks = 0U;
     e->rans_zrun = 0U;
 }
@@ -931,18 +960,11 @@ static inline void zcrudp_ternary_emit_flush(zcrudp_ternary_emit_t *e) {
     if (e->rans) {
         if (e->rans_raw_toks > 0U && e->rans_raw_toks <= e->max_tokens) {
             uint8_t tmp_rans[2048];
-            const size_t k = (size_t)e->pkt_count;
-            const size_t mask_len = (k + 7U) / 8U;
-            const size_t sign_len = ((size_t)e->rans_num_nz + 7U) / 8U;
-            const size_t hdr_len  = 6U + mask_len + (size_t)e->rans_skip_len + sign_len;
-            if (hdr_len + 17U < e->rans_raw_toks * 2U && hdr_len + 17U <= e->max_payload &&
-                e->max_payload <= sizeof(tmp_rans)) {
-                size_t rlen = zcrudp_ternary_emit_rans_pack(e, tmp_rans);
-                if (rlen > 0U && rlen < e->rans_raw_toks * 2U) {
-                    memcpy(e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, tmp_rans, rlen);
-                    zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
-                    return;
-                }
+            size_t rlen = zcrudp_ternary_emit_rans_pack(e, tmp_rans);
+            if (rlen > 0U && rlen < (size_t)e->rans_raw_toks * 2U) {
+                memcpy(e->pkt_buf + ZCRUDP_TERNARY_PKT_HDR_SZ, tmp_rans, rlen);
+                zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
+                return;
             }
             zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA,
                                      (size_t)e->rans_raw_toks * 2U, e->rans_raw_toks);
@@ -953,11 +975,18 @@ static inline void zcrudp_ternary_emit_flush(zcrudp_ternary_emit_t *e) {
             zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA_RANS, rlen, e->pkt_count);
             return;
         }
+        /* Unreachable under the headroom invariant: count dropped blocks and assert in debug builds. */
+        e->rans_dropped_blocks += e->pkt_count;
+        assert(0 && "zcrudp_ternary_emit_flush: unreachable rANS drop branch hit");
         e->pkt_count = 0;
         e->rans_num_nz = 0U;
         e->rans_num_syms = 0U;
         e->rans_skip_len = 0U;
-        e->rans_next_chk = 1U;
+        e->rans_rem_est = 0U;
+        e->rans_last_hdr = 0U;
+        e->rans_worst_bits = 0U;
+        e->rans_last_bits = 0U;
+        e->rans_last_prof = 0xFFU;
         e->rans_raw_toks = 0U;
         e->rans_zrun = 0U;
         return;
@@ -1024,6 +1053,7 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
         const uint16_t ck_skip = e->rans_skip_len;
         const uint32_t ck_raw  = e->rans_raw_toks;
         const uint32_t ck_zrun = e->rans_zrun;
+        const uint32_t ck_bits = e->rans_worst_bits;
         const uint8_t  ck_mask = e->rans_skip_mask[ck_k >> 3];
         const uint8_t  ck_sign = e->rans_sign_buf[ck_nz >> 3];
 
@@ -1082,18 +1112,22 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
                 while (e->rans_zrun >= 128U) {
                     if (e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) { overflow = true; break; }
                     e->rans_syms[e->rans_num_syms++] = 15U;
+                    e->rans_worst_bits += 11U;
                     e->rans_zrun -= 128U;
                 }
                 while (!overflow && e->rans_zrun >= 14U) {
                     if (e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) { overflow = true; break; }
                     e->rans_syms[e->rans_num_syms++] = 14U;
+                    e->rans_worst_bits += 11U;
                     e->rans_zrun -= 14U;
                 }
                 if (overflow || e->rans_num_syms >= ZCRUDP_RANS_MAX_SYMS) {
                     overflow = true;
                     break;
                 }
-                e->rans_syms[e->rans_num_syms++] = (uint8_t)e->rans_zrun;
+                uint8_t rsym = (uint8_t)e->rans_zrun;
+                e->rans_syms[e->rans_num_syms++] = rsym;
+                e->rans_worst_bits += (rsym == 0U) ? 3U : (rsym <= 2U) ? 4U : (rsym == 3U) ? 5U : 11U;
                 e->rans_zrun = 0U;
                 if ((e->rans_num_nz & 7U) == 0U) {
                     e->rans_sign_buf[e->rans_num_nz >> 3] = 0U;
@@ -1111,6 +1145,7 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
             e->rans_skip_len = ck_skip;
             e->rans_raw_toks = ck_raw;
             e->rans_zrun = ck_zrun;
+            e->rans_worst_bits = ck_bits;
             e->rans_skip_mask[ck_k >> 3] = ck_mask;
             e->rans_sign_buf[ck_nz >> 3] = ck_sign;
             zcrudp_ternary_emit_flush(e);
@@ -1118,11 +1153,34 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
         }
         e->pkt_count++;
 
-        if (e->pkt_count >= e->rans_next_chk) {
+        const size_t rcap = zcrudp_ternary_rans_cap(e);
+        const size_t cur_hdr = 6U + (((size_t)e->pkt_count + 7U) / 8U) +
+                               (size_t)e->rans_skip_len + (((size_t)e->rans_num_nz + 7U) / 8U);
+        /* Unconditional upper bound for any profile using per-symbol max bit costs:
+         * skip calling emit_rans_pack entirely while the worst-case total still has headroom. */
+        const size_t abs_worst = cur_hdr + 21U + (((size_t)e->rans_worst_bits + 7U) / 8U);
+        bool need_check = false;
+        uint8_t cur_prof = e->rans_last_prof;
+        if (abs_worst + 16U >= rcap) {
+            cur_prof = zcrudp_rans_pick_profile(e->rans_num_nz, (size_t)e->pkt_count * 10U);
+            if (e->rans_last_prof == 0xFFU || cur_prof != e->rans_last_prof) {
+                need_check = true;
+            } else {
+                const size_t hdr_delta = (cur_hdr > (size_t)e->rans_last_hdr)
+                    ? (cur_hdr - (size_t)e->rans_last_hdr) : 0U;
+                const size_t bits_delta = (e->rans_worst_bits > e->rans_last_bits)
+                    ? ((size_t)e->rans_worst_bits - (size_t)e->rans_last_bits) : 0U;
+                const size_t worst_add = hdr_delta + ((bits_delta + 7U) / 8U) + 4U;
+                if (worst_add + 16U >= (size_t)e->rans_rem_est) {
+                    need_check = true;
+                }
+            }
+        }
+
+        if (need_check) {
             /* Pack into temporary buffer when raw tokens are still buffered so we don't clobber them */
             uint8_t tmp_rans[2048];
-            uint8_t *dst_buf = (e->rans_raw_toks <= e->max_tokens && e->max_payload <= sizeof(tmp_rans))
-                ? tmp_rans : payload;
+            uint8_t *dst_buf = (e->rans_raw_toks <= e->max_tokens) ? tmp_rans : payload;
             size_t rlen = zcrudp_ternary_emit_rans_pack(e, dst_buf);
             if (rlen == 0U) {
                 if (ck_k > 0U) {
@@ -1132,14 +1190,20 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
                     e->rans_skip_len = ck_skip;
                     e->rans_raw_toks = ck_raw;
                     e->rans_zrun = ck_zrun;
+                    e->rans_worst_bits = ck_bits;
                     e->rans_skip_mask[ck_k >> 3] = ck_mask;
                     e->rans_sign_buf[ck_nz >> 3] = ck_sign;
                     zcrudp_ternary_emit_flush(e);
                     goto retry_rans;
                 }
-            } else if (rlen + 16U >= e->max_payload) {
+                /* Single-block packet couldn't fit rANS: send as raw token. */
+                zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA,
+                                         (size_t)e->rans_raw_toks * 2U, e->rans_raw_toks);
+                e->next_blk = blk + 1U;
+                return;
+            } else if (rlen + 16U >= rcap) {
                 if (dst_buf == tmp_rans) {
-                    if (e->rans_raw_toks <= e->max_tokens && rlen >= e->rans_raw_toks * 2U) {
+                    if (e->rans_raw_toks <= e->max_tokens && rlen >= (size_t)e->rans_raw_toks * 2U) {
                         zcrudp_ternary_emit_send(e, ZCRUDP_TERNARY_PKT_DELTA,
                                                  (size_t)e->rans_raw_toks * 2U, e->rans_raw_toks);
                         e->next_blk = blk + 1U;
@@ -1151,10 +1215,10 @@ static inline void zcrudp_ternary_emit_block(zcrudp_ternary_emit_t *e,
                 e->next_blk = blk + 1U;
                 return;
             } else {
-                size_t rem = e->max_payload - rlen;
-                size_t step = rem / 4U;
-                if (step < 8U) step = 8U;
-                e->rans_next_chk = (uint16_t)(e->pkt_count + step);
+                e->rans_rem_est   = (uint16_t)(rcap - rlen);
+                e->rans_last_hdr  = (uint16_t)cur_hdr;
+                e->rans_last_bits = e->rans_worst_bits;
+                e->rans_last_prof = cur_prof;
             }
         }
         e->next_blk = blk + 1U;
@@ -1342,14 +1406,26 @@ static inline size_t zcrudp_ternary_encode_plane_range(const uint8_t * ZCRUDP_RE
     zcrudp_ternary_emit_t em;
     zcrudp_ternary_emit_init(&em, cfg, len, plane_id, frame_id, false, pkt_buf, cb, user_ctx);
 
+#ifdef __AVX2__
+    const uint32_t max_dist = (cfg->neutral_y > (uint8_t)(255U - cfg->neutral_y))
+        ? (uint32_t)cfg->neutral_y : (uint32_t)(255U - cfg->neutral_y);
+    const uint32_t max_decay_shift = cfg->no_decay
+        ? 0U : ((max_dist * (256U - (uint32_t)cfg->gamma_q8) + 255U) >> 8);
+    const bool can_fast_skip = ((uint32_t)cfg->threshold >= max_decay_shift);
+    const uint8_t fast_skip_thr = can_fast_skip
+        ? (uint8_t)((uint32_t)cfg->threshold - max_decay_shift) : 0U;
+#endif
+
     for (size_t blk = blk_begin; blk < blk_end; blk++) {
         size_t base = blk * 10U;
 
 #ifdef __AVX2__
         /* Stationary-region skip: 80 pixels (8 blocks) at a time. A skipped
-         * block only decays, with or without ADM (its steps are kept). */
-        if (base + 80U <= len && (blk + 8U) <= blk_end) {
-            const __m256i vt = _mm256_set1_epi8((char)cfg->threshold);
+         * block only decays, with or without ADM (its steps are kept).
+         * With PDQ, |src - dec| <= |src - ref| + max_decay_shift <= threshold
+         * whenever |src - ref| <= fast_skip_thr, preserving 100% scalar parity. */
+        if (can_fast_skip && base + 80U <= len && (blk + 8U) <= blk_end) {
+            const __m256i vt = _mm256_set1_epi8((char)fast_skip_thr);
 
             __m256i vs0 = _mm256_loadu_si256((const __m256i *)(src + base));
             __m256i vr0 = _mm256_loadu_si256((const __m256i *)(ref + base));
@@ -3006,10 +3082,14 @@ static inline size_t zcrudp_ternary_encode_tile_mv_dpcm(const int8_t *mvs,
                 cnt -= zero_run;
             }
         }
-        if (cnt == 0U) break;
-
         uint8_t ptype = ZCRUDP_TERNARY_PKT_TILE_MV_DPCM;
-        if (plen >= cnt * 2U && cnt * 2U <= max_payload) {
+        if (cnt == 0U) {
+            /* max_payload == 2 and first tile needed a 3-byte literal: emit raw */
+            cnt = 1U;
+            plen = 2U;
+            ptype = ZCRUDP_TERNARY_PKT_TILE_MV;
+            memcpy(payload, mvs + off * 2U, 2U);
+        } else if (plen >= cnt * 2U && cnt * 2U <= max_payload) {
             ptype = ZCRUDP_TERNARY_PKT_TILE_MV;
             plen = cnt * 2U;
             memcpy(payload, mvs + off * 2U, plen);
@@ -3198,7 +3278,7 @@ static inline size_t zcrudp_ternary_encode_nv12_rc(const uint8_t * ZCRUDP_RESTRI
     uint8_t *uv_delta = delta_buf ? (delta_buf + y_sz) : NULL;
     if (target_bytes_per_frame > 0 && bytes > (target_bytes_per_frame * 6U) / 10U) {
         zcrudp_ternary_config_t uv_cfg = *cfg;
-        uv_cfg.threshold = (uint8_t)(cfg->threshold + 2U);
+        uv_cfg.threshold = (cfg->threshold <= 253U) ? (uint8_t)(cfg->threshold + 2U) : 255U;
         bytes += zcrudp_ternary_encode_plane_2x(src + y_sz, ref + y_sz, uv_delta,
                                                 uv_sz, 1, frame_id, &uv_cfg,
                                                 pkt_buf, cb, user_ctx);

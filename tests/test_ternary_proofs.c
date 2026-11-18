@@ -1025,6 +1025,243 @@ static void prove_jnd_mt_and_nv12(void) {
     printf("PROVEN (4T NV12 JND 0 px drift, thin UI protected)\n");
 }
 
+typedef struct {
+    uint8_t *canvas;
+    uint8_t *delta;
+    size_t len;
+    const zcrudp_ternary_config_t *cfg;
+    size_t pkts;
+    size_t bad;
+} rans_fuzz_ctx_t;
+
+static void rans_fuzz_cb(const uint8_t *pkt, size_t len, void *ctx) {
+    rans_fuzz_ctx_t *f = (rans_fuzz_ctx_t *)ctx;
+    f->pkts++;
+    if (len > f->cfg->mtu_payload ||
+        !zcrudp_ternary_decode_packet(pkt, len, f->canvas, f->delta, f->len, f->cfg, NULL)) {
+        f->bad++;
+    }
+}
+
+/*
+ * Proof 16: EC_RANS Zero-Drop / Zero-Drift Fuzz (MTU 80..1480 & Jumbo 2100..9100)
+ *           + Tiny-MTU TILE_MV_DPCM + NV12 RC Threshold Saturation.
+ */
+static void prove_rans_fuzz_and_edge_fixes(void) {
+    printf("[PROOF 16] EC_RANS Fuzz (80..9100 MTU) + MV_DPCM MTU=14 + Thr Sat... ");
+    const size_t len = 16000U;
+    uint8_t *src = (uint8_t *)malloc(len);
+    uint8_t *ref = (uint8_t *)malloc(len);
+    uint8_t *can = (uint8_t *)malloc(len);
+    uint8_t *ed  = (uint8_t *)malloc(len);
+    uint8_t *dd  = (uint8_t *)malloc(len);
+    uint8_t *pkt_buf = (uint8_t *)malloc(9200U);
+    assert(src && ref && can && ed && dd && pkt_buf);
+
+    uint32_t rng = 0xCAFEBABEU;
+    for (int run = 0; run < 2500; run++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        uint16_t mtu = (run < 2000)
+            ? (uint16_t)(80U + (rng % 1401U))
+            : (uint16_t)(2100U + (rng % 7001U));
+        size_t plen = 400U + (rng % (len - 400U));
+        /* Alternate sparse runs, long skips, and dense bursts to stress profile switches & headroom */
+        memset(ref, 128, plen);
+        memset(can, 128, plen);
+        memset(src, 128, plen);
+        for (size_t b = 0; b < plen / 10U; b++) {
+            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+            uint32_t mode = (b / 16U + (uint32_t)run) & 3U;
+            if (mode == 0U && (rng & 7U) != 0U) continue; /* sparse / large gaps */
+            size_t base = b * 10U;
+            for (size_t j = 0; j < 10U; j++) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                if (mode == 1U || (rng & 3U) == 0U) {
+                    src[base + j] = (uint8_t)(rng & 0xFFU);
+                }
+            }
+        }
+        zcrudp_ternary_config_t cfg = {
+            .width = 160, .height = 100, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+            .delta_min = 2, .delta_max = (run & 1) ? 32 : 2, .threshold = 2,
+            .gamma_q8 = 250, .neutral_y = 128, .mtu_payload = mtu,
+            .entropy = ZCRUDP_TERNARY_EC_RANS, .no_decay = (uint8_t)((run >> 1) & 1)
+        };
+        memset(ed, cfg.delta_min, plen);
+        memset(dd, cfg.delta_min, plen);
+        zcrudp_ternary_decay_plane_cfg(can, plen, &cfg);
+        rans_fuzz_ctx_t fctx = { can, (cfg.delta_max > cfg.delta_min) ? dd : NULL, plen, &cfg, 0, 0 };
+        zcrudp_ternary_encode_plane(src, ref, (cfg.delta_max > cfg.delta_min) ? ed : NULL,
+                                    plen, 0, (uint16_t)run, &cfg, pkt_buf, rans_fuzz_cb, &fctx);
+        assert(fctx.bad == 0U);
+        assert(memcmp(ref, can, plen) == 0);
+        if (cfg.delta_max > cfg.delta_min) {
+            assert(memcmp(ed, dd, plen) == 0);
+        }
+    }
+
+    /* TILE_MV_DPCM with mtu_payload = 14 (max_payload = 2) must fall back to raw without dropping MVs */
+    {
+        int8_t mvs[12] = { 10, -10, 10, -10, -25, 30, 0, 0, 40, -40, 41, -39 };
+        int8_t dec[12] = { 0 };
+        proof_sink_t sm = { malloc(32U * 1400U), malloc(32U * sizeof(size_t)), 0, 32 };
+        assert(sm.pkts && sm.lens);
+        zcrudp_ternary_config_t mcfg = {
+            .width = 192, .height = 64, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+            .delta_min = 2, .delta_max = 2, .threshold = 2,
+            .gamma_q8 = 255, .neutral_y = 128, .mtu_payload = 14
+        };
+        size_t mb = zcrudp_ternary_encode_tile_mv_dpcm(mvs, 6, 3, 0, 1, &mcfg, pkt_buf, proof_cb, &sm);
+        assert(mb > 0U && sm.count > 0U);
+        for (size_t i = 0; i < sm.count; i++) {
+            assert(zcrudp_ternary_decode_tile_mv_dpcm(sm.pkts[i], sm.lens[i], 3, dec, 6));
+        }
+        assert(memcmp(mvs, dec, sizeof(mvs)) == 0);
+        free(sm.pkts); free(sm.lens);
+    }
+
+    /* NV12 RC chroma threshold saturation (threshold = 254 must not wrap to 0) */
+    {
+        zcrudp_ternary_config_t rcfg = {
+            .width = 64, .height = 64, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+            .delta_min = 2, .delta_max = 2, .threshold = 254,
+            .gamma_q8 = 255, .neutral_y = 128, .mtu_payload = 1380, .no_decay = 1
+        };
+        size_t y_sz = 64U * 64U, uv_sz = y_sz / 2U;
+        memset(src, 128, y_sz + uv_sz);
+        memset(ref, 128, y_sz + uv_sz);
+        /* Trigger Y > 60% of tiny budget (1 byte), and put a small 10-level delta on UV */
+        src[0] = 255; ref[0] = 0;
+        memset(src + y_sz, 138, uv_sz);
+        proof_sink_t sr = { malloc(32U * 1400U), malloc(32U * sizeof(size_t)), 0, 32 };
+        assert(sr.pkts && sr.lens);
+        zcrudp_ternary_encode_nv12_rc(src, ref, NULL, 0, 1U, 0U, &rcfg, pkt_buf, proof_cb, &sr);
+        /* With saturated threshold 255, UV delta of 10 must produce zero UV packets */
+        for (size_t i = 0; i < sr.count; i++) {
+            zcrudp_ternary_pkt_hdr_t h;
+            assert(zcrudp_ternary_pkt_hdr_read_le(sr.pkts[i], &h));
+            assert(h.plane == 0U);
+        }
+        free(sr.pkts); free(sr.lens);
+    }
+
+    free(src); free(ref); free(can); free(ed); free(dd); free(pkt_buf);
+    printf("PROVEN (2500 rANS fuzz runs 0 drops/0 drift, MV_DPCM MTU=14 & thr sat)\n");
+}
+
+/*
+ * Proof 17: PDQ Counterexample Optimality & Fast-Skip Scalar==AVX2 Parity.
+ */
+static void prove_pdq_optimal_and_fast_skip_parity(void) {
+    printf("[PROOF 17] PDQ Optimality & Fast-Skip Scalar==AVX2 Parity... ");
+
+    /* Counterexample from pre-decay bug: x=203, y=210, gamma=240, y0=128, thr=3, d=8 */
+    {
+        zcrudp_ternary_config_t cfg = {
+            .width = 16, .height = 1, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+            .delta_min = 4, .delta_max = 32, .threshold = 3,
+            .gamma_q8 = 240, .neutral_y = 128, .mtu_payload = 1380
+        };
+        uint8_t ref = 210;
+        bool shrink = false;
+        zcrudp_trit_t t = zcrudp_ternary_encode_sample(203, &ref, 8, true, &cfg, &shrink);
+        assert(t == 0);
+        assert(ref == 204); /* |203 - 204| = 1 instead of pre-decay's 196 (err=7) */
+        assert(!shrink);
+    }
+
+    /* Fast-skip boundary parity: compare full plane encode against pure scalar loop */
+    static const struct {
+        uint8_t gamma_q8, neutral_y, threshold, no_decay, jnd_boost;
+    } cases[] = {
+        { 240, 128, 3, 0, 0 }, /* thr < max_decay_shift (8) -> fast-skip disabled */
+        { 240, 128, 8, 0, 0 }, /* thr == max_decay_shift (8) -> fast_skip_thr = 0 */
+        { 240, 128, 10, 0, 0 },/* thr > max_decay_shift -> fast_skip_thr = 2 */
+        { 250, 128, 6, 0, 4 }, /* JND enabled + fast-skip */
+        { 200, 0,   60, 0, 0 },/* neutral_y = 0 (max_dist = 255) */
+        { 248, 128, 3, 1, 0 }, /* no_decay = 1 */
+    };
+    const size_t W = 160, H = 8, len = W * H;
+    uint8_t *src = (uint8_t *)malloc(len);
+    uint8_t *ref_v = (uint8_t *)malloc(len);
+    uint8_t *ref_s = (uint8_t *)malloc(len);
+    uint8_t *ed_v = (uint8_t *)malloc(len);
+    uint8_t *ed_s = (uint8_t *)malloc(len);
+    uint8_t *can_v = (uint8_t *)malloc(len);
+    uint8_t *dd_v = (uint8_t *)malloc(len);
+    uint8_t pkt_buf[1400];
+    assert(src && ref_v && ref_s && ed_v && ed_s && can_v && dd_v);
+
+    uint32_t rng = 0x13579BDFU;
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        zcrudp_ternary_config_t cfg = {
+            .width = (uint16_t)W, .height = (uint16_t)H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+            .delta_min = 3, .delta_max = 32, .threshold = cases[ci].threshold,
+            .gamma_q8 = cases[ci].gamma_q8, .neutral_y = cases[ci].neutral_y,
+            .mtu_payload = 1380, .jnd_boost = cases[ci].jnd_boost,
+            .no_decay = cases[ci].no_decay
+        };
+        for (size_t i = 0; i < len; i++) {
+            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+            ref_v[i] = (uint8_t)(rng & 0xFFU);
+            /* Make half the plane near-stationary to exercise the 80-px fast-skip */
+            if (i < len / 2U) {
+                int delta = (int)(rng % 5U) - 2;
+                int sv = (int)ref_v[i] + delta;
+                src[i] = (uint8_t)(sv < 0 ? 0 : (sv > 255 ? 255 : sv));
+            } else {
+                src[i] = (uint8_t)((rng >> 8) & 0xFFU);
+            }
+            ed_v[i] = (uint8_t)(cfg.delta_min + ((rng >> 16) % (uint32_t)(cfg.delta_max - cfg.delta_min + 1U)));
+        }
+        memcpy(ref_s, ref_v, len);
+        memcpy(ed_s, ed_v, len);
+        memcpy(can_v, ref_v, len);
+        memcpy(dd_v, ed_v, len);
+
+        /* Pure scalar reference over all 10-px blocks */
+        for (size_t blk = 0; blk < len / 10U; blk++) {
+            size_t base = blk * 10U;
+            zcrudp_ternary_config_t bcfg = cfg;
+            if (cfg.jnd_boost > 0U) {
+                bcfg.threshold = zcrudp_ternary_block_jnd_threshold(
+                    src, base, len, cfg.width, 1U, cfg.threshold, cfg.jnd_boost);
+            }
+            zcrudp_trit_t trits[10] = { 0 };
+            bool coded = false;
+            for (size_t j = 0; j < 10U; j++) {
+                trits[j] = zcrudp_ternary_encode_sample(
+                    src[base + j], &ref_s[base + j], ed_s[base + j], true, &bcfg, &coded);
+                if (trits[j] != 0) coded = true;
+            }
+            if (coded) {
+                for (size_t j = 0; j < 10U; j++) {
+                    ed_s[base + j] = zcrudp_adm_update_delta(
+                        ed_s[base + j], trits[j], cfg.delta_min, cfg.delta_max);
+                }
+            }
+        }
+
+        proof_sink_t sink = { malloc(64U * 1400U), malloc(64U * sizeof(size_t)), 0, 64 };
+        assert(sink.pkts && sink.lens);
+        zcrudp_ternary_encode_plane(src, ref_v, ed_v, len, 0, (uint16_t)ci, &cfg,
+                                    pkt_buf, proof_cb, &sink);
+        zcrudp_ternary_decay_plane_cfg(can_v, len, &cfg);
+        for (size_t p = 0; p < sink.count; p++) {
+            assert(zcrudp_ternary_decode_packet(sink.pkts[p], sink.lens[p],
+                                                can_v, dd_v, len, &cfg, NULL));
+        }
+        assert(memcmp(ref_v, ref_s, len) == 0);
+        assert(memcmp(ed_v, ed_s, len) == 0);
+        assert(memcmp(ref_v, can_v, len) == 0);
+        assert(memcmp(ed_v, dd_v, len) == 0);
+        free(sink.pkts); free(sink.lens);
+    }
+
+    free(src); free(ref_v); free(ref_s); free(ed_v); free(ed_s); free(can_v); free(dd_v);
+    printf("PROVEN (counterexample optimal, 6/6 fast-skip configs bit-exact)\n");
+}
+
 int main(void) {
     printf("=== zcrudp Ternary Formal & Exhaustive Proof Suite ===\n\n");
     prove_quant_strict_descent();
@@ -1042,6 +1279,8 @@ int main(void) {
     prove_mt_parallel_intra();
     prove_no_decay_and_safety_guards();
     prove_jnd_mt_and_nv12();
+    prove_rans_fuzz_and_edge_fixes();
+    prove_pdq_optimal_and_fast_skip_parity();
     printf("\n=== ALL PROOFS VERIFIED ===\n");
     return 0;
 }

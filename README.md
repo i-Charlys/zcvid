@@ -1,4 +1,4 @@
-# tern_vid
+# zcvid
 
 Ternary differential video codec for ultra-low-latency UDP transport, designed
 as a profile of [`zcrudp`](../zcrudp). Each pixel sends one trit per frame

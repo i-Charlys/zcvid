@@ -458,7 +458,7 @@ void CSTileMV(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (gtid.x < 9u) {
             int2 cmv = (best_coarse == 0xFFFFFFFFu) ? int2(0, 0) : (MvOfKey(best_coarse) / 4);
             cand = cmv + int2((int)(gtid.x % 3u) - 1, (int)(gtid.x / 3u) - 1);
-        } else if (gtid.x >= 10u) {
+        } else if (gtid.x >= 10u && gtid.x < 15u) {
             uint ntx = tx;
             uint nty = ty;
             if (gtid.x == 11u) ntx = (tx > 0u) ? tx - 1u : tx;
