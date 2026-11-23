@@ -1,6 +1,6 @@
 # zcvid
 
-Ternary differential video codec for ultra-low-latency UDP transport, designed
+Zcvid differential video codec for ultra-low-latency UDP transport, designed
 as a profile of [`zcrudp`](../zcrudp). Each pixel sends one trit per frame
 (`-1`, `0`, `+1`); ten trits pack into 16 bits. The decoder is a leaky
 integrator, so a lost packet fades out instead of corrupting later frames.
@@ -16,22 +16,33 @@ photographs the delta stream shrinks by 1.4x to 1.8x and anchors by 1.9x to
 
 | Path | Content |
 | :--- | :--- |
-| `include/protocol_ternary.h` | Trit packing (5 and 10 trits), wire helpers, leaky integrator, closed-loop encoder step |
-| `include/ternary_codec.h` | Plane/frame encoder and decoder: RLE skip, Realloc v2 (`W1`/`W2` fused tokens), Jayant ADM, rolling Intra-Refresh, `DELTA_2X`, `INTRA_Q_EC`, closed-loop JND, fused decode, global/per-tile MC (`TILE_MV_DPCM`, Y->UV NV12), rate control |
-| `include/ternary_entropy.h` | Adaptive binary range coder, trit context model, lossless & quantized anchor models |
-| `include/ternary_rans.h` | 4-way interleaved 12-bit static rANS coder (`DELTA_RANS`) with 4 compile-time CDF profiles |
-| `include/ternary_mt.h` | Persistent worker pool (OS sleep/wake) for sliced delta/intra encode, decay, and ordered decode |
-| `include/ternary_zcrudp_bridge.h` | Routes packets to a reliable (`INTRA*`, `TILE_MV*`) or unreliable (`DELTA*`) channel |
-| `shaders/ternary_encode.hlsl`, `shaders/ternary_decode.hlsl` | D3D11 compute (`cs_5_0`) YCbCr encoder and decoder used by [`streaming`](../streaming): pyramid motion search with quarter-pel refinement and 4-tap interpolation, ternary deltas, transform blocks (4x4 integer transform, intra and motion residual), display deblocking. Encoder and decoder share the integer interpolation and inverse transform code word for word, so they stay bit-exact on any GPU. Results and design notes: [`streaming/README.md`](../streaming/README.md) |
-| `tests/test_ternary_proofs.c` | Exhaustive & adversarial formal proof suite (15 proofs) run by `make test` and `make sanitize` |
-| `docs/research/TERNARY_VIDEO_TRANSPORT.md` | Design study (French) |
+| `include/protocol_zcvid.h` | Trit packing (5 and 10 trits), wire helpers, leaky integrator, closed-loop encoder step |
+| `include/zcvid_codec.h` | Plane/frame encoder and decoder: RLE skip, Realloc v2 (`W1`/`W2` fused tokens), Jayant ADM, rolling Intra-Refresh, `DELTA_2X`, `INTRA_Q_EC`, closed-loop JND, fused decode, global/per-tile MC (`TILE_MV_DPCM`, Y->UV NV12), rate control |
+| `include/zcvid_entropy.h` | Adaptive binary range coder, trit context model, lossless & quantized anchor models |
+| `include/zcvid_rans.h` | 4-way interleaved 12-bit static rANS coder (`DELTA_RANS`) with 4 compile-time CDF profiles |
+| `include/zcvid_mt.h` | Persistent worker pool (OS sleep/wake) for sliced delta/intra encode, decay, and ordered decode |
+| `include/zcvid_zcrudp_bridge.h` | Routes packets to a reliable (`INTRA*`, `TILE_MV*`) or unreliable (`DELTA*`) channel |
+| `shaders/zcvid_encode.hlsl`, `shaders/zcvid_decode.hlsl` | D3D11 compute (`cs_5_0`) YCbCr encoder and decoder used by [`zcstream`](../zcstream): pyramid motion search with quarter-pel refinement and 4-tap interpolation, zcvid deltas, transform blocks (4x4 integer transform, intra and motion residual), display deblocking. Encoder and decoder share the integer interpolation and inverse transform code word for word, so they stay bit-exact on any GPU. Results and design notes: [`zcstream/README.md`](../zcstream/README.md) |
+| `tests/test_zcvid_proofs.c` | Exhaustive & adversarial formal proof suite (18 proofs) run by `make test` and `make sanitize` |
+| `docs/research/ZCVID_VIDEO_TRANSPORT.md` | Design study (French) |
 
 ## Build and test
+
+With Make (Linux, macOS, Windows MinGW/Clang):
 
 ```sh
 make test       # packing + codec tests and the 1080p benchmark (-O3 -mavx2)
 make sanitize   # same tests under ASan + UBSan, AVX2 path included
+make bench-latent                # latent factorization + hybrid RDO benchmark
 make bench-image IMG=photo.pgm   # token vs entropy-coded size on a real picture
+```
+
+Or with CMake (cross-platform, including Windows MSVC):
+
+```sh
+cmake -S . -B build
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 `bench-image` takes a binary 8-bit PGM of at least 1296x736 and plays a
@@ -42,9 +53,9 @@ make bench-image IMG=photo.pgm   # token vs entropy-coded size on a real picture
 
 With AVX2 the token path works one 10-sample block per step on both sides:
 the encoder quantises, updates the reference and the ADM steps in one go
-(`zcrudp_ternary_encode_block_avx2`), the decoder unpacks a token with one
-multiply-high and applies it (`zcrudp_ternary_unpack10_avx2`,
-`zcrudp_ternary_apply_block_avx2`). `test_avx2_block_matches_scalar` checks
+(`zcrudp_zcvid_encode_block_avx2`), the decoder unpacks a token with one
+multiply-high and applies it (`zcrudp_zcvid_unpack10_avx2`,
+`zcrudp_zcvid_apply_block_avx2`). `test_avx2_block_matches_scalar` checks
 200 000 random blocks against the scalar code, and the scalar and AVX2 builds
 produce byte-identical streams on every test scene.
 
@@ -60,10 +71,10 @@ On Windows use `mingw32-make` with a MinGW GCC or Clang as `cc`.
 
 ## Entropy coding
 
-Set `cfg.entropy` on the encoder to `ZCRUDP_TERNARY_EC_DELTA`,
-`ZCRUDP_TERNARY_EC_INTRA`, `ZCRUDP_TERNARY_EC_ALL`, `ZCRUDP_TERNARY_EC_RANS`
+Set `cfg.entropy` on the encoder to `ZCRUDP_ZCVID_EC_DELTA`,
+`ZCRUDP_ZCVID_EC_INTRA`, `ZCRUDP_ZCVID_EC_ALL`, `ZCRUDP_ZCVID_EC_RANS`
 (4-way interleaved static rANS, 2–3x faster decode than adaptive EC), or
-`ZCRUDP_TERNARY_EC_REALLOC_V2` (dual-resolution RLE + W1/W2 fused tokens).
+`ZCRUDP_ZCVID_EC_REALLOC_V2` (dual-resolution RLE + W1/W2 fused tokens).
 Set `cfg.intra_qstep >= 2` for near-lossless `INTRA_Q_EC` disocclusion/slope-overload
 repair and `cfg.jnd_boost > 0` for closed-loop edge-preserving texture masking.
 The decoder needs no setting: it reads the packet type (`DELTA_EC`, `DELTA_2X_EC`,
@@ -84,15 +95,15 @@ The decoder needs no setting: it reads the packet type (`DELTA_EC`, `DELTA_2X_EC
   block is active costs about +7 ms to encode and +6 ms to decode on one core;
   a frame with 5 % of active blocks costs twenty times less. `make test`
   prints both modes side by side. What was tried to go faster, and what did
-  not work, is written at the top of the bit model in `ternary_entropy.h`.
+  not work, is written at the top of the bit model in `zcvid_entropy.h`.
 - `cfg.ec_max_blocks` caps that cost: after that many range-coded blocks in
   one plane-encode call the rest of the call goes out as tokens. The switch
   happens at a packet boundary and the decoder follows from the packet type,
   so the cap bounds the decoder as well. Quiet frames keep the full gain, busy
   frames fall back toward the token bitrate instead of overrunning the frame
-  time. With `ternary_mt.h` the cap applies per slice, that is per thread.
+  time. With `zcvid_mt.h` the cap applies per slice, that is per thread.
 - Range-coded packets hold many more blocks, so a frame has fewer packets for
-  `zcrudp_ternary_mt_decode_packets()` to spread over threads.
+  `zcrudp_zcvid_mt_decode_packets()` to spread over threads.
 
 Measured with `bench-image` on five 4K photographs scaled to 1920x1200
 (1 px/frame pan, +-1 noise, threshold 3):
@@ -117,8 +128,8 @@ are 0. This is an encoder decision: the bitstream and the decoder did not
 change. On the tile-MV test it moved luma from 36.1 dB at 2.20 bpp to 40.1 dB
 at 1.6 bpp with tokens, and 0.50 bpp with entropy coding.
 
-The encode shader applies the same rule (`Quant()` in `ternary_encode.hlsl`).
-Measured with `zcrudp_ternary_bench --synth --psnr` on the GPU: 35.8 dB at
+The encode shader applies the same rule (`Quant()` in `zcvid_encode.hlsl`).
+Measured with `zcrudp_zcvid_bench --synth --psnr` on the GPU: 35.8 dB at
 20.1 Mbit/s before, 37.0 to 37.3 dB at 17.3 Mbit/s after, 0 px of drift.
 
 ## Closed-loop rules
@@ -127,9 +138,9 @@ The encoder keeps the exact picture the decoder will rebuild and codes the
 difference against it. Any change to one side must be mirrored on the other,
 otherwise the two references drift apart.
 
-CPU codec (`ternary_codec.h`):
+CPU codec (`zcvid_codec.h`):
 
-- Call `zcrudp_ternary_decay_plane()` once per frame on the receiver, then
+- Call `zcrudp_zcvid_decay_plane()` once per frame on the receiver, then
   apply the packets of that frame in the order they were produced.
 - Emit the anchors of a frame (rolling slice, `repair_disocclusions`) after its
   delta pass. The encoder's delta pass decays every sample it visits, the
@@ -137,7 +148,7 @@ CPU codec (`ternary_codec.h`):
   pass is decayed on the encoder only and the references drift unless
   `gamma_q8` is 255.
 - After a motion shift (`shift_plane`, `apply_tile_mv`), run
-  `zcrudp_ternary_repair_disocclusions()` after the delta pass. The shift
+  `zcrudp_zcvid_repair_disocclusions()` after the delta pass. The shift
   uncovers borders and drags static overlays; deltas alone need several frames
   to catch up, and the 3D test sat at 27 dB for that reason. With the repair it
   is at 37.9 dB.
@@ -145,25 +156,25 @@ CPU codec (`ternary_codec.h`):
   token; skipped blocks keep their step.
 - `DELTA_2X`: one trit drives two samples. On the interleaved NV12 chroma
   plane (`plane == 1`) the two samples belong to the same component
-  (U0+U1, V0+V1), see `zcrudp_ternary_2x_interleaved()`.
+  (U0+U1, V0+V1), see `zcrudp_zcvid_2x_interleaved()`.
 
-HLSL codec: the contract is written at the top of `ternary_encode.hlsl`. It
+HLSL codec: the contract is written at the top of `zcvid_encode.hlsl`. It
 differs from the CPU codec (the step halves every frame, pixels are coded in
 pairs, Intra is a 4:2:2 pair), so the two bitstreams are not interchangeable.
-`zcrudp_ternary_bench --psnr` in `streaming` prints how many pixels differ
+`zcrudp_zcvid_bench --psnr` in `zcstream` prints how many pixels differ
 between the encoder reference and the decoder output; it must be 0 on a
 lossless link.
 
 ## Untrusted input
 
-`zcrudp_ternary_decode_packet()` bounds every write to the plane it is given
+`zcrudp_zcvid_decode_packet()` bounds every write to the plane it is given
 and rejects packet types that are not picture data (`TILE_MV`, unknown types).
 The caller picks the plane from `hdr.plane`, which comes off the wire: check
-it against the pixel format first, as `ternary_mt.h` does.
+it against the pixel format first, as `zcvid_mt.h` does.
 `test_malformed_packets_stay_in_bounds` feeds 60 000 random and mutated packets
 of every type between guard bands; `make sanitize` runs it under ASan + UBSan.
 
-`zcrudp_ternary_mt_decode_packets()` gives the same picture as decoding the
+`zcrudp_zcvid_mt_decode_packets()` gives the same picture as decoding the
 batch one packet at a time: it cuts the batch where deltas and anchors
 alternate and decodes each run in parallel
 (`test_mt_decode_keeps_packet_order`).

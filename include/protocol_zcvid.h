@@ -1,14 +1,14 @@
 /**
- * @file protocol_ternary.h
- * @brief zcrudp Ternary Video Transport Profile C11 Header
+ * @file protocol_zcvid.h
+ * @brief zcrudp Zcvid Video Transport Profile C11 Header
  *
  * Strict C11, zero-dynamic-allocation (malloc-free), pure integer arithmetic,
  * fully unrolled/vectorizable 5-trit (8-bit) and 10-trit (16-bit) packing/unpacking primitives
  * for zcrudp ultra-low-latency UDP transport.
  */
 
-#ifndef ZCRUDP_PROTOCOL_TERNARY_H
-#define ZCRUDP_PROTOCOL_TERNARY_H
+#ifndef ZCRUDP_PROTOCOL_ZCVID_H
+#define ZCRUDP_PROTOCOL_ZCVID_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -36,11 +36,11 @@ extern "C" {
  * Constants and Protocol Types
  * ========================================================================= */
 
-/** TFV Record Types for Ternary Video Profile (Track D) */
-#define ZCRUDP_TFV_TYPE_TERNARY_HEADER     0xD0  /**< Header record for slice/block metadata */
-#define ZCRUDP_TFV_TYPE_TERNARY_PACK10     0xD1  /**< 10-trit packed uint16_t data record */
-#define ZCRUDP_TFV_TYPE_TERNARY_PACK5_PAIR 0xD2  /**< Dual 5-trit packed uint16_t data record */
-#define ZCRUDP_TFV_TYPE_TERNARY_SKIP       0xD3  /**< RLE skip record: value = count of zero 10-trit blocks */
+/** TFV Record Types for Zcvid Video Profile (Track D) */
+#define ZCRUDP_TFV_TYPE_ZCVID_HEADER     0xD0  /**< Header record for slice/block metadata */
+#define ZCRUDP_TFV_TYPE_ZCVID_PACK10     0xD1  /**< 10-trit packed uint16_t data record */
+#define ZCRUDP_TFV_TYPE_ZCVID_PACK5_PAIR 0xD2  /**< Dual 5-trit packed uint16_t data record */
+#define ZCRUDP_TFV_TYPE_ZCVID_SKIP       0xD3  /**< RLE skip record: value = count of zero 10-trit blocks */
 
 /** Maximum combinatorial bounds for base-3 representations */
 #define ZCRUDP_TRIT_MAX_5P   243U   /**< 3^5  = 243 <= 256 (8 bits) */
@@ -64,13 +64,13 @@ typedef uint8_t zcrudp_utrit_t;
  * @brief Atomic TFV (Type 8 / Flags 8 / Value 16) payload record format.
  */
 typedef struct {
-    uint8_t  type;    /**< Record type identifier (e.g. ZCRUDP_TFV_TYPE_TERNARY_PACK10) */
+    uint8_t  type;    /**< Record type identifier (e.g. ZCRUDP_TFV_TYPE_ZCVID_PACK10) */
     uint8_t  flags;   /**< Sequence offset or sub-stream flags */
     uint16_t value;   /**< 16-bit value carrying 10-trits packed in base-3 */
 } zcrudp_tfv_record_t;
 
 /**
- * @brief Header structure for a slice/block of ternary video deltas.
+ * @brief Header structure for a slice/block of zcvid video deltas.
  */
 typedef struct {
     uint16_t slice_index;  /**< Slice sequence number / index */
@@ -78,10 +78,10 @@ typedef struct {
     uint16_t count;        /**< Number of packed records in slice */
     uint8_t  flags;        /**< Additional metadata flags (e.g., end-of-frame) */
     uint8_t  reserved;     /**< Alignment padding */
-} zcrudp_ternary_slice_header_t;
+} zcrudp_zcvid_slice_header_t;
 
 _Static_assert(sizeof(zcrudp_tfv_record_t) == 4, "zcrudp_tfv_record_t must be 4 bytes");
-_Static_assert(sizeof(zcrudp_ternary_slice_header_t) == 8, "zcrudp_ternary_slice_header_t must be 8 bytes");
+_Static_assert(sizeof(zcrudp_zcvid_slice_header_t) == 8, "zcrudp_zcvid_slice_header_t must be 8 bytes");
 
 /* =========================================================================
  * Powers of 3 Static LookUp Table for Compile-Time Unrolling
@@ -213,7 +213,7 @@ static inline bool zcrudp_unpack_10trits_checked(uint16_t word, zcrudp_trit_t tr
 
 /**
  * @brief Packs 10 signed trits as two independent 5-trit bytes in a uint16_t
- *        (for ZCRUDP_TFV_TYPE_TERNARY_PACK5_PAIR).
+ *        (for ZCRUDP_TFV_TYPE_ZCVID_PACK5_PAIR).
  *
  * @param trits Array of 10 signed trits in {-1, 0, +1}.
  * @return uint16_t Low byte = trits[0..4], high byte = trits[5..9].
@@ -269,7 +269,7 @@ static inline void zcrudp_tfv_read_le(const uint8_t src[4], zcrudp_tfv_record_t 
  * @brief Serializes a slice header into an 8-byte little-endian wire buffer.
  */
 static inline void zcrudp_slice_header_write_le(uint8_t dst[8],
-                                                const zcrudp_ternary_slice_header_t *hdr) {
+                                                const zcrudp_zcvid_slice_header_t *hdr) {
     dst[0] = (uint8_t)(hdr->slice_index & 0xFFU);
     dst[1] = (uint8_t)(hdr->slice_index >> 8);
     dst[2] = (uint8_t)(hdr->start_pixel & 0xFFU);
@@ -284,7 +284,7 @@ static inline void zcrudp_slice_header_write_le(uint8_t dst[8],
  * @brief Deserializes a slice header from an 8-byte little-endian wire buffer.
  */
 static inline void zcrudp_slice_header_read_le(const uint8_t src[8],
-                                               zcrudp_ternary_slice_header_t *hdr) {
+                                               zcrudp_zcvid_slice_header_t *hdr) {
     hdr->slice_index = (uint16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
     hdr->start_pixel = (uint16_t)((uint16_t)src[2] | ((uint16_t)src[3] << 8));
     hdr->count = (uint16_t)((uint16_t)src[4] | ((uint16_t)src[5] << 8));
@@ -390,4 +390,4 @@ static inline zcrudp_trit_t zcrudp_encode_step(uint8_t current_y,
 }
 #endif
 
-#endif /* ZCRUDP_PROTOCOL_TERNARY_H */
+#endif /* ZCRUDP_PROTOCOL_ZCVID_H */

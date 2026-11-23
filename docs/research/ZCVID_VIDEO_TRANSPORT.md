@@ -1,4 +1,4 @@
-# Spécification & Architecture : Profil de Transport Vidéo Différentiel Ternaire sur UDP (`zcrudp`)
+# Spécification & Architecture : Profil de Transport Vidéo Différentiel Zcvid sur UDP (`zcrudp`)
 
 ## Executive Summary & Context
 
@@ -9,7 +9,7 @@ Dans le cadre du transport vidéo à ultra-basse latence, les représentations v
 2. **Latence de codage/décodage non déterministe** et coût CPU/GPU élevé pour les codecs vidéo hybrides standard.
 3. **Sensibilité extrême aux pertes de paquets** : un paquet manquant dans une trame de référence (I-frame ou P-frame) provoque une propagation d'erreur catastrophique.
 
-Ce document étudie la faisabilité et spécifie l'architecture d'un **profil vidéo différentiel ternaire** $\{-1, 0, +1\}$ exploité sur les **canaux non fiables / séquencés** de `zcrudp`.
+Ce document étudie la faisabilité et spécifie l'architecture d'un **profil vidéo différentiel zcvid** $\{-1, 0, +1\}$ exploité sur les **canaux non fiables / séquencés** de `zcrudp`.
 
 ---
 
@@ -18,7 +18,7 @@ Ce document étudie la faisabilité et spécifie l'architecture d'un **profil vi
 ### 1.1 Modulation Delta Adaptive (ADM) et Capteurs Neuromorphiques (DVS)
 
 #### Modulation Delta (DM) & ADM
-La Modulation Delta (DM) est une technique de conversion analogique-numérique différentielle où le signal est représenté non pas par sa valeur absolue, mais par une suite de variations élémentaires (ou pas quantifiés) $+\Delta$ ou $-\Delta$. Dans sa forme ternaire $\{-1, 0, +1\}$, un trit $0$ est introduit pour représenter l'absence de variation significative (zone sous le seuil de détection ou état stationnaire).
+La Modulation Delta (DM) est une technique de conversion analogique-numérique différentielle où le signal est représenté non pas par sa valeur absolue, mais par une suite de variations élémentaires (ou pas quantifiés) $+\Delta$ ou $-\Delta$. Dans sa forme zcvid $\{-1, 0, +1\}$, un trit $0$ est introduit pour représenter l'absence de variation significative (zone sous le seuil de détection ou état stationnaire).
 
 $$\Delta S(x, y, t) = \begin{cases}
 +1 & \text{si } I(x, y, t) - I(x, y, t-\delta t) > \theta_{up} \\
@@ -29,15 +29,15 @@ $$\Delta S(x, y, t) = \begin{cases}
 #### Capteurs Evénementiels / Neuromorphiques (DVS - Dynamic Vision Sensors)
 Les capteurs événementiels neuromorphiques (ex. Prophesee Metavision, Sony IMX636) s'affranchissent du concept de trame globale (frame-rate). Chaque pixel réagit de manière autonome à la variation de log-luminance $\ln(I)$. Dès que la variation dépasse un seuil $\theta$, un événement assynchrone $(x, y, t, p)$ avec polarité $p \in \{-1, +1\}$ est émis.
 
-À haute fréquence (120 Hz – 240 Hz), une caméra conventionnelle à obturateur global (Global Shutter) capturant des changements temporels fins peut être discrétisée dans le domaine ternaire $\{-1, 0, +1\}$ à chaque *tick* temporel ($\Delta t = 4.16\text{ ms}$ à $8.33\text{ ms}$).
+À haute fréquence (120 Hz – 240 Hz), une caméra conventionnelle à obturateur global (Global Shutter) capturant des changements temporels fins peut être discrétisée dans le domaine zcvid $\{-1, 0, +1\}$ à chaque *tick* temporel ($\Delta t = 4.16\text{ ms}$ à $8.33\text{ ms}$).
 
-### 1.2 Propriétés de la vidéo ternaire à 120 Hz – 240 Hz
+### 1.2 Propriétés de la vidéo zcvid à 120 Hz – 240 Hz
 * **Sparsité spatio-temporelle extrême** : Dans la majorité des scènes réelles (robotique, vision industrielle, gaming cloud, télépilotage), entre **80% et 98% des pixels** ne changent pas d'état entre deux ticks consécutifs à 240 Hz (valeur $0$).
 * **Bornage strict** : Chaque élément de variation vaut exactement un trit parmi trois états possibles $\{-1, 0, +1\}$.
 
 ---
 
-## 2. Compaction Mathématique et Encodage Ternaire Sans Perte
+## 2. Compaction Mathématique et Encodage Zcvid Sans Perte
 
 Pour maximiser l'efficacité de l'Unité de Charge Utile Atomique **TFV 8/8/16** (`uint8_t type`, `uint8_t flags`, `uint16_t value`), les trits $\{-1, 0, +1\}$ doivent être compactés dans les champs d'octets sans gaspillage d'espace bit par bit.
 
@@ -111,7 +111,7 @@ Deux approches de résilience sont modélisées et comparées.
 
 #### Principe
 * La vidéo est découpée en tranches horizontales ou macro-lignes.
-* À chaque tick, pendant que le canal non fiable transporte les deltas ternaires $\{-1, 0, +1\}$ de l'image entière, une **tranche d'ancre absolue** (valeurs absolues de pixels Y/Luma 8 bits) est envoyée sur le **canal fiable/ordonné** de `zcrudp`.
+* À chaque tick, pendant que le canal non fiable transporte les deltas zcvid $\{-1, 0, +1\}$ de l'image entière, une **tranche d'ancre absolue** (valeurs absolues de pixels Y/Luma 8 bits) est envoyée sur le **canal fiable/ordonné** de `zcrudp`.
 * Sur un cycle de $N$ frames (ex. $N=12$ ticks à 240 Hz = 50 ms), 100% des lignes du canevas récepteur sont réinitialisées avec certitude.
 
 #### Formulation Mathématique
@@ -182,21 +182,21 @@ Chaque record dans le bundler intra-tick respecte la structure atomique 32 bits 
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### 4.2 Spécification des Types de Records du Profil Ternaire
+### 4.2 Spécification des Types de Records du Profil Zcvid
 
-Nous définissons deux types de records dédiés au profil vidéo ternaire (Track D - Ternary Video) :
+Nous définissons deux types de records dédiés au profil vidéo zcvid (Track D - Zcvid Video) :
 
-1. **`ZCRUDP_TFV_TYPE_TERNARY_HEADER` (Type `0xD0`)** : En-tête de bloc / tranche vidéo.
+1. **`ZCRUDP_TFV_TYPE_ZCVID_HEADER` (Type `0xD0`)** : En-tête de bloc / tranche vidéo.
    * `type` : `0xD0`
    * `flags` : Numéro de tranche ou d'index de bloc ($0 .. 255$).
    * `value` : `uint16_t` contenant les coordonnées de départ de la ligne / bloc ($Y$ offset ou $X, Y$).
 
-2. **`ZCRUDP_TFV_TYPE_TERNARY_PACK10` (Type `0xD1`)** : Record de données 10 trits compactés.
+2. **`ZCRUDP_TFV_TYPE_ZCVID_PACK10` (Type `0xD1`)** : Record de données 10 trits compactés.
    * `type` : `0xD1`
    * `flags` : Offset de séquence ou masque de validité spatiale dans la tranche.
    * `value` : `uint16_t` contenant les 10 trits compactés en base 3 ($0 .. 59048$).
 
-3. **`ZCRUDP_TFV_TYPE_TERNARY_PACK5_PAIR` (Type `0xD2`)** : Record alternatif contenant deux paquets de 5 trits.
+3. **`ZCRUDP_TFV_TYPE_ZCVID_PACK5_PAIR` (Type `0xD2`)** : Record alternatif contenant deux paquets de 5 trits.
    * `type` : `0xD2`
    * `flags` : Offset de séquence.
    * `value` : `uint16_t` combinant deux octets $B_0, B_1$ ($B_0 | (B_1 \ll 8)$) contenant chacun 5 trits.
@@ -207,7 +207,7 @@ En C11, les structures de données réceptrices et émettrices sont pré-alloué
 
 ```c
 typedef struct {
-    uint8_t  type;    /* ZCRUDP_TFV_TYPE_TERNARY_* */
+    uint8_t  type;    /* ZCRUDP_TFV_TYPE_ZCVID_* */
     uint8_t  flags;   /* Sub-stream ID / Sequence offset */
     uint16_t value;   /* 10-trit base-3 encoded data or header metadata */
 } zcrudp_tfv_record_t;
@@ -262,11 +262,11 @@ Seuls les blocs de 10 pixels contenant au moins un delta non nul sont transmis, 
   * $\alpha = 5\%$ : **$\approx 35.39 \text{ Mbps}$**.
   * $\alpha = 15\%$ : **$\approx 106.17 \text{ Mbps}$**.
 
-Cette analyse démontre que l'association de l'encodage ternaire compacté et du canal non fiable UDP offre une adéquation parfaite pour le transport vidéo ultra-basse latence sur des liens Ethernet Gigabit ou Wi-Fi 6/7.
+Cette analyse démontre que l'association de l'encodage zcvid compacté et du canal non fiable UDP offre une adéquation parfaite pour le transport vidéo ultra-basse latence sur des liens Ethernet Gigabit ou Wi-Fi 6/7.
 
 ---
 
-## 6. Guide d'Implémentation C11 (`include/protocol_ternary.h`)
+## 6. Guide d'Implémentation C11 (`include/protocol_zcvid.h`)
 
 La bibliothèque C11 doit respecter les contraintes suivantes :
 1. Dépliage de boucle (loop unrolling) à la compilation.
@@ -296,7 +296,7 @@ La limite de Shannon est l'entropie conditionnelle $H(T \mid \text{voisinage})$,
 
 ### 8.2 Codeur retenu
 
-`include/ternary_entropy.h` implémente un codeur d'intervalles binaire adaptatif (plage 32 bits, probabilités 12 bits, adaptation en $1/32$).
+`include/zcvid_entropy.h` implémente un codeur d'intervalles binaire adaptatif (plage 32 bits, probabilités 12 bits, adaptation en $1/32$).
 
 | Élément | Codage |
 | :--- | :--- |
@@ -367,7 +367,7 @@ Règle actuelle : un trit non nul n'est émis que si $|e| > \theta$ et $2|e| > \
 | 720p NV12, seuil 1 | 28,6 dB | 37,1 dB | 37,1 dB |
 | Shader HLSL (GPU, `--synth --psnr`) | 35,8 dB à 20,1 Mbit/s | 37,0 à 37,3 dB à 17,3 Mbit/s | sans objet |
 
-La même règle est appliquée dans `ternary_encode.hlsl` (`Quant()`), vérifiée sur GPU avec 0 pixel d'écart entre la référence de l'encodeur et la sortie du décodeur.
+La même règle est appliquée dans `zcvid_encode.hlsl` (`Quant()`), vérifiée sur GPU avec 0 pixel d'écart entre la référence de l'encodeur et la sortie du décodeur.
 
 ### 8.6 Ordre des ancres et compensation de mouvement
 
@@ -380,7 +380,7 @@ La scène 3D restait à 27 dB. La cause n'était pas la modulation delta : le d�
 
 Ce diagnostic a aussi révélé une règle d'ordre. Le récepteur applique la fuite une fois, avant tout paquet ; l'encodeur l'applique à chaque échantillon visité par la passe delta. Une ancre émise avant la passe delta est donc atténuée côté encodeur seulement, et les deux références divergent dès que $\gamma < 1$ (reproduit avec `gamma_q8 = 254`). Règle : les ancres d'une trame sont émises après ses deltas. Les deux tests de scène vérifient maintenant l'égalité bit à bit des références à chaque trame.
 
-Le décodage multi-thread respecte le même ordre : `zcrudp_ternary_mt_decode_packets()` découpe le lot là où deltas et ancres alternent et décode chaque série en parallèle (`test_mt_decode_keeps_packet_order`).
+Le décodage multi-thread respecte le même ordre : `zcrudp_zcvid_mt_decode_packets()` découpe le lot là où deltas et ancres alternent et décode chaque série en parallèle (`test_mt_decode_keeps_packet_order`).
 
 Limite restante levée (Section 9) : sur une photographie détaillée en panoramique, la combinaison de la compensation de mouvement `TileMV` (amorçage spatial + recherche logarithmique `2×2` + raffinement `±1` sur CPU et GPU `CSTileMV`), du décalage cohérent de `delta_buf` (`apply_tile_mv_state`), et de la réparation spatiale quantifiée `INTRA_Q_EC` (`cfg.intra_qstep >= 2`) élimine le plafond des 25 dB.
 
@@ -389,17 +389,17 @@ Limite restante levée (Section 9) : sur une photographie détaillée en panoram
 ## 9. Levée de la limite 25 dB, optimisation 360 Hz et preuves formelles
 
 ### 9.1 Prédiction avancée et borne analytique universelle
-* **`INTRA_Q_EC` (`ZCRUDP_TERNARY_PKT_INTRA_Q_EC`)** : prédiction spatiale JPEG-LS MED quantifiée au pas `qstep >= 2` sur le tampon reconstruit `ref`, suivie du range coder réinitialisé par paquet. Réduit le coût des ancres de réparation de ~44 % tout en bornant l'erreur ponctuelle à $\lfloor q/2 \rfloor$ pour tout couple `(src, pred)`.
-* **Borne pire cas universelle** : `zcrudp_ternary_repair_disocclusions()` déclenche une ancre dès que `bad >= 2 || max_err > 2 * err_thresh`, garantissant analytiquement $\text{MSE}_{\max} \le \max(\lfloor q/2 \rfloor^2, \frac{67}{64} E^2)$ pour toute image possible ($\ge 35{,}89\text{ dB}$ pour $E=4, q=4$).
-* **JND fermé arête-vs-texture (`cfg.jnd_boost`)** : `zcrudp_ternary_block_jnd_threshold()` sépare sur `ref` les arêtes alignées (UI/texte, cohérence directionnelle élevée $\rightarrow$ seuil inchangé) des textures désordonnées (énergie élevée et faible cohérence $\rightarrow$ relèvement du seuil sans dérive ni bit de signalisation).
+* **`INTRA_Q_EC` (`ZCRUDP_ZCVID_PKT_INTRA_Q_EC`)** : prédiction spatiale JPEG-LS MED quantifiée au pas `qstep >= 2` sur le tampon reconstruit `ref`, suivie du range coder réinitialisé par paquet. Réduit le coût des ancres de réparation de ~44 % tout en bornant l'erreur ponctuelle à $\lfloor q/2 \rfloor$ pour tout couple `(src, pred)`.
+* **Borne pire cas universelle** : `zcrudp_zcvid_repair_disocclusions()` déclenche une ancre dès que `bad >= 2 || max_err > 2 * err_thresh`, garantissant analytiquement $\text{MSE}_{\max} \le \max(\lfloor q/2 \rfloor^2, \frac{67}{64} E^2)$ pour toute image possible ($\ge 35{,}89\text{ dB}$ pour $E=4, q=4$).
+* **JND fermé arête-vs-texture (`cfg.jnd_boost`)** : `zcrudp_zcvid_block_jnd_threshold()` sépare sur `ref` les arêtes alignées (UI/texte, cohérence directionnelle élevée $\rightarrow$ seuil inchangé) des textures désordonnées (énergie élevée et faible cohérence $\rightarrow$ relèvement du seuil sans dérive ni bit de signalisation).
 
 ### 9.2 Optimisations débit/latence 1080p360
-* **Décompactage sans division (CPU, AVX2 16 voies, HLSL)** : factorisation 32 bits (`69043U >> 24`) et Granlund-Montgomery 16 bits (`3507`) dans `protocol_ternary.h`, `ternary_codec.h` (`zcrudp_ternary_unpack10_x16_avx2`) et `ternary_decode.hlsl`.
-* **rANS statique 4 voies (`ternary_rans.h`, `DELTA_RANS`)** : 4 états `uint32_t` entrelacés sur 4 profils CDF 12 bits avec repli automatique vers `DELTA` si le paquet ne rétrécit pas.
+* **Décompactage sans division (CPU, AVX2 16 voies, HLSL)** : factorisation 32 bits (`69043U >> 24`) et Granlund-Montgomery 16 bits (`3507`) dans `protocol_zcvid.h`, `zcvid_codec.h` (`zcrudp_zcvid_unpack10_x16_avx2`) et `zcvid_decode.hlsl`.
+* **rANS statique 4 voies (`zcvid_rans.h`, `DELTA_RANS`)** : 4 états `uint32_t` entrelacés sur 4 profils CDF 12 bits avec repli automatique vers `DELTA` si le paquet ne rétrécit pas.
 * **Realloc v2 (`DELTA_RV2`)** : réalloue les 6 487 codes `[59049..65535]` en RLE double résolution (`1..384` + puissances de 2 `512..32768`) et fusion saut + bloc de poids 1 (`W1`) ou 2 (`W2`) sans division.
-* **Flux auxiliaires & décodage fusionné** : compression `TILE_MV_DPCM`, partage `Y -> UV` en NV12 avec alignement pair strict (`apply_tile_mv_nv12_state`), décodage en une passe (`decode_packets_fused`), sommeil OS dans `ternary_mt.h`, et parallélisation `zcrudp_ternary_mt_encode_intra_range()`.
+* **Flux auxiliaires & décodage fusionné** : compression `TILE_MV_DPCM`, partage `Y -> UV` en NV12 avec alignement pair strict (`apply_tile_mv_nv12_state`), décodage en une passe (`decode_packets_fused`), sommeil OS dans `zcvid_mt.h`, et parallélisation `zcrudp_zcvid_mt_encode_intra_range()`.
 
-### 9.3 Suite de preuves exhaustives (`tests/test_ternary_proofs.c`)
+### 9.3 Suite de preuves exhaustives (`tests/test_zcvid_proofs.c`)
 Exécutée automatiquement par `make test` et `make sanitize` (ASan + UBSan) :
 1. Descente stricte du quantificateur (`20 971 520` tuples).
 2. Borne d'erreur `INTRA_Q_EC` sur tous les `4 128 768` triplets `(src, pred, q)`.

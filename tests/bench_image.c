@@ -17,7 +17,7 @@
 #include <math.h>
 #include <time.h>
 
-#include "ternary_codec.h"
+#include "zcvid_codec.h"
 
 enum { OUT_W = 1280, OUT_H = 720, FRAMES = 20, WARMUP = 4, INTRA_CYCLE = 24 };
 
@@ -37,8 +37,8 @@ static void sink_cb(const uint8_t *data, size_t len, void *ctx) {
     memcpy(s->pkts[s->count], data, len);
     s->lens[s->count++] = len;
     uint8_t type = (uint8_t)((data[2] >> 4) & 0x0FU);
-    if (type == ZCRUDP_TERNARY_PKT_INTRA || type == ZCRUDP_TERNARY_PKT_INTRA_EC ||
-        type == ZCRUDP_TERNARY_PKT_INTRA_Q_EC) {
+    if (type == ZCRUDP_ZCVID_PKT_INTRA || type == ZCRUDP_ZCVID_PKT_INTRA_EC ||
+        type == ZCRUDP_ZCVID_PKT_INTRA_Q_EC) {
         s->anchor_bytes += len;
     } else {
         s->delta_bytes += len;
@@ -94,8 +94,8 @@ typedef struct { double delta_bpp, anchor_bpp, mv_bpp, key_bpp, psnr, enc_ms, de
 static result_t run(const uint8_t *img, int iw, int ih, int pan, int noise,
                     uint8_t entropy, uint8_t intra_qstep, bool use_tile_mv,
                     bool use_repair, uint8_t *final_ref) {
-    zcrudp_ternary_config_t cfg = {
-        .width = OUT_W, .height = OUT_H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = OUT_W, .height = OUT_H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
         .entropy = entropy, .intra_qstep = intra_qstep
@@ -148,26 +148,26 @@ static result_t run(const uint8_t *img, int iw, int ih, int pan, int noise,
         size_t d0 = s.delta_bytes, a0 = s.anchor_bytes, m0 = mv_bytes;
         double t0 = now_ms();
         if (f == 0) {
-            zcrudp_ternary_encode_intra_range(src, ref, enc_delta, 0, len, len, 0, 0, &cfg,
+            zcrudp_zcvid_encode_intra_range(src, ref, enc_delta, 0, len, len, 0, 0, &cfg,
                                               pkt_buf, sink_cb, &s);
         } else {
             if (use_tile_mv) {
-                zcrudp_ternary_estimate_tile_mv(src, ref, OUT_W, OUT_H, tile_sz, 16, enc_mvs);
-                mv_bytes += zcrudp_ternary_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, (uint16_t)f,
+                zcrudp_zcvid_estimate_tile_mv(src, ref, OUT_W, OUT_H, tile_sz, 16, enc_mvs);
+                mv_bytes += zcrudp_zcvid_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, (uint16_t)f,
                                                                &cfg, pkt_buf, sink_cb, &s);
-                zcrudp_ternary_apply_tile_mv_state(ref, ref_mc, enc_delta, enc_delta_mc,
+                zcrudp_zcvid_apply_tile_mv_state(ref, ref_mc, enc_delta, enc_delta_mc,
                                                    OUT_W, OUT_H, tile_sz, enc_mvs);
                 memcpy(ref, ref_mc, len);
                 memcpy(enc_delta, enc_delta_mc, len);
             }
-            zcrudp_ternary_encode_plane(src, ref, enc_delta, len, 0, (uint16_t)f, &cfg,
+            zcrudp_zcvid_encode_plane(src, ref, enc_delta, len, 0, (uint16_t)f, &cfg,
                                         pkt_buf, sink_cb, &s);
             if (use_repair) {
-                zcrudp_ternary_repair_disocclusions(src, ref, enc_delta, len, 16, 0, (uint16_t)f,
+                zcrudp_zcvid_repair_disocclusions(src, ref, enc_delta, len, 16, 0, (uint16_t)f,
                                                     &cfg, pkt_buf, sink_cb, &s);
             } else {
                 size_t i0 = (size_t)(f % INTRA_CYCLE) * slice;
-                zcrudp_ternary_encode_intra_range(src, ref, enc_delta, i0, i0 + slice, len, 0,
+                zcrudp_zcvid_encode_intra_range(src, ref, enc_delta, i0, i0 + slice, len, 0,
                                                   (uint16_t)f, &cfg, pkt_buf, sink_cb, &s);
             }
         }
@@ -176,27 +176,27 @@ static result_t run(const uint8_t *img, int iw, int ih, int pan, int noise,
         size_t pkt_idx = 0;
         if (f > 0 && use_tile_mv) {
             while (pkt_idx < s.count) {
-                zcrudp_ternary_pkt_hdr_t hdr;
-                if (!zcrudp_ternary_pkt_hdr_read_le(s.pkts[pkt_idx], &hdr) ||
-                    ZCRUDP_TERNARY_HDR_TYPE(&hdr) != ZCRUDP_TERNARY_PKT_TILE_MV) {
+                zcrudp_zcvid_pkt_hdr_t hdr;
+                if (!zcrudp_zcvid_pkt_hdr_read_le(s.pkts[pkt_idx], &hdr) ||
+                    ZCRUDP_ZCVID_HDR_TYPE(&hdr) != ZCRUDP_ZCVID_PKT_TILE_MV) {
                     break;
                 }
-                if (!zcrudp_ternary_decode_tile_mv_pkt(s.pkts[pkt_idx], s.lens[pkt_idx],
+                if (!zcrudp_zcvid_decode_tile_mv_pkt(s.pkts[pkt_idx], s.lens[pkt_idx],
                                                        dec_mvs, num_tiles)) {
                     fprintf(stderr, "tile mv decode failed\n");
                     exit(2);
                 }
                 pkt_idx++;
             }
-            zcrudp_ternary_apply_tile_mv_state(canvas, canvas_mc, dec_delta, dec_delta_mc,
+            zcrudp_zcvid_apply_tile_mv_state(canvas, canvas_mc, dec_delta, dec_delta_mc,
                                                OUT_W, OUT_H, tile_sz, dec_mvs);
             memcpy(canvas, canvas_mc, len);
             memcpy(dec_delta, dec_delta_mc, len);
         }
 
-        zcrudp_ternary_decay_plane(canvas, len, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(canvas, len, cfg.gamma_q8, cfg.neutral_y);
         for (; pkt_idx < s.count; pkt_idx++) {
-            if (!zcrudp_ternary_decode_packet(s.pkts[pkt_idx], s.lens[pkt_idx],
+            if (!zcrudp_zcvid_decode_packet(s.pkts[pkt_idx], s.lens[pkt_idx],
                                               canvas, dec_delta, len, &cfg, NULL)) {
                 fprintf(stderr, "decode failed\n");
                 exit(2);
@@ -252,14 +252,14 @@ int main(int argc, char **argv) {
     uint8_t *ref_tok = (uint8_t *)malloc(len), *ref_ec = (uint8_t *)malloc(len);
     if (!ref_tok || !ref_ec) return 2;
     result_t tok = run(img, iw, ih, pan, noise, 0U, 0U, false, false, ref_tok);
-    result_t ec  = run(img, iw, ih, pan, noise, ZCRUDP_TERNARY_EC_ALL, 0U, false, false, ref_ec);
+    result_t ec  = run(img, iw, ih, pan, noise, ZCRUDP_ZCVID_EC_ALL, 0U, false, false, ref_ec);
     if (memcmp(ref_tok, ref_ec, len) != 0) {
         fprintf(stderr, "token and entropy-coded pictures differ\n");
         return 2;
     }
-    result_t qrepair = run(img, iw, ih, pan, noise, ZCRUDP_TERNARY_EC_ALL, 4U, false, true, NULL);
-    result_t tilemv  = run(img, iw, ih, pan, noise, ZCRUDP_TERNARY_EC_ALL, 4U, true,  true, NULL);
-    result_t tilerans = run(img, iw, ih, pan, noise, ZCRUDP_TERNARY_EC_RANS | ZCRUDP_TERNARY_EC_INTRA, 4U, true, true, NULL);
+    result_t qrepair = run(img, iw, ih, pan, noise, ZCRUDP_ZCVID_EC_ALL, 4U, false, true, NULL);
+    result_t tilemv  = run(img, iw, ih, pan, noise, ZCRUDP_ZCVID_EC_ALL, 4U, true,  true, NULL);
+    result_t tilerans = run(img, iw, ih, pan, noise, ZCRUDP_ZCVID_EC_RANS | ZCRUDP_ZCVID_EC_INTRA, 4U, true, true, NULL);
 
     printf("%s (%dx%d), 1280x720 window, pan %d px/frame, noise +-%d\n",
            argv[1], iw, ih, pan, noise);

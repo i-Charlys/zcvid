@@ -1,10 +1,10 @@
 """
-Z3 SMT Formal Verification of tern_vid 4-way 12-bit static rANS tables,
+Z3 SMT Formal Verification of zcvid 4-way 12-bit static rANS tables,
 32-bit arithmetic overflow freedom, encode/decode invertibility, and
-zero-drop emitter headroom invariant (ternary_rans.h & ternary_codec.h).
+zero-drop emitter headroom invariant (zcvid_rans.h & zcvid_codec.h).
 
 Run with:
-  C:\\Users\\charl\\.gemini\\mcp-venvs\\z3-mcp\\Scripts\\python.exe rans_tables_and_headroom_z3.py
+  python3 rans_tables_and_headroom_z3.py
 """
 
 import sys
@@ -13,7 +13,7 @@ from z3 import (
     And, Or, Not, If, ForAll, unsat, sat, ZeroExt, Extract
 )
 
-# Exact constants from ternary_rans.h & ternary_codec.h
+# Exact constants from zcvid_rans.h & zcvid_codec.h
 RANS_BITS = 12
 RANS_SCALE = 1 << RANS_BITS  # 4096
 RANS_L = 1 << 23             # 8388608
@@ -33,7 +33,7 @@ ZCRUDP_RANS_CUM = [
 
 
 def worst_bits(sym: int) -> int:
-    """Exact per-symbol worst-case bit cost from ternary_codec.h lines 1100, 1106, 1115."""
+    """Exact per-symbol worst-case bit cost from zcvid_codec.h lines 1100, 1106, 1115."""
     if sym == 0:
         return 3
     if sym <= 2:
@@ -77,7 +77,7 @@ def verify_find_sym_binary_search() -> None:
         cf = BitVec("cf", 32)
         s_solver.add(ULT(cf, BitVecVal(RANS_SCALE, 32)))
 
-        # Model C code in ternary_rans.h lines 60-67
+        # Model C code in zcvid_rans.h lines 60-67
         def cum_at(idx_bv):
             expr = BitVecVal(cum[16], 32)
             for k in range(15, -1, -1):
@@ -156,7 +156,7 @@ def verify_rans_step_no_overflow_and_invertible() -> None:
 
 
 def verify_emitter_zero_drop_headroom() -> None:
-    """Theorem 4: Zero-drop rANS headroom invariant in zcrudp_ternary_emit_block / flush.
+    """Theorem 4: Zero-drop rANS headroom invariant in zcrudp_zcvid_emit_block / flush.
 
     Let rcap = min(max_payload, 2048) with 64 <= rcap <= 2048.
     Let B_actual be the total stream bytes emitted across 4 lanes.
@@ -257,7 +257,7 @@ def verify_emitter_zero_drop_headroom() -> None:
 
 
 if __name__ == "__main__":
-    print("=== tern_vid Z3 Formal Verification: rANS Tables, Arithmetic & Zero-Drop Headroom ===")
+    print("=== zcvid Z3 Formal Verification: rANS Tables, Arithmetic & Zero-Drop Headroom ===")
     verify_tables_and_worst_bits()
     verify_find_sym_binary_search()
     verify_rans_step_no_overflow_and_invertible()

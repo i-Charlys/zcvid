@@ -1,6 +1,6 @@
 /**
- * @file test_ternary_packing.c
- * @brief Unit tests & CPU cycle benchmark for C11 ternary packing primitives.
+ * @file test_zcvid_packing.c
+ * @brief Unit tests & CPU cycle benchmark for C11 zcvid packing primitives.
  */
 
 #include <stdio.h>
@@ -11,7 +11,7 @@
 #include <assert.h>
 #include <time.h>
 
-#include "protocol_ternary.h"
+#include "protocol_zcvid.h"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
@@ -104,13 +104,13 @@ static void test_tfv_record_integration(void) {
     uint16_t packed_val = zcrudp_pack_10trits(trits);
 
     zcrudp_tfv_record_t rec = {
-        .type = ZCRUDP_TFV_TYPE_TERNARY_PACK10,
+        .type = ZCRUDP_TFV_TYPE_ZCVID_PACK10,
         .flags = 0x01,
         .value = packed_val
     };
 
     assert(sizeof(rec) == 4);
-    assert(rec.type == ZCRUDP_TFV_TYPE_TERNARY_PACK10);
+    assert(rec.type == ZCRUDP_TFV_TYPE_ZCVID_PACK10);
     assert(rec.flags == 0x01);
 
     zcrudp_trit_t unpacked[10];
@@ -192,13 +192,13 @@ static void test_wire_serialization(void) {
     printf("[TEST] Running Little-Endian Wire Serialization Test... ");
 
     zcrudp_tfv_record_t rec_in = {
-        .type = ZCRUDP_TFV_TYPE_TERNARY_SKIP,
+        .type = ZCRUDP_TFV_TYPE_ZCVID_SKIP,
         .flags = 0xAB,
         .value = 0x1234
     };
     uint8_t buf4[4];
     zcrudp_tfv_write_le(buf4, &rec_in);
-    assert(buf4[0] == ZCRUDP_TFV_TYPE_TERNARY_SKIP);
+    assert(buf4[0] == ZCRUDP_TFV_TYPE_ZCVID_SKIP);
     assert(buf4[1] == 0xAB);
     assert(buf4[2] == 0x34);
     assert(buf4[3] == 0x12);
@@ -209,7 +209,7 @@ static void test_wire_serialization(void) {
     assert(rec_out.flags == rec_in.flags);
     assert(rec_out.value == rec_in.value);
 
-    zcrudp_ternary_slice_header_t hdr_in = {
+    zcrudp_zcvid_slice_header_t hdr_in = {
         .slice_index = 42,
         .start_pixel = 12800,
         .count = 64,
@@ -218,7 +218,7 @@ static void test_wire_serialization(void) {
     };
     uint8_t buf8[8];
     zcrudp_slice_header_write_le(buf8, &hdr_in);
-    zcrudp_ternary_slice_header_t hdr_out;
+    zcrudp_zcvid_slice_header_t hdr_out;
     zcrudp_slice_header_read_le(buf8, &hdr_out);
     assert(hdr_out.slice_index == hdr_in.slice_index);
     assert(hdr_out.start_pixel == hdr_in.start_pixel);
@@ -377,7 +377,7 @@ static void benchmark_packing(void) {
 }
 
 int main(void) {
-    printf("=== zcrudp Ternary Video Profile Test Suite ===\n\n");
+    printf("=== zcrudp Zcvid Video Profile Test Suite ===\n\n");
 
     test_5trits_roundtrip();
     test_10trits_roundtrip();

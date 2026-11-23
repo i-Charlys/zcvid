@@ -1,11 +1,11 @@
-// ternary_decode.hlsl - D3D11 Compute Shader (cs_5_0)
+// zcvid_decode.hlsl - D3D11 Compute Shader (cs_5_0)
 // Full-Color (YCbCr) + 32x32 Tile MV + Jayant ADM + Intra-Refresh Decoder.
 //
 // Pass 1: CSMotionDecay -> Applies Tile MV from g_prev_yuvd + Leaky Decay into g_cur_yuvd
 // Pass 2: CSApply       -> Applies received Delta (Y/Cb/Cr) & Intra records
 // Pass 3: CSYCbCrToRGBA -> Converts g_cur_yuvd to Swapchain RGBA Texture2D
 
-cbuffer TernaryDecParams : register(b0) {
+cbuffer ZcvidDecParams : register(b0) {
     uint width;
     uint height;
     uint delta_min;
@@ -29,8 +29,8 @@ RWStructuredBuffer<uint>  g_coef       : register(u2); // transform intra: 48 de
 RWStructuredBuffer<uint>  g_tflag      : register(u3); // transform intra: 1 per block with coefficients this frame
 
 // -------------------------------------------------------------------------
-// 4x4 integer transform intra (shared, word for word, by ternary_encode.hlsl
-// and ternary_decode.hlsl: the reconstruction must be bit-exact on both
+// 4x4 integer transform intra (shared, word for word, by zcvid_encode.hlsl
+// and zcvid_decode.hlsl: the reconstruction must be bit-exact on both
 // sides, on any GPU, so everything is integer).
 //
 // The H.264 core transform and its quantizer: forward Cf.X.Cf^T, level =
@@ -84,7 +84,7 @@ int LeakyDecay(int prev_val, int neutral) {
 
 // -------------------------------------------------------------------------
 // Motion-compensated reference with a quarter-pel vector (shared, word for
-// word, by ternary_encode.hlsl and ternary_decode.hlsl). Y, Cb and Cr are
+// word, by zcvid_encode.hlsl and zcvid_decode.hlsl). Y, Cb and Cr are
 // interpolated in integers (4-tap, see below), so both sides get the same value on
 // any GPU; the adaptive step comes from the integer-pel position. A vector
 // that is a multiple of 4 reads exactly one reference pixel, as before.
@@ -154,13 +154,119 @@ int StepOf(uint ref_w) {
 // Pass 1: Motion-Compensated Copy + Leaky Decay (1 thread per pixel)
 // This is the "all trits are zero" reconstruction, so the adaptive step is
 // halved here; CSApply overrides it where a non-zero luma trit arrives.
+// Every 16x16 workgroup lies strictly inside one 32x32 tile (uniform mvq),
+// using a bit-exact groupshared separable 4-tap HEVC filter matching CSMotionPred.
 // =========================================================================
+groupshared uint gs_mc_ref[361]; // 19x19 packed reference patch
+groupshared int  gs_mc_h0[304];  // 19x16 unrounded horizontal 4-tap Y
+groupshared int  gs_mc_h1[304];  // 19x16 unrounded horizontal 4-tap Cb
+groupshared int  gs_mc_h2[304];  // 19x16 unrounded horizontal 4-tap Cr
+
 [numthreads(16, 16, 1)]
-void CSMotionDecay(uint3 dtid : SV_DispatchThreadID) {
-    if (dtid.x >= width || dtid.y >= height) return;
+void CSMotionDecay(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint gx0 = gid.x * 16u;
+    uint gy0 = gid.y * 16u;
+    int2 mv = g_tile_mvs[(gy0 >> 5) * tiles_x + (gx0 >> 5)];
+    int2 mvq = (mv_qpel != 0u) ? mv : mv * 4;
+    int sxq0 = (int)gx0 * 4 - mvq.x;
+    int syq0 = (int)gy0 * 4 - mvq.y;
+    int ix0 = sxq0 >> 2;
+    int iy0 = syq0 >> 2;
+    int fx = sxq0 & 3;
+    int fy = syq0 & 3;
+
+    uint w;
+    if ((fx | fy) == 0) {
+        if (dtid.x >= width || dtid.y >= height) return;
+        w = RefWordAt(ix0 + (int)gtid.x, iy0 + (int)gtid.y);
+    } else {
+        uint lid = gtid.y * 16u + gtid.x;
+        [unroll] for (uint k = 0u; k < 2u; k++) {
+            uint idx_k = lid + k * 256u;
+            if (idx_k < 361u) {
+                uint ry = idx_k / 19u;
+                uint rx = idx_k - ry * 19u;
+                gs_mc_ref[idx_k] = RefWordAt(ix0 - 1 + (int)rx, iy0 - 1 + (int)ry);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (fy == 0) {
+            if (dtid.x >= width || dtid.y >= height) return;
+            int4 tx = TapsQ(fx);
+            uint rb = (gtid.y + 1u) * 19u + gtid.x;
+            uint w0 = gs_mc_ref[rb];
+            uint w1 = gs_mc_ref[rb + 1u];
+            uint w2 = gs_mc_ref[rb + 2u];
+            uint w3 = gs_mc_ref[rb + 3u];
+            int h0 = tx.x * (int)(w0 & 0xFFu) + tx.y * (int)(w1 & 0xFFu) +
+                     tx.z * (int)(w2 & 0xFFu) + tx.w * (int)(w3 & 0xFFu);
+            int h1 = tx.x * (int)((w0 >> 8) & 0xFFu) + tx.y * (int)((w1 >> 8) & 0xFFu) +
+                     tx.z * (int)((w2 >> 8) & 0xFFu) + tx.w * (int)((w3 >> 8) & 0xFFu);
+            int h2 = tx.x * (int)((w0 >> 16) & 0xFFu) + tx.y * (int)((w1 >> 16) & 0xFFu) +
+                     tx.z * (int)((w2 >> 16) & 0xFFu) + tx.w * (int)((w3 >> 16) & 0xFFu);
+            w = (w1 & 0xFF000000u) |
+                (uint)clamp((h0 + 32) >> 6, 0, 255) |
+                ((uint)clamp((h1 + 32) >> 6, 0, 255) << 8) |
+                ((uint)clamp((h2 + 32) >> 6, 0, 255) << 16);
+        } else if (fx == 0) {
+            if (dtid.x >= width || dtid.y >= height) return;
+            int4 ty = TapsQ(fy);
+            uint cb = gtid.y * 19u + (gtid.x + 1u);
+            uint w0 = gs_mc_ref[cb];
+            uint w1 = gs_mc_ref[cb + 19u];
+            uint w2 = gs_mc_ref[cb + 38u];
+            uint w3 = gs_mc_ref[cb + 57u];
+            int v0 = ty.x * (int)(w0 & 0xFFu) + ty.y * (int)(w1 & 0xFFu) +
+                     ty.z * (int)(w2 & 0xFFu) + ty.w * (int)(w3 & 0xFFu);
+            int v1 = ty.x * (int)((w0 >> 8) & 0xFFu) + ty.y * (int)((w1 >> 8) & 0xFFu) +
+                     ty.z * (int)((w2 >> 8) & 0xFFu) + ty.w * (int)((w3 >> 8) & 0xFFu);
+            int v2 = ty.x * (int)((w0 >> 16) & 0xFFu) + ty.y * (int)((w1 >> 16) & 0xFFu) +
+                     ty.z * (int)((w2 >> 16) & 0xFFu) + ty.w * (int)((w3 >> 16) & 0xFFu);
+            w = (w1 & 0xFF000000u) |
+                (uint)clamp((v0 + 32) >> 6, 0, 255) |
+                ((uint)clamp((v1 + 32) >> 6, 0, 255) << 8) |
+                ((uint)clamp((v2 + 32) >> 6, 0, 255) << 16);
+        } else {
+            int4 tx = TapsQ(fx);
+            [unroll] for (uint m2 = 0u; m2 < 2u; m2++) {
+                uint m = lid + m2 * 256u;
+                if (m < 304u) {
+                    uint ry = m >> 4;
+                    uint rx = m & 15u;
+                    uint rb = ry * 19u + rx;
+                    uint w0 = gs_mc_ref[rb];
+                    uint w1 = gs_mc_ref[rb + 1u];
+                    uint w2 = gs_mc_ref[rb + 2u];
+                    uint w3 = gs_mc_ref[rb + 3u];
+                    gs_mc_h0[m] = tx.x * (int)(w0 & 0xFFu) + tx.y * (int)(w1 & 0xFFu) +
+                                  tx.z * (int)(w2 & 0xFFu) + tx.w * (int)(w3 & 0xFFu);
+                    gs_mc_h1[m] = tx.x * (int)((w0 >> 8) & 0xFFu) + tx.y * (int)((w1 >> 8) & 0xFFu) +
+                                  tx.z * (int)((w2 >> 8) & 0xFFu) + tx.w * (int)((w3 >> 8) & 0xFFu);
+                    gs_mc_h2[m] = tx.x * (int)((w0 >> 16) & 0xFFu) + tx.y * (int)((w1 >> 16) & 0xFFu) +
+                                  tx.z * (int)((w2 >> 16) & 0xFFu) + tx.w * (int)((w3 >> 16) & 0xFFu);
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (dtid.x >= width || dtid.y >= height) return;
+            int4 ty = TapsQ(fy);
+            uint c0 = gtid.y * 16u + gtid.x;
+            int acc0 = ty.x * gs_mc_h0[c0] + ty.y * gs_mc_h0[c0 + 16u] +
+                       ty.z * gs_mc_h0[c0 + 32u] + ty.w * gs_mc_h0[c0 + 48u];
+            int acc1 = ty.x * gs_mc_h1[c0] + ty.y * gs_mc_h1[c0 + 16u] +
+                       ty.z * gs_mc_h1[c0 + 32u] + ty.w * gs_mc_h1[c0 + 48u];
+            int acc2 = ty.x * gs_mc_h2[c0] + ty.y * gs_mc_h2[c0 + 16u] +
+                       ty.z * gs_mc_h2[c0 + 32u] + ty.w * gs_mc_h2[c0 + 48u];
+            uint w00 = gs_mc_ref[(gtid.y + 1u) * 19u + (gtid.x + 1u)];
+            w = (w00 & 0xFF000000u) |
+                (uint)clamp((acc0 + 2048) >> 12, 0, 255) |
+                ((uint)clamp((acc1 + 2048) >> 12, 0, 255) << 8) |
+                ((uint)clamp((acc2 + 2048) >> 12, 0, 255) << 16);
+        }
+    }
 
     uint idx = dtid.y * width + dtid.x;
-    uint w = PrevShifted(idx);
     int y  = LeakyDecay((int)(w & 0xFFu), (int)neutral_y);
     int cb = LeakyDecay((int)((w >> 8) & 0xFFu), 128);
     int cr = LeakyDecay((int)((w >> 16) & 0xFFu), 128);
@@ -214,7 +320,7 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
             uint qp = (w1 >> 16) & 0xFFu;
             uint pred = (w1 >> 24) & 0xFFu;
             uint nblocks = ((width + 3u) >> 2) * ((height + 3u) >> 2);
-            if (b >= nblocks || qp > 51u || pred > 1u) return;
+            if (b >= nblocks || qp > 51u || pred > 3u) return;
             int level = (int)(w1 << 16) >> 16;
             if (level < -255 || level > 255) return;
             uint r = TQ_ZZ[pid % 16u];
@@ -232,8 +338,8 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
             uint y2_q6 = (w1 >> 12) & 0x3Fu;
             uint y3_q6 = (w1 >> 18) & 0x3Fu;
             uint cb_q6 = (w1 >> 24) & 0x3Fu;
-            uint cb = (cb_q6 << 2) | (cb_q6 >> 4);
-            uint cr = (cr_q6 << 2) | (cr_q6 >> 4);
+            uint cb = cb_q6 << 2;
+            uint cr = cr_q6 << 2;
             uint chroma_d = (cb << 8) | (cr << 16) | (delta_min << 24);
             if (idx4 + 0u < num_px) g_cur_yuvd[idx4 + 0u] = ((y0_q6 << 2) | (y0_q6 >> 4)) | chroma_d;
             if (idx4 + 1u < num_px) g_cur_yuvd[idx4 + 1u] = ((y1_q6 << 2) | (y1_q6 >> 4)) | chroma_d;
@@ -299,33 +405,61 @@ void CSYCbCrToRGBA(uint3 dtid : SV_DispatchThreadID) {
 
     uint w = g_prev_yuvd[dtid.y * width + dtid.x];
     float y  = (float)(w & 0xFFu);
-    // Display-only deblocking: across a 4x4 block edge, a small luma step
-    // (at most post_thr, too small to be a real edge) is pulled a quarter of
-    // the way towards the other side. Applied after the closed loop: the
-    // reference is untouched, so nothing can drift.
-    if (post_thr != 0u) {
-        int yc = (int)(w & 0xFFu);
-        int adj = 0;
-        uint x = dtid.x, yy = dtid.y;
-        uint idx = yy * width + x;
-        if ((x & 3u) == 0u && x > 0u) {
-            int d = (int)(g_prev_yuvd[idx - 1u] & 0xFFu) - yc;
-            if (abs(d) <= (int)post_thr) adj += d / 4;
-        } else if ((x & 3u) == 3u && x + 1u < width) {
-            int d = (int)(g_prev_yuvd[idx + 1u] & 0xFFu) - yc;
-            if (abs(d) <= (int)post_thr) adj += d / 4;
-        }
-        if ((yy & 3u) == 0u && yy > 0u) {
-            int d = (int)(g_prev_yuvd[idx - width] & 0xFFu) - yc;
-            if (abs(d) <= (int)post_thr) adj += d / 4;
-        } else if ((yy & 3u) == 3u && yy + 1u < height) {
-            int d = (int)(g_prev_yuvd[idx + width] & 0xFFu) - yc;
-            if (abs(d) <= (int)post_thr) adj += d / 4;
-        }
-        y = (float)clamp(yc + adj, 0, 255);
-    }
     float cb = (float)((w >> 8) & 0xFFu) - 128.0f;
     float cr = (float)((w >> 16) & 0xFFu) - 128.0f;
+    // Display-only edge-aware deblocking: across a 4x4 block edge, a small luma step
+    // (<= 6) is pulled a quarter of the way towards the other side. When post_thr > 6
+    // (high-QP fast motion), allow up to post_thr on luma and post_thr>>1 on chroma ONLY
+    // when both sides of the boundary are locally smooth (|p0-p1| <= beta && |q0-q1| <= beta),
+    // preserving sharp UI text, thin lines, and real edges without blur.
+    // Applied after the closed loop: the reference is untouched, so nothing can drift.
+    if (post_thr != 0u) {
+        int yc = (int)(w & 0xFFu);
+        int cbc = (int)((w >> 8) & 0xFFu);
+        int crc = (int)((w >> 16) & 0xFFu);
+        int adj = 0, adj_cb = 0, adj_cr = 0;
+        bool hi_qp = (post_thr > 6u);
+        int base_thr = (int)min(post_thr, 6u);
+        int beta = max((int)(post_thr >> 1), 4);
+        int c_thr = (int)(post_thr >> 1);
+        uint x = dtid.x, yy = dtid.y;
+        uint idx = yy * width + x;
+        int nx = ((x & 3u) == 0u && x > 0u) ? -1 : (((x & 3u) == 3u && x + 1u < width) ? 1 : 0);
+        int ny = ((yy & 3u) == 0u && yy > 0u) ? -(int)width : (((yy & 3u) == 3u && yy + 1u < height) ? (int)width : 0);
+        bool ok_in_x = (nx < 0) ? (x + 1u < width && x >= 2u) : (nx > 0 ? (x > 0u && x + 2u < width) : false);
+        bool ok_in_y = (ny < 0) ? (yy + 1u < height && yy >= 2u) : (ny > 0 ? (yy > 0u && yy + 2u < height) : false);
+        int n_off[2] = { nx, ny };
+        bool ok_in[2] = { ok_in_x, ok_in_y };
+        [unroll] for (uint k = 0u; k < 2u; k++) {
+            if (n_off[k] != 0) {
+                uint wn = g_prev_yuvd[(uint)((int)idx + n_off[k])];
+                int yn = (int)(wn & 0xFFu);
+                int d = yn - yc;
+                int lim = base_thr;
+                bool smooth_side = false;
+                if (hi_qp && ok_in[k]) {
+                    int p1 = (int)(g_prev_yuvd[(uint)((int)idx - n_off[k])] & 0xFFu);
+                    int q1 = (int)(g_prev_yuvd[(uint)((int)idx + 2 * n_off[k])] & 0xFFu);
+                    if (abs(yc - p1) <= beta && abs(yn - q1) <= beta) {
+                        lim = (int)post_thr;
+                        smooth_side = true;
+                    }
+                }
+                if (abs(d) <= lim) adj += d / 4;
+                if (smooth_side) {
+                    int dcb = (int)((wn >> 8) & 0xFFu) - cbc;
+                    int dcr = (int)((wn >> 16) & 0xFFu) - crc;
+                    if (abs(dcb) <= c_thr) adj_cb += dcb / 4;
+                    if (abs(dcr) <= c_thr) adj_cr += dcr / 4;
+                }
+            }
+        }
+        y = (float)clamp(yc + adj, 0, 255);
+        if (hi_qp) {
+            cb = (float)clamp(cbc + adj_cb, 0, 255) - 128.0f;
+            cr = (float)clamp(crc + adj_cr, 0, 255) - 128.0f;
+        }
+    }
 
     float r = clamp((y + 1.402f * cr) / 255.0f, 0.0f, 1.0f);
     float g = clamp((y - 0.344136f * cb - 0.714136f * cr) / 255.0f, 0.0f, 1.0f);
@@ -334,8 +468,18 @@ void CSYCbCrToRGBA(uint3 dtid : SV_DispatchThreadID) {
     g_out_rgba[dtid.xy] = float4(r, g, b, 1.0f);
 }
 
+// Intra-block exact integer bilinear upsample of a 4x4 grid to 8x8 pixels.
+// Shared word-for-word with zcvid_encode.hlsl and zcvid_gpu_cpu_dec.h.
+int TqSample8x8(int c[16], uint lx, uint ly) {
+    uint u = lx >> 1;
+    uint v = ly >> 1;
+    uint un = ((lx & 1u) == 0u) ? ((u > 0u) ? (u - 1u) : 0u) : ((u < 3u) ? (u + 1u) : 3u);
+    uint vn = ((ly & 1u) == 0u) ? ((v > 0u) ? (v - 1u) : 0u) : ((v < 3u) ? (v + 1u) : 3u);
+    return (9 * c[v * 4u + u] + 3 * c[v * 4u + un] + 3 * c[vn * 4u + u] + c[vn * 4u + un] + 8) >> 4;
+}
+
 // =========================================================================
-// Pass 2b: Transform intra reconstruction (1 thread per 4x4 block)
+// Pass 2b: Transform reconstruction (4x4 mode 1..2 and 8x8 mode 3..4)
 // Runs after CSApply. A flagged block is rebuilt from its coefficients
 // (missing ones are 0), then its coefficients and flag are cleared so the
 // buffers are all-zero again for the next frame.
@@ -350,30 +494,59 @@ void CSITrans(uint3 dtid : SV_DispatchThreadID) {
     g_tflag[b] = 0u;
     uint x0 = (b % bw) * 4u;
     uint y0 = (b / bw) * 4u;
-    bool inside = (x0 + 4u <= width) && (y0 + 4u <= height);
-    // Inter blocks are predicted from what CSMotionDecay wrote there.
-    uint cur[16];
-    [unroll] for (uint j0 = 0; j0 < 16u; j0++) {
-        cur[j0] = inside ? g_cur_yuvd[(y0 + (j0 >> 2)) * width + x0 + (j0 & 3u)] : 0x00808080u;
-    }
-    int rec[48];
-    [unroll] for (uint pl = 0; pl < 3u; pl++) {
-        int c[16];
-        [unroll] for (uint k = 0; k < 16u; k++) {
-            uint pid = b * 48u + pl * 16u + k;
-            c[TQ_ZZ[k]] = (int)g_coef[pid];
-            g_coef[pid] = 0u;
+    bool is_inter = (mode == 2u) || (mode == 4u);
+    if (mode <= 2u) {
+        bool inside = (x0 + 4u <= width) && (y0 + 4u <= height);
+        uint cur[16];
+        [unroll] for (uint j0 = 0; j0 < 16u; j0++) {
+            cur[j0] = inside ? g_cur_yuvd[(y0 + (j0 >> 2)) * width + x0 + (j0 & 3u)] : 0x00808080u;
         }
-        TqInverse(c);
-        [unroll] for (uint q = 0; q < 16u; q++) {
-            int pv = (mode == 2u) ? (int)((cur[q] >> (pl * 8u)) & 0xFFu) : 128;
-            rec[pl * 16u + q] = clamp(pv + c[q], 0, 255);
+        int rec[48];
+        [unroll] for (uint pl = 0; pl < 3u; pl++) {
+            int c[16];
+            [unroll] for (uint k = 0; k < 16u; k++) {
+                uint pid = b * 48u + pl * 16u + k;
+                c[TQ_ZZ[k]] = (int)g_coef[pid];
+                g_coef[pid] = 0u;
+            }
+            TqInverse(c);
+            [unroll] for (uint q = 0; q < 16u; q++) {
+                int pv = is_inter ? (int)((cur[q] >> (pl * 8u)) & 0xFFu) : 128;
+                rec[pl * 16u + q] = clamp(pv + c[q], 0, 255);
+            }
         }
-    }
-    if (!inside) return; // never coded by the encoder
-    [unroll] for (uint j = 0; j < 16u; j++) {
-        uint idx = (y0 + (j >> 2)) * width + x0 + (j & 3u);
-        g_cur_yuvd[idx] = (uint)rec[j] | ((uint)rec[16u + j] << 8) |
-                          ((uint)rec[32u + j] << 16) | (delta_min << 24);
+        if (!inside) return; // never coded by the encoder
+        [unroll] for (uint j = 0; j < 16u; j++) {
+            uint idx = (y0 + (j >> 2)) * width + x0 + (j & 3u);
+            g_cur_yuvd[idx] = (uint)rec[j] | ((uint)rec[16u + j] << 8) |
+                              ((uint)rec[32u + j] << 16) | (delta_min << 24);
+        }
+    } else {
+        // 8x8 bilinear-upsampled transform block (mode 3 = intra, mode 4 = inter).
+        bool inside8 = (x0 + 8u <= width) && (y0 + 8u <= height);
+        int c0[16], c1[16], c2[16];
+        [unroll] for (uint pl = 0; pl < 3u; pl++) {
+            int c[16];
+            [unroll] for (uint k = 0; k < 16u; k++) {
+                uint pid = b * 48u + pl * 16u + k;
+                c[TQ_ZZ[k]] = (int)g_coef[pid];
+                g_coef[pid] = 0u;
+            }
+            TqInverse(c);
+            if (pl == 0u) { [unroll] for (uint q0 = 0; q0 < 16u; q0++) c0[q0] = c[q0]; }
+            else if (pl == 1u) { [unroll] for (uint q1 = 0; q1 < 16u; q1++) c1[q1] = c[q1]; }
+            else { [unroll] for (uint q2 = 0; q2 < 16u; q2++) c2[q2] = c[q2]; }
+        }
+        if (!inside8) return;
+        [loop] for (uint ly = 0; ly < 8u; ly++) {
+            [unroll] for (uint lx = 0; lx < 8u; lx++) {
+                uint idx = (y0 + ly) * width + x0 + lx;
+                uint pw = is_inter ? g_cur_yuvd[idx] : 0x00808080u;
+                int ry = clamp((int)(pw & 0xFFu) + TqSample8x8(c0, lx, ly), 0, 255);
+                int rb = clamp((int)((pw >> 8) & 0xFFu) + TqSample8x8(c1, lx, ly), 0, 255);
+                int rr = clamp((int)((pw >> 16) & 0xFFu) + TqSample8x8(c2, lx, ly), 0, 255);
+                g_cur_yuvd[idx] = (uint)ry | ((uint)rb << 8) | ((uint)rr << 16) | (delta_min << 24);
+            }
+        }
     }
 }

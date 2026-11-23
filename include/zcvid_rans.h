@@ -1,6 +1,6 @@
 /**
- * @file ternary_rans.h
- * @brief 4-way interleaved 12-bit static rANS entropy coder for tern_vid.
+ * @file zcvid_rans.h
+ * @brief 4-way interleaved 12-bit static rANS entropy coder for zcvid.
  *
  * Designed for 1080p360 real-time transport:
  *  - Zero dynamic allocation, zero mutable global state, zero encoder/decoder drift.
@@ -11,8 +11,8 @@
  *    with 1-bit signs packed separately at 1.00 bit/sign.
  */
 
-#ifndef ZCRUDP_TERNARY_RANS_H
-#define ZCRUDP_TERNARY_RANS_H
+#ifndef ZCRUDP_ZCVID_RANS_H
+#define ZCRUDP_ZCVID_RANS_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -187,4 +187,4 @@ static inline bool zcrudp_rans_decode_syms(const uint8_t *in,
 }
 #endif
 
-#endif /* ZCRUDP_TERNARY_RANS_H */
+#endif /* ZCRUDP_ZCVID_RANS_H */

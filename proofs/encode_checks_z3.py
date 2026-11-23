@@ -1,4 +1,4 @@
-"""Checks of ternary_encode.hlsl that the Dafny proof (tq_budget_scan.dfy)
+"""Checks of zcvid_encode.hlsl that the Dafny proof (tq_budget_scan.dfy)
 takes as given, plus overflow bounds. Run with a Python that has z3-solver:  python encode_checks_z3.py
 
 (a) The groupshared scans compute prefix sums. GroupExclusive64 (64 lanes)

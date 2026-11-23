@@ -1,6 +1,6 @@
 /**
- * @file test_ternary_codec.c
- * @brief Unit tests & 1080p120 latency/bandwidth benchmark for ternary_codec.h
+ * @file test_zcvid_codec.c
+ * @brief Unit tests & 1080p120 latency/bandwidth benchmark for zcvid_codec.h
  *        (NV12 & RGBA, Jayant ADM, RLE zero-skip, entropy coding, AVX2/Scalar).
  */
 
@@ -13,9 +13,9 @@
 #include <time.h>
 #include <math.h>
 
-#include "ternary_codec.h"
-#include "ternary_mt.h"
-#include "ternary_zcrudp_bridge.h"
+#include "zcvid_codec.h"
+#include "zcvid_mt.h"
+#include "zcvid_zcrudp_bridge.h"
 
 static inline uint64_t read_ns(void) {
     struct timespec ts;
@@ -45,13 +45,13 @@ static void sink_cb(const uint8_t *data, size_t len, void *ctx) {
 static void test_nv12_and_rgba_roundtrip(void) {
     printf("[TEST] Running NV12 & RGBA Jayant ADM Roundtrip Test... ");
 
-    const zcrudp_ternary_pixfmt_t fmts[2] = {
-        ZCRUDP_TERNARY_FMT_NV12,
-        ZCRUDP_TERNARY_FMT_RGBA
+    const zcrudp_zcvid_pixfmt_t fmts[2] = {
+        ZCRUDP_ZCVID_FMT_NV12,
+        ZCRUDP_ZCVID_FMT_RGBA
     };
 
     for (int f_idx = 0; f_idx < 2; f_idx++) {
-        zcrudp_ternary_config_t cfg = {
+        zcrudp_zcvid_config_t cfg = {
             .width = 160,
             .height = 90,
             .pixfmt = fmts[f_idx],
@@ -63,7 +63,7 @@ static void test_nv12_and_rgba_roundtrip(void) {
             .mtu_payload = 1380
         };
 
-        size_t psz = zcrudp_ternary_planar_size(&cfg);
+        size_t psz = zcrudp_zcvid_planar_size(&cfg);
         uint8_t *src = (uint8_t *)malloc(psz);
         uint8_t *enc_ref = (uint8_t *)malloc(psz);
         uint8_t *enc_delta = (uint8_t *)malloc(psz);
@@ -97,28 +97,28 @@ static void test_nv12_and_rgba_roundtrip(void) {
             sink.count = 0;
             sink.total_bytes = 0;
 
-            zcrudp_ternary_encode_frame(src, enc_ref, enc_delta, fid, &cfg,
+            zcrudp_zcvid_encode_frame(src, enc_ref, enc_delta, fid, &cfg,
                                         pkt_buf, sink_cb, &sink);
 
             /* Decoder: decay all planes once, then apply received packets */
-            if (cfg.pixfmt == ZCRUDP_TERNARY_FMT_NV12) {
-                zcrudp_ternary_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
-                zcrudp_ternary_decay_plane(dec_canvas + y_sz, y_sz / 2U, cfg.gamma_q8, cfg.neutral_y);
+            if (cfg.pixfmt == ZCRUDP_ZCVID_FMT_NV12) {
+                zcrudp_zcvid_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
+                zcrudp_zcvid_decay_plane(dec_canvas + y_sz, y_sz / 2U, cfg.gamma_q8, cfg.neutral_y);
             } else {
                 for (size_t p = 0; p < 3U; p++) {
-                    zcrudp_ternary_decay_plane(dec_canvas + p * y_sz, y_sz, cfg.gamma_q8, cfg.neutral_y);
+                    zcrudp_zcvid_decay_plane(dec_canvas + p * y_sz, y_sz, cfg.gamma_q8, cfg.neutral_y);
                 }
             }
 
             for (size_t p = 0; p < sink.count; p++) {
                 const uint8_t *pd = sink.pkts + p * sink.mtu;
-                zcrudp_ternary_pkt_hdr_t hdr;
-                bool ok = zcrudp_ternary_pkt_hdr_read_le(pd, &hdr);
+                zcrudp_zcvid_pkt_hdr_t hdr;
+                bool ok = zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr);
                 assert(ok);
                 size_t plane_off = (hdr.plane == 0) ? 0 : (hdr.plane * y_sz);
-                size_t plane_len = (cfg.pixfmt == ZCRUDP_TERNARY_FMT_NV12 && hdr.plane == 1)
+                size_t plane_len = (cfg.pixfmt == ZCRUDP_ZCVID_FMT_NV12 && hdr.plane == 1)
                     ? (y_sz / 2U) : y_sz;
-                ok = zcrudp_ternary_decode_packet(
+                ok = zcrudp_zcvid_decode_packet(
                     pd, sink.lens[p],
                     dec_canvas + plane_off,
                     dec_delta + plane_off,
@@ -141,8 +141,8 @@ static void test_nv12_and_rgba_roundtrip(void) {
     printf("PASSED (NV12 & RGBA bit-exact)\n");
 }
 
-static void bench_1080p120_format(zcrudp_ternary_pixfmt_t fmt, const char *name, uint8_t entropy) {
-    zcrudp_ternary_config_t cfg = {
+static void bench_1080p120_format(zcrudp_zcvid_pixfmt_t fmt, const char *name, uint8_t entropy) {
+    zcrudp_zcvid_config_t cfg = {
         .width = 1920,
         .height = 1080,
         .pixfmt = fmt,
@@ -155,7 +155,7 @@ static void bench_1080p120_format(zcrudp_ternary_pixfmt_t fmt, const char *name,
         .entropy = entropy
     };
 
-    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t psz = zcrudp_zcvid_planar_size(&cfg);
     size_t y_sz = (size_t)cfg.width * (size_t)cfg.height;
     uint8_t *src = (uint8_t *)malloc(psz);
     uint8_t *enc_ref = (uint8_t *)malloc(psz);
@@ -202,27 +202,27 @@ static void bench_1080p120_format(zcrudp_ternary_pixfmt_t fmt, const char *name,
         sink.total_bytes = 0;
 
         uint64_t t0 = read_ns();
-        zcrudp_ternary_encode_frame(src, enc_ref, NULL, (uint16_t)it, &cfg,
+        zcrudp_zcvid_encode_frame(src, enc_ref, NULL, (uint16_t)it, &cfg,
                                     pkt_buf, sink_cb, &sink);
         uint64_t t1 = read_ns();
 
         uint64_t t2 = read_ns();
-        if (fmt == ZCRUDP_TERNARY_FMT_NV12) {
-            zcrudp_ternary_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
-            zcrudp_ternary_decay_plane(dec_canvas + y_sz, y_sz / 2U, cfg.gamma_q8, cfg.neutral_y);
+        if (fmt == ZCRUDP_ZCVID_FMT_NV12) {
+            zcrudp_zcvid_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
+            zcrudp_zcvid_decay_plane(dec_canvas + y_sz, y_sz / 2U, cfg.gamma_q8, cfg.neutral_y);
         } else {
             for (size_t p = 0; p < 3U; p++) {
-                zcrudp_ternary_decay_plane(dec_canvas + p * y_sz, y_sz, cfg.gamma_q8, cfg.neutral_y);
+                zcrudp_zcvid_decay_plane(dec_canvas + p * y_sz, y_sz, cfg.gamma_q8, cfg.neutral_y);
             }
         }
         for (size_t p = 0; p < sink.count; p++) {
             const uint8_t *pd = sink.pkts + p * sink.mtu;
-            zcrudp_ternary_pkt_hdr_t hdr;
-            zcrudp_ternary_pkt_hdr_read_le(pd, &hdr);
+            zcrudp_zcvid_pkt_hdr_t hdr;
+            zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr);
             size_t plane_off = (hdr.plane == 0) ? 0 : (hdr.plane * y_sz);
-            size_t plane_len = (fmt == ZCRUDP_TERNARY_FMT_NV12 && hdr.plane == 1)
+            size_t plane_len = (fmt == ZCRUDP_ZCVID_FMT_NV12 && hdr.plane == 1)
                 ? (y_sz / 2U) : y_sz;
-            zcrudp_ternary_decode_packet(pd, sink.lens[p],
+            zcrudp_zcvid_decode_packet(pd, sink.lens[p],
                                          dec_canvas + plane_off, NULL,
                                          plane_len, &cfg, NULL);
         }
@@ -249,8 +249,8 @@ static void bench_1080p120_format(zcrudp_ternary_pixfmt_t fmt, const char *name,
     free(dec_canvas);
 }
 
-static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uint32_t threads, uint8_t entropy) {
-    zcrudp_ternary_config_t cfg = {
+static void bench_1080p120_mt(zcrudp_zcvid_pixfmt_t fmt, const char *name, uint32_t threads, uint8_t entropy) {
+    zcrudp_zcvid_config_t cfg = {
         .width = 1920,
         .height = 1080,
         .pixfmt = fmt,
@@ -263,7 +263,7 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
         .entropy = entropy
     };
 
-    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t psz = zcrudp_zcvid_planar_size(&cfg);
     size_t y_sz = (size_t)cfg.width * (size_t)cfg.height;
     uint8_t *src = (uint8_t *)malloc(psz);
     uint8_t *enc_ref = (uint8_t *)malloc(psz);
@@ -279,8 +279,8 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
     memset(enc_ref, 128, psz);
     memset(dec_canvas, 128, psz);
 
-    zcrudp_ternary_mt_pool_t pool;
-    zcrudp_ternary_mt_init(&pool, threads, slice_pkts, slice_lens, MAX_PKTS_PER_T, 1400);
+    zcrudp_zcvid_mt_pool_t pool;
+    zcrudp_zcvid_mt_init(&pool, threads, slice_pkts, slice_lens, MAX_PKTS_PER_T, 1400);
 
     const int ITERS = 40;
     uint64_t enc_ns_total = 0;
@@ -299,9 +299,9 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
         size_t total_pkts = 0;
 
         uint64_t t0 = read_ns();
-        if (fmt == ZCRUDP_TERNARY_FMT_NV12) {
+        if (fmt == ZCRUDP_ZCVID_FMT_NV12) {
             size_t pk0 = 0, pk1 = 0;
-            total_bytes += zcrudp_ternary_mt_encode_plane(
+            total_bytes += zcrudp_zcvid_mt_encode_plane(
                 &pool, src, enc_ref, NULL, y_sz, 0, (uint16_t)it, &cfg, &pk0);
             /* Gather packets for decode simulation */
             for (uint32_t t = 0; t < pool.num_threads; t++) {
@@ -312,7 +312,7 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
                     total_pkts += c;
                 }
             }
-            total_bytes += zcrudp_ternary_mt_encode_plane(
+            total_bytes += zcrudp_zcvid_mt_encode_plane(
                 &pool, src + y_sz, enc_ref + y_sz, NULL, y_sz / 2U, 1, (uint16_t)it, &cfg, &pk1);
             for (uint32_t t = 0; t < pool.num_threads; t++) {
                 size_t c = pool.workers[t].sink.count;
@@ -325,7 +325,7 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
         } else {
             for (uint8_t pl = 0; pl < 3U; pl++) {
                 size_t pk = 0;
-                total_bytes += zcrudp_ternary_mt_encode_plane(
+                total_bytes += zcrudp_zcvid_mt_encode_plane(
                     &pool, src + pl * y_sz, enc_ref + pl * y_sz, NULL,
                     y_sz, pl, (uint16_t)it, &cfg, &pk);
                 for (uint32_t t = 0; t < pool.num_threads; t++) {
@@ -341,15 +341,15 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
         uint64_t t1 = read_ns();
 
         uint64_t t2 = read_ns();
-        if (fmt == ZCRUDP_TERNARY_FMT_NV12) {
-            zcrudp_ternary_mt_decay_plane(&pool, dec_canvas, y_sz, &cfg);
-            zcrudp_ternary_mt_decay_plane(&pool, dec_canvas + y_sz, y_sz / 2U, &cfg);
+        if (fmt == ZCRUDP_ZCVID_FMT_NV12) {
+            zcrudp_zcvid_mt_decay_plane(&pool, dec_canvas, y_sz, &cfg);
+            zcrudp_zcvid_mt_decay_plane(&pool, dec_canvas + y_sz, y_sz / 2U, &cfg);
         } else {
             for (uint8_t pl = 0; pl < 3U; pl++) {
-                zcrudp_ternary_mt_decay_plane(&pool, dec_canvas + pl * y_sz, y_sz, &cfg);
+                zcrudp_zcvid_mt_decay_plane(&pool, dec_canvas + pl * y_sz, y_sz, &cfg);
             }
         }
-        zcrudp_ternary_mt_decode_packets(&pool, dec_canvas, NULL, y_sz, &cfg,
+        zcrudp_zcvid_mt_decode_packets(&pool, dec_canvas, NULL, y_sz, &cfg,
                                          flat_pkts, flat_lens, 1400, total_pkts);
         uint64_t t3 = read_ns();
 
@@ -366,7 +366,7 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
         }
     }
 
-    zcrudp_ternary_mt_destroy(&pool);
+    zcrudp_zcvid_mt_destroy(&pool);
 
     double enc_ms = (double)enc_ns_total / ((ITERS - 10) * 1e6);
     double dec_ms = (double)dec_ns_total / ((ITERS - 10) * 1e6);
@@ -375,8 +375,8 @@ static void bench_1080p120_mt(zcrudp_ternary_pixfmt_t fmt, const char *name, uin
     double mbps_360 = ((double)last_bytes * 8.0 * 360.0) / 1e6;
     double budget_360_pct = (total_ms / (1000.0 / 360.0)) * 100.0;
 
-    const char *mode_str = (entropy == ZCRUDP_TERNARY_EC_RANS) ? "rans   "
-                         : (entropy == ZCRUDP_TERNARY_EC_REALLOC_V2) ? "rv2    "
+    const char *mode_str = (entropy == ZCRUDP_ZCVID_EC_RANS) ? "rans   "
+                         : (entropy == ZCRUDP_ZCVID_EC_REALLOC_V2) ? "rv2    "
                          : (entropy != 0U) ? "entropy" : "tokens ";
     printf("  -> %-5s 1080p (%uT MT, %s) : Enc %.3f ms | Dec %.3f ms | Total %.3f ms | %zu pkts/f | %.2f Mbps @120Hz | %.2f Mbps @360Hz (%.1f%% of 2.78ms budget)\n",
            name, threads, mode_str, enc_ms, dec_ms, total_ms, last_pkts, mbps_120, mbps_360, budget_360_pct);
@@ -409,15 +409,15 @@ static void test_gmc_panoramic_savings(void) {
     }
     /* Pan camera by (+5, -3) */
     memcpy(curr, prev, sz);
-    zcrudp_ternary_shift_plane(curr, W, H, 5, -3, 128);
+    zcrudp_zcvid_shift_plane(curr, W, H, 5, -3, 128);
 
     int8_t dx = 0, dy = 0;
     uint64_t t0 = read_ns();
-    zcrudp_ternary_estimate_gmc(curr, prev, W, H, 8, &dx, &dy);
+    zcrudp_zcvid_estimate_gmc(curr, prev, W, H, 8, &dx, &dy);
     uint64_t t1 = read_ns();
 
     assert(dx == 5 && dy == -3);
-    zcrudp_ternary_shift_plane(prev, W, H, dx, dy, 128);
+    zcrudp_zcvid_shift_plane(prev, W, H, dx, dy, 128);
     assert(memcmp(prev, curr, sz) == 0);
 
     printf("PASSED (detected dx=%d, dy=%d in %.3f ms, 0 residual error)\n",
@@ -430,10 +430,10 @@ static void test_gmc_panoramic_savings(void) {
 static void test_intra_refresh_and_2x_mode(void) {
     printf("[TEST] Running Rolling Intra-Refresh (HUD Crispness) & 2x Mode Test... ");
 
-    zcrudp_ternary_config_t cfg = {
+    zcrudp_zcvid_config_t cfg = {
         .width = 320,
         .height = 180,
-        .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3,
         .delta_max = 32,
         .threshold = 3,
@@ -478,20 +478,20 @@ static void test_intra_refresh_and_2x_mode(void) {
 
         /* Encode delta first, then overwrite rolling Intra-Refresh slice at end of frame */
         if (f & 1U) {
-            zcrudp_ternary_encode_plane_2x(src, enc_ref, enc_delta, len,
+            zcrudp_zcvid_encode_plane_2x(src, enc_ref, enc_delta, len,
                                            0, f, &cfg, pkt_buf, sink_cb, &sink);
         } else {
-            zcrudp_ternary_encode_plane(src, enc_ref, enc_delta, len,
+            zcrudp_zcvid_encode_plane(src, enc_ref, enc_delta, len,
                                         0, f, &cfg, pkt_buf, sink_cb, &sink);
         }
         size_t i0 = (size_t)f * slice_bytes;
         size_t i1 = i0 + slice_bytes;
-        zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, i0, i1, len,
+        zcrudp_zcvid_encode_intra_range(src, enc_ref, enc_delta, i0, i1, len,
                                           0, f, &cfg, pkt_buf, sink_cb, &sink);
 
-        zcrudp_ternary_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
         for (size_t p = 0; p < sink.count; p++) {
-            bool ok = zcrudp_ternary_decode_packet(
+            bool ok = zcrudp_zcvid_decode_packet(
                 sink.pkts + p * sink.mtu, sink.lens[p],
                 dec_canvas, dec_delta, len, &cfg, NULL);
             assert(ok);
@@ -516,10 +516,10 @@ static void test_3d_complex_scene_psnr(uint8_t entropy) {
     printf("[TEST] Running Complex 3D-like Textured + Pan + HUD PSNR Test (%s)... ",
            entropy ? "entropy" : "tokens");
 
-    zcrudp_ternary_config_t cfg = {
+    zcrudp_zcvid_config_t cfg = {
         .width = 640,
         .height = 360,
-        .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3,
         .delta_max = 32,
         .threshold = 4,
@@ -576,30 +576,30 @@ static void test_3d_complex_scene_psnr(uint8_t entropy) {
 
         if (f == 0) {
             /* Initial Intra keyframe */
-            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, 0, len,
+            zcrudp_zcvid_encode_intra_range(src, enc_ref, enc_delta, 0, len,
                                               len, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
         } else {
             /* GMC: estimate & shift both refs */
             int8_t dx = 0, dy = 0;
-            zcrudp_ternary_estimate_gmc(src, enc_ref, cfg.width, cfg.height, 8, &dx, &dy);
-            zcrudp_ternary_shift_plane(enc_ref, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
-            zcrudp_ternary_shift_plane(dec_canvas, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
+            zcrudp_zcvid_estimate_gmc(src, enc_ref, cfg.width, cfg.height, 8, &dx, &dy);
+            zcrudp_zcvid_shift_plane(enc_ref, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
+            zcrudp_zcvid_shift_plane(dec_canvas, cfg.width, cfg.height, dx, dy, cfg.neutral_y);
 
             /* 1x Delta, then anchors where the deltas could not follow (borders
              * uncovered by the shift, HUD dragged by it), then the rolling slice */
             size_t i0 = (size_t)f * slice_bytes;
-            zcrudp_ternary_encode_plane(src, enc_ref, enc_delta, len,
+            zcrudp_zcvid_encode_plane(src, enc_ref, enc_delta, len,
                                         0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
-            zcrudp_ternary_repair_disocclusions(src, enc_ref, enc_delta, len, 20U,
+            zcrudp_zcvid_repair_disocclusions(src, enc_ref, enc_delta, len, 20U,
                                                 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
-            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, i0, i0 + slice_bytes,
+            zcrudp_zcvid_encode_intra_range(src, enc_ref, enc_delta, i0, i0 + slice_bytes,
                                               len, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
         }
 
-        zcrudp_ternary_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(dec_canvas, len, cfg.gamma_q8, cfg.neutral_y);
         assert(sink.count < sink.max_pkts);
         for (size_t p = 0; p < sink.count; p++) {
-            zcrudp_ternary_decode_packet(sink.pkts + p * sink.mtu, sink.lens[p],
+            zcrudp_zcvid_decode_packet(sink.pkts + p * sink.mtu, sink.lens[p],
                                          dec_canvas, dec_delta, len, &cfg, NULL);
         }
         assert(memcmp(enc_ref, dec_canvas, len) == 0);
@@ -637,10 +637,10 @@ static void test_tile_mv_3d_parallax_35db(uint8_t entropy) {
     printf("[TEST] Running 32x32 Tile MV + Luma-First RC + Bridge (35+ dB target, %s)... ",
            entropy ? "entropy" : "tokens");
 
-    zcrudp_ternary_config_t cfg = {
+    zcrudp_zcvid_config_t cfg = {
         .width = 640,
         .height = 360,
-        .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 4,
         .delta_max = 48,
         .threshold = 2,
@@ -650,7 +650,7 @@ static void test_tile_mv_3d_parallax_35db(uint8_t entropy) {
         .entropy = entropy
     };
 
-    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t psz = zcrudp_zcvid_planar_size(&cfg);
     size_t y_sz = (size_t)cfg.width * cfg.height;
     size_t uv_sz = y_sz / 2U;
     const uint16_t TILE = 32;
@@ -679,7 +679,7 @@ static void test_tile_mv_3d_parallax_35db(uint8_t entropy) {
         .pkts = pkt_store, .lens = pkt_lens, .count = 0,
         .max_pkts = 512, .mtu = 1400, .total_bytes = 0
     };
-    zcrudp_ternary_bridge_router_t router = {
+    zcrudp_zcvid_bridge_router_t router = {
         .tx_fn = NULL, .bridge_ctx = NULL,
         .reliable_bytes = 0, .unreliable_bytes = 0,
         .reliable_pkts = 0, .unreliable_pkts = 0
@@ -722,47 +722,47 @@ static void test_tile_mv_3d_parallax_35db(uint8_t entropy) {
         sink.total_bytes = 0;
 
         if (f == 0) {
-            zcrudp_ternary_encode_intra_range(src, enc_ref, enc_delta, 0, y_sz,
+            zcrudp_zcvid_encode_intra_range(src, enc_ref, enc_delta, 0, y_sz,
                                               y_sz, 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
-            zcrudp_ternary_encode_intra_range(src + y_sz, enc_ref + y_sz, enc_delta + y_sz,
+            zcrudp_zcvid_encode_intra_range(src + y_sz, enc_ref + y_sz, enc_delta + y_sz,
                                               0, uv_sz, uv_sz, 1, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
         } else {
-            zcrudp_ternary_estimate_tile_mv(src, enc_ref, cfg.width, cfg.height, TILE, 8, mvs);
-            zcrudp_ternary_apply_tile_mv(enc_ref, enc_mc, cfg.width, cfg.height, TILE, mvs);
+            zcrudp_zcvid_estimate_tile_mv(src, enc_ref, cfg.width, cfg.height, TILE, 8, mvs);
+            zcrudp_zcvid_apply_tile_mv(enc_ref, enc_mc, cfg.width, cfg.height, TILE, mvs);
             memcpy(enc_ref, enc_mc, y_sz);
 
-            zcrudp_ternary_encode_tile_mv_pkts(mvs, num_tiles, 0, (uint16_t)f, &cfg,
+            zcrudp_zcvid_encode_tile_mv_pkts(mvs, num_tiles, 0, (uint16_t)f, &cfg,
                                                pkt_buf, sink_cb, &sink);
-            zcrudp_ternary_encode_nv12_rc(src, enc_ref, enc_delta, (uint16_t)f,
+            zcrudp_zcvid_encode_nv12_rc(src, enc_ref, enc_delta, (uint16_t)f,
                                           25000U, 20U, &cfg, pkt_buf, sink_cb, &sink);
-            zcrudp_ternary_repair_disocclusions(src, enc_ref, enc_delta, y_sz, 20U,
+            zcrudp_zcvid_repair_disocclusions(src, enc_ref, enc_delta, y_sz, 20U,
                                                 0, (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
         }
 
         /* Route & decode packets in exact encoder order: TILE_MV -> decay -> DELTA/INTRA */
         for (size_t p = 0; p < sink.count; p++) {
             const uint8_t *pd = sink.pkts + p * sink.mtu;
-            zcrudp_ternary_bridge_pkt_cb(pd, sink.lens[p], &router);
-            zcrudp_ternary_pkt_hdr_t hdr;
-            assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
-            if (ZCRUDP_TERNARY_HDR_TYPE(&hdr) == ZCRUDP_TERNARY_PKT_TILE_MV) {
-                const int8_t *rx_mvs = (const int8_t *)(pd + ZCRUDP_TERNARY_PKT_HDR_SZ);
-                zcrudp_ternary_apply_tile_mv(dec_canvas, dec_mc, cfg.width, cfg.height, TILE, rx_mvs);
+            zcrudp_zcvid_bridge_pkt_cb(pd, sink.lens[p], &router);
+            zcrudp_zcvid_pkt_hdr_t hdr;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr));
+            if (ZCRUDP_ZCVID_HDR_TYPE(&hdr) == ZCRUDP_ZCVID_PKT_TILE_MV) {
+                const int8_t *rx_mvs = (const int8_t *)(pd + ZCRUDP_ZCVID_PKT_HDR_SZ);
+                zcrudp_zcvid_apply_tile_mv(dec_canvas, dec_mc, cfg.width, cfg.height, TILE, rx_mvs);
                 memcpy(dec_canvas, dec_mc, y_sz);
             }
         }
 
-        zcrudp_ternary_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
-        zcrudp_ternary_decay_plane(dec_canvas + y_sz, uv_sz, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(dec_canvas, y_sz, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(dec_canvas + y_sz, uv_sz, cfg.gamma_q8, cfg.neutral_y);
 
         for (size_t p = 0; p < sink.count; p++) {
             const uint8_t *pd = sink.pkts + p * sink.mtu;
-            zcrudp_ternary_pkt_hdr_t hdr;
-            assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
-            if (ZCRUDP_TERNARY_HDR_TYPE(&hdr) != ZCRUDP_TERNARY_PKT_TILE_MV) {
+            zcrudp_zcvid_pkt_hdr_t hdr;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr));
+            if (ZCRUDP_ZCVID_HDR_TYPE(&hdr) != ZCRUDP_ZCVID_PKT_TILE_MV) {
                 size_t plane_off = (hdr.plane == 0) ? 0 : y_sz;
                 size_t plane_len = (hdr.plane == 0) ? y_sz : uv_sz;
-                bool ok = zcrudp_ternary_decode_packet(
+                bool ok = zcrudp_zcvid_decode_packet(
                     pd, sink.lens[p], dec_canvas + plane_off, dec_delta + plane_off,
                     plane_len, &cfg, NULL);
                 assert(ok);
@@ -813,10 +813,10 @@ static void test_tile_mv_3d_parallax_35db(uint8_t entropy) {
 static void test_nv12_chroma_2x_keeps_components(void) {
     printf("[TEST] Running NV12 Interleaved Chroma DELTA_2X Component Test... ");
 
-    zcrudp_ternary_config_t cfg = {
+    zcrudp_zcvid_config_t cfg = {
         .width = 320,
         .height = 180,
-        .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 4,
         .delta_max = 32,
         .threshold = 2,
@@ -857,13 +857,13 @@ static void test_nv12_chroma_2x_keeps_components(void) {
     for (int f = 0; f < 40; f++) {
         sink.count = 0;
         sink.total_bytes = 0;
-        zcrudp_ternary_encode_plane_2x(src, enc_ref, enc_delta, uv_sz, 1,
+        zcrudp_zcvid_encode_plane_2x(src, enc_ref, enc_delta, uv_sz, 1,
                                        (uint16_t)f, &cfg, pkt_buf, sink_cb, &sink);
         assert(sink.count < sink.max_pkts);
 
-        zcrudp_ternary_decay_plane(dec_canvas, uv_sz, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(dec_canvas, uv_sz, cfg.gamma_q8, cfg.neutral_y);
         for (size_t p = 0; p < sink.count; p++) {
-            bool ok = zcrudp_ternary_decode_packet(
+            bool ok = zcrudp_zcvid_decode_packet(
                 sink.pkts + p * sink.mtu, sink.lens[p], dec_canvas, dec_delta,
                 uv_sz, &cfg, NULL);
             assert(ok);
@@ -926,10 +926,10 @@ static uint8_t tex_at(uint32_t x, uint32_t y) {
  * thirds, a still bottom third, a moving block and a sharp static HUD.
  * Fills every plane of the configured format.
  */
-static void make_scene(uint8_t *src, const zcrudp_ternary_config_t *cfg, int f) {
+static void make_scene(uint8_t *src, const zcrudp_zcvid_config_t *cfg, int f) {
     const uint32_t W = cfg->width, H = cfg->height;
     const size_t y_sz = (size_t)W * H;
-    const uint32_t planes = (cfg->pixfmt == ZCRUDP_TERNARY_FMT_RGBA) ? 3U : 1U;
+    const uint32_t planes = (cfg->pixfmt == ZCRUDP_ZCVID_FMT_RGBA) ? 3U : 1U;
 
     for (uint32_t p = 0; p < planes; p++) {
         uint8_t *pl = src + (size_t)p * y_sz;
@@ -951,7 +951,7 @@ static void make_scene(uint8_t *src, const zcrudp_ternary_config_t *cfg, int f) 
             }
         }
     }
-    if (cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12) {
+    if (cfg->pixfmt == ZCRUDP_ZCVID_FMT_NV12) {
         uint8_t *uv = src + y_sz;
         for (uint32_t y = 0; y < H / 2U; y++) {
             for (uint32_t x = 0; x + 1U < W; x += 2U) {
@@ -962,26 +962,26 @@ static void make_scene(uint8_t *src, const zcrudp_ternary_config_t *cfg, int f) 
     }
 }
 
-static uint32_t cfg_num_planes(const zcrudp_ternary_config_t *cfg) {
-    return (cfg->pixfmt == ZCRUDP_TERNARY_FMT_RGBA) ? 3U
-         : (cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12) ? 2U : 1U;
+static uint32_t cfg_num_planes(const zcrudp_zcvid_config_t *cfg) {
+    return (cfg->pixfmt == ZCRUDP_ZCVID_FMT_RGBA) ? 3U
+         : (cfg->pixfmt == ZCRUDP_ZCVID_FMT_NV12) ? 2U : 1U;
 }
 
-static size_t cfg_plane_len(const zcrudp_ternary_config_t *cfg, uint32_t plane) {
+static size_t cfg_plane_len(const zcrudp_zcvid_config_t *cfg, uint32_t plane) {
     size_t y_sz = (size_t)cfg->width * cfg->height;
-    return (cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12 && plane == 1U) ? (y_sz / 2U) : y_sz;
+    return (cfg->pixfmt == ZCRUDP_ZCVID_FMT_NV12 && plane == 1U) ? (y_sz / 2U) : y_sz;
 }
 
 /* One encoder + decoder pair with its own state, for side-by-side runs. */
 typedef struct {
-    zcrudp_ternary_config_t cfg;
+    zcrudp_zcvid_config_t cfg;
     uint8_t *ref, *canvas, *enc_delta, *dec_delta;
     pkt_sink_t sink;
     size_t delta_bytes, intra_bytes, trit_tokens;
 } codec_pipe_t;
 
-static void pipe_init(codec_pipe_t *c, const zcrudp_ternary_config_t *cfg, bool adm, size_t max_pkts) {
-    size_t psz = zcrudp_ternary_planar_size(cfg);
+static void pipe_init(codec_pipe_t *c, const zcrudp_zcvid_config_t *cfg, bool adm, size_t max_pkts) {
+    size_t psz = zcrudp_zcvid_planar_size(cfg);
     c->cfg = *cfg;
     c->ref = (uint8_t *)malloc(psz);
     c->canvas = (uint8_t *)malloc(psz);
@@ -1011,7 +1011,7 @@ static void pipe_free(codec_pipe_t *c) {
 
 /* Encodes one frame: keyframe on f == 0, else delta (+ optional chroma 2x) and a rolling anchor slice. */
 static void pipe_encode(codec_pipe_t *c, const uint8_t *src, int f, bool chroma_2x, uint32_t intra_cycle) {
-    const zcrudp_ternary_config_t *cfg = &c->cfg;
+    const zcrudp_zcvid_config_t *cfg = &c->cfg;
     const size_t y_sz = (size_t)cfg->width * cfg->height;
     uint8_t pkt_buf[1400];
     c->sink.count = 0;
@@ -1021,21 +1021,21 @@ static void pipe_encode(codec_pipe_t *c, const uint8_t *src, int f, bool chroma_
         size_t len = cfg_plane_len(cfg, p);
         uint8_t *ed = c->enc_delta ? c->enc_delta + off : NULL;
         if (f == 0) {
-            zcrudp_ternary_encode_intra_range(src + off, c->ref + off, ed, 0, len, len,
+            zcrudp_zcvid_encode_intra_range(src + off, c->ref + off, ed, 0, len, len,
                                               (uint8_t)p, 0, cfg, pkt_buf, sink_cb, &c->sink);
             continue;
         }
         if (chroma_2x && p == 1U) {
-            zcrudp_ternary_encode_plane_2x(src + off, c->ref + off, ed, len, (uint8_t)p,
+            zcrudp_zcvid_encode_plane_2x(src + off, c->ref + off, ed, len, (uint8_t)p,
                                            (uint16_t)f, cfg, pkt_buf, sink_cb, &c->sink);
         } else {
-            zcrudp_ternary_encode_plane(src + off, c->ref + off, ed, len, (uint8_t)p,
+            zcrudp_zcvid_encode_plane(src + off, c->ref + off, ed, len, (uint8_t)p,
                                         (uint16_t)f, cfg, pkt_buf, sink_cb, &c->sink);
         }
         if (intra_cycle > 0U) {
             size_t slice = (len + intra_cycle - 1U) / intra_cycle;
             size_t i0 = (size_t)((uint32_t)f % intra_cycle) * slice;
-            zcrudp_ternary_encode_intra_range(src + off, c->ref + off, ed, i0, i0 + slice, len,
+            zcrudp_zcvid_encode_intra_range(src + off, c->ref + off, ed, i0, i0 + slice, len,
                                               (uint8_t)p, (uint16_t)f, cfg, pkt_buf, sink_cb, &c->sink);
         }
     }
@@ -1043,18 +1043,18 @@ static void pipe_encode(codec_pipe_t *c, const uint8_t *src, int f, bool chroma_
 
     for (size_t i = 0; i < c->sink.count; i++) {
         const uint8_t *pd = c->sink.pkts + i * c->sink.mtu;
-        zcrudp_ternary_pkt_hdr_t hdr;
-        assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
-        uint8_t type = ZCRUDP_TERNARY_HDR_TYPE(&hdr);
+        zcrudp_zcvid_pkt_hdr_t hdr;
+        assert(zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr));
+        uint8_t type = ZCRUDP_ZCVID_HDR_TYPE(&hdr);
         assert(c->sink.lens[i] <= cfg->mtu_payload);
-        if (type == ZCRUDP_TERNARY_PKT_INTRA || type == ZCRUDP_TERNARY_PKT_INTRA_EC) {
+        if (type == ZCRUDP_ZCVID_PKT_INTRA || type == ZCRUDP_ZCVID_PKT_INTRA_EC) {
             c->intra_bytes += c->sink.lens[i];
         } else {
             c->delta_bytes += c->sink.lens[i];
         }
-        if (type == ZCRUDP_TERNARY_PKT_DELTA || type == ZCRUDP_TERNARY_PKT_DELTA_2X) {
+        if (type == ZCRUDP_ZCVID_PKT_DELTA || type == ZCRUDP_ZCVID_PKT_DELTA_2X) {
             for (uint16_t t = 0; t < hdr.num_tokens; t++) {
-                uint16_t tok = zcrudp_ternary_read_u16_le(pd + ZCRUDP_TERNARY_PKT_HDR_SZ + (size_t)t * 2U);
+                uint16_t tok = zcrudp_zcvid_read_u16_le(pd + ZCRUDP_ZCVID_PKT_HDR_SZ + (size_t)t * 2U);
                 if (tok < ZCRUDP_TRIT_MAX_10P) c->trit_tokens++;
             }
         }
@@ -1063,20 +1063,20 @@ static void pipe_encode(codec_pipe_t *c, const uint8_t *src, int f, bool chroma_
 
 /* Decays, then applies every packet of the frame except index skip_pkt (SIZE_MAX = none). */
 static void pipe_decode(codec_pipe_t *c, size_t skip_pkt) {
-    const zcrudp_ternary_config_t *cfg = &c->cfg;
+    const zcrudp_zcvid_config_t *cfg = &c->cfg;
     const size_t y_sz = (size_t)cfg->width * cfg->height;
     for (uint32_t p = 0; p < cfg_num_planes(cfg); p++) {
-        zcrudp_ternary_decay_plane(c->canvas + (size_t)p * y_sz, cfg_plane_len(cfg, p),
+        zcrudp_zcvid_decay_plane(c->canvas + (size_t)p * y_sz, cfg_plane_len(cfg, p),
                                    cfg->gamma_q8, cfg->neutral_y);
     }
     for (size_t i = 0; i < c->sink.count; i++) {
         if (i == skip_pkt) continue;
         const uint8_t *pd = c->sink.pkts + i * c->sink.mtu;
-        zcrudp_ternary_pkt_hdr_t hdr;
-        assert(zcrudp_ternary_pkt_hdr_read_le(pd, &hdr));
+        zcrudp_zcvid_pkt_hdr_t hdr;
+        assert(zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr));
         assert(hdr.plane < cfg_num_planes(cfg));
         size_t off = (size_t)hdr.plane * y_sz;
-        bool ok = zcrudp_ternary_decode_packet(pd, c->sink.lens[i], c->canvas + off,
+        bool ok = zcrudp_zcvid_decode_packet(pd, c->sink.lens[i], c->canvas + off,
                                                c->dec_delta ? c->dec_delta + off : NULL,
                                                cfg_plane_len(cfg, hdr.plane), cfg, NULL);
         assert(ok);
@@ -1092,7 +1092,7 @@ static void test_avx2_unpack_matches_scalar(void) {
         zcrudp_trit_t want[10];
         int8_t got[16];
         zcrudp_unpack_10trits((uint16_t)tok, want);
-        zcrudp_ternary_unpack10_avx2((uint16_t)tok, got);
+        zcrudp_zcvid_unpack10_avx2((uint16_t)tok, got);
         assert(memcmp(want, got, 10) == 0);
     }
     printf("PASSED\n");
@@ -1113,8 +1113,8 @@ static void test_avx2_block_matches_scalar(void) {
 
     for (int r = 0; r < ROUNDS; r++) {
         uint8_t dmin = (uint8_t)(1U + RND() % 8U);
-        zcrudp_ternary_config_t cfg = {
-            .width = 16, .height = 1, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        zcrudp_zcvid_config_t cfg = {
+            .width = 16, .height = 1, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
             .delta_min = dmin, .threshold = (uint8_t)(RND() % 12U), .mtu_payload = 1380
         };
         uint32_t pick = RND();
@@ -1136,12 +1136,12 @@ static void test_avx2_block_matches_scalar(void) {
         memcpy(ref_v, ref_s, 16);
         memcpy(d_v, d_s, 16);
 
-        /* scalar block, as zcrudp_ternary_encode_plane_range() does it */
+        /* scalar block, as zcrudp_zcvid_encode_plane_range() does it */
         zcrudp_trit_t t_s[10];
         bool coded_s = false;
         for (int j = 0; j < 10; j++) {
             uint8_t d = adm ? d_s[j] : cfg.delta_min;
-            t_s[j] = zcrudp_ternary_encode_sample(src[j], &ref_s[j], d, adm, &cfg, &coded_s);
+            t_s[j] = zcrudp_zcvid_encode_sample(src[j], &ref_s[j], d, adm, &cfg, &coded_s);
             if (t_s[j] != 0) coded_s = true;
         }
         if (coded_s && adm) {
@@ -1151,7 +1151,7 @@ static void test_avx2_block_matches_scalar(void) {
         }
 
         int8_t t_v[16];
-        bool coded_v = zcrudp_ternary_encode_block_avx2(src, ref_v, adm ? d_v : NULL, &cfg, t_v);
+        bool coded_v = zcrudp_zcvid_encode_block_avx2(src, ref_v, adm ? d_v : NULL, &cfg, t_v);
         assert(coded_v == coded_s);
         assert(memcmp(t_v, t_s, 10) == 0);
         assert(memcmp(ref_v, ref_s, 16) == 0);
@@ -1164,8 +1164,8 @@ static void test_avx2_block_matches_scalar(void) {
             can_s[i] = can_v[i] = (uint8_t)RND();
             dd_s[i] = dd_v[i] = (uint8_t)RND();
         }
-        zcrudp_ternary_apply_block(can_s, adm ? dd_s : NULL, 16, &cfg, 0, false, false, t_s);
-        zcrudp_ternary_apply_block_avx2(can_v, adm ? dd_v : NULL, &cfg, t_v);
+        zcrudp_zcvid_apply_block(can_s, adm ? dd_s : NULL, 16, &cfg, 0, false, false, t_s);
+        zcrudp_zcvid_apply_block_avx2(can_v, adm ? dd_v : NULL, &cfg, t_v);
         assert(memcmp(can_v, can_s, 16) == 0);
         assert(memcmp(dd_v, dd_s, 16) == 0);
     }
@@ -1189,7 +1189,7 @@ static void test_decay_matches_scalar_any_neutral(void) {
     for (size_t n = 0; n < 6U; n++) {
         for (size_t g = 0; g < 5U; g++) {
             for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i * 7U);
-            zcrudp_ternary_decay_plane(buf, sizeof(buf), gammas[g], neutrals[n]);
+            zcrudp_zcvid_decay_plane(buf, sizeof(buf), gammas[g], neutrals[n]);
             for (size_t i = 0; i < sizeof(buf); i++) {
                 uint8_t want = zcrudp_leaky_integrator_step((uint8_t)(i * 7U), 0, 0,
                                                             gammas[g], neutrals[n]);
@@ -1209,34 +1209,34 @@ static void test_entropy_matches_tokens(void) {
 
     typedef struct {
         const char *name;
-        zcrudp_ternary_pixfmt_t fmt;
+        zcrudp_zcvid_pixfmt_t fmt;
         uint16_t w, h, mtu;
         bool adm, chroma_2x;
         uint8_t gamma;
         uint32_t intra_cycle;
     } variant_t;
     static const variant_t variants[] = {
-        { "GRAY8 ADM",                 ZCRUDP_TERNARY_FMT_GRAY8, 320, 180, 1380, true,  false, 254, 12 },
-        { "NV12 ADM + chroma 2x",      ZCRUDP_TERNARY_FMT_NV12,  320, 180, 1380, true,  true,  254, 12 },
-        { "RGBA fixed step",           ZCRUDP_TERNARY_FMT_RGBA,  320, 180, 1380, false, false, 250, 0  },
-        { "NV12 ADM, 300-byte MTU",    ZCRUDP_TERNARY_FMT_NV12,  322, 90,  300,  true,  true,  255, 6  },
-        { "GRAY8 ADM, 8200 px wide",   ZCRUDP_TERNARY_FMT_GRAY8, 8200, 6,  1380, true,  false, 254, 4  },
+        { "GRAY8 ADM",                 ZCRUDP_ZCVID_FMT_GRAY8, 320, 180, 1380, true,  false, 254, 12 },
+        { "NV12 ADM + chroma 2x",      ZCRUDP_ZCVID_FMT_NV12,  320, 180, 1380, true,  true,  254, 12 },
+        { "RGBA fixed step",           ZCRUDP_ZCVID_FMT_RGBA,  320, 180, 1380, false, false, 250, 0  },
+        { "NV12 ADM, 300-byte MTU",    ZCRUDP_ZCVID_FMT_NV12,  322, 90,  300,  true,  true,  255, 6  },
+        { "GRAY8 ADM, 8200 px wide",   ZCRUDP_ZCVID_FMT_GRAY8, 8200, 6,  1380, true,  false, 254, 4  },
     };
 
     for (size_t v = 0; v < sizeof(variants) / sizeof(variants[0]); v++) {
         const variant_t *va = &variants[v];
-        zcrudp_ternary_config_t cfg = {
+        zcrudp_zcvid_config_t cfg = {
             .width = va->w, .height = va->h, .pixfmt = va->fmt,
             .delta_min = 2, .delta_max = 32, .threshold = 2,
             .gamma_q8 = va->gamma, .neutral_y = 128, .mtu_payload = va->mtu
         };
-        size_t psz = zcrudp_ternary_planar_size(&cfg);
+        size_t psz = zcrudp_zcvid_planar_size(&cfg);
         uint8_t *src = (uint8_t *)malloc(psz);
         assert(src);
 
         codec_pipe_t tok, ec;
         pipe_init(&tok, &cfg, va->adm, 4096);
-        cfg.entropy = ZCRUDP_TERNARY_EC_ALL;
+        cfg.entropy = ZCRUDP_ZCVID_EC_ALL;
         pipe_init(&ec, &cfg, va->adm, 4096);
 
         for (int f = 0; f < 12; f++) {
@@ -1279,11 +1279,11 @@ static void test_entropy_matches_tokens(void) {
 static void test_entropy_packet_loss_is_isolated(void) {
     printf("[TEST] Running Entropy-Coded Packet Loss Isolation Test... ");
 
-    zcrudp_ternary_config_t cfg = {
-        .width = 320, .height = 180, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = 320, .height = 180, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 3, .threshold = 2,
         .gamma_q8 = 252, .neutral_y = 128, .mtu_payload = 400,
-        .entropy = ZCRUDP_TERNARY_EC_ALL
+        .entropy = ZCRUDP_ZCVID_EC_ALL
     };
     size_t len = (size_t)cfg.width * cfg.height;
     uint8_t *src = (uint8_t *)malloc(len);
@@ -1307,19 +1307,19 @@ static void test_entropy_packet_loss_is_isolated(void) {
 
         /* Try several loss positions from the same synchronised state. */
         for (size_t drop = 0; drop < c.sink.count; drop += 1U + c.sink.count / 5U) {
-            zcrudp_ternary_pkt_hdr_t hdr, next;
-            assert(zcrudp_ternary_pkt_hdr_read_le(c.sink.pkts + drop * c.sink.mtu, &hdr));
-            assert(ZCRUDP_TERNARY_HDR_TYPE(&hdr) == ZCRUDP_TERNARY_PKT_DELTA_EC);
+            zcrudp_zcvid_pkt_hdr_t hdr, next;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(c.sink.pkts + drop * c.sink.mtu, &hdr));
+            assert(ZCRUDP_ZCVID_HDR_TYPE(&hdr) == ZCRUDP_ZCVID_PKT_DELTA_EC);
             size_t lost_begin = (size_t)hdr.start_block * 10U;
             size_t lost_end = len;
             if (drop + 1U < c.sink.count) {
-                assert(zcrudp_ternary_pkt_hdr_read_le(c.sink.pkts + (drop + 1U) * c.sink.mtu, &next));
+                assert(zcrudp_zcvid_pkt_hdr_read_le(c.sink.pkts + (drop + 1U) * c.sink.mtu, &next));
                 lost_end = (size_t)next.start_block * 10U;
             }
 
             memcpy(c.canvas, synced, len);
             memcpy(before, synced, len);
-            zcrudp_ternary_decay_plane(before, len, cfg.gamma_q8, cfg.neutral_y);
+            zcrudp_zcvid_decay_plane(before, len, cfg.gamma_q8, cfg.neutral_y);
             pipe_decode(&c, drop);
 
             for (size_t i = 0; i < len; i++) {
@@ -1358,15 +1358,15 @@ static uint32_t xorshift32(uint32_t *state) {
 static void test_malformed_packets_stay_in_bounds(void) {
     printf("[TEST] Running Malformed / Hostile Packet Bounds Test... ");
 
-    zcrudp_ternary_config_t cfg = {
-        .width = 64, .height = 18, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+    zcrudp_zcvid_config_t cfg = {
+        .width = 64, .height = 18, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 2, .delta_max = 32, .threshold = 2,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 256,
-        .entropy = ZCRUDP_TERNARY_EC_ALL
+        .entropy = ZCRUDP_ZCVID_EC_ALL
     };
     enum { GUARD = 64 };
     size_t y_sz = (size_t)cfg.width * cfg.height;
-    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t psz = zcrudp_zcvid_planar_size(&cfg);
     uint8_t *canvas_buf = (uint8_t *)malloc(psz + 2U * GUARD);
     uint8_t *delta_buf = (uint8_t *)malloc(psz + 2U * GUARD);
     uint8_t *src = (uint8_t *)malloc(psz);
@@ -1385,7 +1385,7 @@ static void test_malformed_packets_stay_in_bounds(void) {
     static uint8_t valid_pkts[512][256];
     static size_t valid_lens[512];
     for (int f = 0; f < 4; f++) {
-        c.cfg.entropy = (f & 1) ? 0U : ZCRUDP_TERNARY_EC_ALL;
+        c.cfg.entropy = (f & 1) ? 0U : ZCRUDP_ZCVID_EC_ALL;
         make_scene(src, &cfg, f);
         pipe_encode(&c, src, f, (f & 2) != 0, 3);
         pipe_decode(&c, SIZE_MAX);
@@ -1418,16 +1418,16 @@ static void test_malformed_packets_stay_in_bounds(void) {
             /* Random payload behind a valid magic, any type nibble. */
             plen = xorshift32(&rng) % sizeof(pkt);
             for (size_t i = 0; i < plen; i++) pkt[i] = (uint8_t)xorshift32(&rng);
-            if (plen >= ZCRUDP_TERNARY_PKT_HDR_SZ) {
-                zcrudp_ternary_pkt_hdr_t hdr = {
-                    .magic = ZCRUDP_TERNARY_PKT_MAGIC,
+            if (plen >= ZCRUDP_ZCVID_PKT_HDR_SZ) {
+                zcrudp_zcvid_pkt_hdr_t hdr = {
+                    .magic = ZCRUDP_ZCVID_PKT_MAGIC,
                     .pixfmt = (uint8_t)xorshift32(&rng),
                     .plane = (uint8_t)(xorshift32(&rng) % 2U),
                     .frame_id = (uint16_t)xorshift32(&rng),
                     .start_block = (xorshift32(&rng) % 3U) ? (xorshift32(&rng) % 200U) : xorshift32(&rng),
                     .num_tokens = (uint16_t)((xorshift32(&rng) % 3U) ? (xorshift32(&rng) % 150U) : xorshift32(&rng))
                 };
-                zcrudp_ternary_pkt_hdr_write_le(pkt, &hdr);
+                zcrudp_zcvid_pkt_hdr_write_le(pkt, &hdr);
             }
         }
 
@@ -1438,7 +1438,7 @@ static void test_malformed_packets_stay_in_bounds(void) {
         uint8_t *exact = (uint8_t *)malloc(plen ? plen : 1U);
         assert(exact);
         memcpy(exact, pkt, plen);
-        bool ok = zcrudp_ternary_decode_packet(exact, plen, canvas + off, delta + off,
+        bool ok = zcrudp_zcvid_decode_packet(exact, plen, canvas + off, delta + off,
                                                plane_len, &cfg, NULL);
         free(exact);
         if (!ok) rejected++;
@@ -1450,16 +1450,16 @@ static void test_malformed_packets_stay_in_bounds(void) {
     }
 
     /* A TILE_MV packet is not picture data: refused, canvas left as it was. */
-    uint8_t mv_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ + 8];
-    zcrudp_ternary_pkt_hdr_t mv_hdr = {
-        .magic = ZCRUDP_TERNARY_PKT_MAGIC,
-        .pixfmt = ZCRUDP_TERNARY_MAKE_PF(cfg.pixfmt, ZCRUDP_TERNARY_PKT_TILE_MV),
+    uint8_t mv_pkt[ZCRUDP_ZCVID_PKT_HDR_SZ + 8];
+    zcrudp_zcvid_pkt_hdr_t mv_hdr = {
+        .magic = ZCRUDP_ZCVID_PKT_MAGIC,
+        .pixfmt = ZCRUDP_ZCVID_MAKE_PF(cfg.pixfmt, ZCRUDP_ZCVID_PKT_TILE_MV),
         .plane = 0, .frame_id = 1, .start_block = 0, .num_tokens = 4
     };
-    zcrudp_ternary_pkt_hdr_write_le(mv_pkt, &mv_hdr);
-    memset(mv_pkt + ZCRUDP_TERNARY_PKT_HDR_SZ, 3, 8);
+    zcrudp_zcvid_pkt_hdr_write_le(mv_pkt, &mv_hdr);
+    memset(mv_pkt + ZCRUDP_ZCVID_PKT_HDR_SZ, 3, 8);
     memcpy(src, canvas, psz);
-    assert(!zcrudp_ternary_decode_packet(mv_pkt, sizeof(mv_pkt), canvas, delta, y_sz, &cfg, NULL));
+    assert(!zcrudp_zcvid_decode_packet(mv_pkt, sizeof(mv_pkt), canvas, delta, y_sz, &cfg, NULL));
     assert(memcmp(src, canvas, psz) == 0);
 
     pipe_free(&c);
@@ -1477,8 +1477,8 @@ static void test_malformed_packets_stay_in_bounds(void) {
 static void test_entropy_cpu_cap(void) {
     printf("[TEST] Running Entropy CPU Cap (range-coded, then tokens) Test... ");
 
-    zcrudp_ternary_config_t cfg = {
-        .width = 320, .height = 180, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = 320, .height = 180, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 2, .delta_max = 32, .threshold = 2,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 600
     };
@@ -1489,7 +1489,7 @@ static void test_entropy_cpu_cap(void) {
 
     codec_pipe_t tok, capped, full;
     pipe_init(&tok, &cfg, true, 2048);
-    cfg.entropy = ZCRUDP_TERNARY_EC_ALL;
+    cfg.entropy = ZCRUDP_ZCVID_EC_ALL;
     pipe_init(&full, &cfg, true, 2048);
     cfg.ec_max_blocks = CAP;
     pipe_init(&capped, &cfg, true, 2048);
@@ -1503,14 +1503,14 @@ static void test_entropy_cpu_cap(void) {
 
         size_t ec_blocks = 0;
         for (size_t i = 0; i < capped.sink.count; i++) {
-            zcrudp_ternary_pkt_hdr_t hdr;
-            assert(zcrudp_ternary_pkt_hdr_read_le(capped.sink.pkts + i * capped.sink.mtu, &hdr));
-            uint8_t type = ZCRUDP_TERNARY_HDR_TYPE(&hdr);
-            if (type == ZCRUDP_TERNARY_PKT_DELTA_EC) {
+            zcrudp_zcvid_pkt_hdr_t hdr;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(capped.sink.pkts + i * capped.sink.mtu, &hdr));
+            uint8_t type = ZCRUDP_ZCVID_HDR_TYPE(&hdr);
+            if (type == ZCRUDP_ZCVID_PKT_DELTA_EC) {
                 ec_pkts++;
                 ec_blocks += hdr.num_tokens;
                 assert(tok_pkts == 0 || f > 1); /* range-coded packets come first */
-            } else if (type == ZCRUDP_TERNARY_PKT_DELTA) {
+            } else if (type == ZCRUDP_ZCVID_PKT_DELTA) {
                 tok_pkts++;
             }
         }
@@ -1542,13 +1542,13 @@ static void test_entropy_cpu_cap(void) {
 static void test_mt_decode_keeps_packet_order(void) {
     printf("[TEST] Running MT Decode Order (deltas + overlapping anchors) Test... ");
 
-    zcrudp_ternary_config_t cfg = {
-        .width = 320, .height = 180, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+    zcrudp_zcvid_config_t cfg = {
+        .width = 320, .height = 180, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 2, .delta_max = 32, .threshold = 2,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 200,
-        .entropy = ZCRUDP_TERNARY_EC_INTRA
+        .entropy = ZCRUDP_ZCVID_EC_INTRA
     };
-    size_t psz = zcrudp_ternary_planar_size(&cfg);
+    size_t psz = zcrudp_zcvid_planar_size(&cfg);
     size_t y_sz = (size_t)cfg.width * cfg.height;
     uint8_t *src = (uint8_t *)malloc(psz);
     uint8_t *mt_canvas = (uint8_t *)malloc(psz);
@@ -1564,8 +1564,8 @@ static void test_mt_decode_keeps_packet_order(void) {
     uint8_t *slice_pkts = (uint8_t *)malloc(THREADS * 16U * 1400U);
     size_t *slice_lens = (size_t *)malloc(THREADS * 16U * sizeof(size_t));
     assert(slice_pkts && slice_lens);
-    zcrudp_ternary_mt_pool_t pool;
-    zcrudp_ternary_mt_init(&pool, THREADS, slice_pkts, slice_lens, 16, 1400);
+    zcrudp_zcvid_mt_pool_t pool;
+    zcrudp_zcvid_mt_init(&pool, THREADS, slice_pkts, slice_lens, 16, 1400);
 
     size_t mixed_frames = 0;
     for (int f = 0; f < 10; f++) {
@@ -1576,15 +1576,15 @@ static void test_mt_decode_keeps_packet_order(void) {
         assert(memcmp(c.ref, c.canvas, psz) == 0);
         if (f > 0) mixed_frames++;
 
-        zcrudp_ternary_mt_decay_plane(&pool, mt_canvas, y_sz, &cfg);
-        zcrudp_ternary_mt_decay_plane(&pool, mt_canvas + y_sz, y_sz / 2U, &cfg);
-        zcrudp_ternary_mt_decode_packets(&pool, mt_canvas, mt_delta, y_sz, &cfg,
+        zcrudp_zcvid_mt_decay_plane(&pool, mt_canvas, y_sz, &cfg);
+        zcrudp_zcvid_mt_decay_plane(&pool, mt_canvas + y_sz, y_sz / 2U, &cfg);
+        zcrudp_zcvid_mt_decode_packets(&pool, mt_canvas, mt_delta, y_sz, &cfg,
                                          c.sink.pkts, c.sink.lens, c.sink.mtu, c.sink.count);
         assert(memcmp(mt_canvas, c.canvas, psz) == 0);
         assert(memcmp(mt_delta, c.dec_delta, psz) == 0);
     }
 
-    zcrudp_ternary_mt_destroy(&pool);
+    zcrudp_zcvid_mt_destroy(&pool);
     pipe_free(&c);
     free(slice_pkts);
     free(slice_lens);
@@ -1606,19 +1606,19 @@ static void test_entropy_rate_quality(void) {
     typedef struct { const char *name; uint8_t entropy, threshold, delta_min; } point_t;
     static const point_t points[3] = {
         { "tokens,  threshold 4", 0U, 4U, 3U },
-        { "entropy, threshold 4", ZCRUDP_TERNARY_EC_ALL, 4U, 3U },
-        { "entropy, threshold 2", ZCRUDP_TERNARY_EC_ALL, 2U, 3U },
+        { "entropy, threshold 4", ZCRUDP_ZCVID_EC_ALL, 4U, 3U },
+        { "entropy, threshold 2", ZCRUDP_ZCVID_EC_ALL, 2U, 3U },
     };
     double psnr[3], bpp[3];
 
     for (size_t k = 0; k < 3U; k++) {
-        zcrudp_ternary_config_t cfg = {
-            .width = 640, .height = 360, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        zcrudp_zcvid_config_t cfg = {
+            .width = 640, .height = 360, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
             .delta_min = points[k].delta_min, .delta_max = 32, .threshold = points[k].threshold,
             .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
             .entropy = points[k].entropy
         };
-        size_t psz = zcrudp_ternary_planar_size(&cfg);
+        size_t psz = zcrudp_zcvid_planar_size(&cfg);
         size_t y_sz = (size_t)cfg.width * cfg.height;
         uint8_t *src = (uint8_t *)malloc(psz);
         assert(src);
@@ -1676,13 +1676,13 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
         }
     }
 
-    zcrudp_ternary_config_t cfg_l = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg_l = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 0
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 0
     };
-    zcrudp_ternary_config_t cfg_q = cfg_l;
+    zcrudp_zcvid_config_t cfg_q = cfg_l;
     cfg_q.intra_qstep = 4;
 
     pkt_sink_t sq = { (uint8_t *)malloc(256U * 1400U), (size_t *)malloc(256U * sizeof(size_t)), 0, 256, 1400, 0 };
@@ -1696,9 +1696,9 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
     memset(ed, cfg_q.delta_min, len);
     memset(dd, cfg_q.delta_min, len);
 
-    size_t bytes_l = zcrudp_ternary_encode_intra_range(src, ref_l, NULL, 0, len, len, 0, 0, &cfg_l,
+    size_t bytes_l = zcrudp_zcvid_encode_intra_range(src, ref_l, NULL, 0, len, len, 0, 0, &cfg_l,
                                                        pkt_buf, sink_cb, &sl);
-    size_t bytes_q = zcrudp_ternary_encode_intra_range(src, ref_q, ed, 0, len, len, 0, 0, &cfg_q,
+    size_t bytes_q = zcrudp_zcvid_encode_intra_range(src, ref_q, ed, 0, len, len, 0, 0, &cfg_q,
                                                        pkt_buf, sink_cb, &sq);
     assert(bytes_q < bytes_l);
     assert(sq.count > 1U);
@@ -1706,13 +1706,13 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
     bool saw_q_ec = false;
     for (size_t i = 0; i < sq.count; i++) {
         const uint8_t *p = sq.pkts + i * sq.mtu;
-        zcrudp_ternary_pkt_hdr_t h;
-        assert(zcrudp_ternary_pkt_hdr_read_le(p, &h));
-        if (ZCRUDP_TERNARY_HDR_TYPE(&h) == ZCRUDP_TERNARY_PKT_INTRA_Q_EC) {
+        zcrudp_zcvid_pkt_hdr_t h;
+        assert(zcrudp_zcvid_pkt_hdr_read_le(p, &h));
+        if (ZCRUDP_ZCVID_HDR_TYPE(&h) == ZCRUDP_ZCVID_PKT_INTRA_Q_EC) {
             saw_q_ec = true;
         }
-        assert(zcrudp_ternary_route_packet(p, sq.lens[i]) == ZCRUDP_TERNARY_CHAN_RELIABLE_FEC);
-        assert(zcrudp_ternary_decode_packet(p, sq.lens[i], can_q, dd, len, &cfg_q, NULL));
+        assert(zcrudp_zcvid_route_packet(p, sq.lens[i]) == ZCRUDP_ZCVID_CHAN_RELIABLE_FEC);
+        assert(zcrudp_zcvid_decode_packet(p, sq.lens[i], can_q, dd, len, &cfg_q, NULL));
     }
     assert(saw_q_ec);
     assert(memcmp(ref_q, can_q, len) == 0);
@@ -1730,11 +1730,11 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
     uint8_t *can_loss = (uint8_t *)malloc(len);
     assert(can_loss);
     memset(can_loss, 128, len);
-    zcrudp_ternary_pkt_hdr_t drop_h;
-    assert(zcrudp_ternary_pkt_hdr_read_le(sq.pkts + 1U * sq.mtu, &drop_h));
+    zcrudp_zcvid_pkt_hdr_t drop_h;
+    assert(zcrudp_zcvid_pkt_hdr_read_le(sq.pkts + 1U * sq.mtu, &drop_h));
     for (size_t i = 0; i < sq.count; i++) {
         if (i == 1U) continue;
-        assert(zcrudp_ternary_decode_packet(sq.pkts + i * sq.mtu, sq.lens[i], can_loss, NULL, len, &cfg_q, NULL));
+        assert(zcrudp_zcvid_decode_packet(sq.pkts + i * sq.mtu, sq.lens[i], can_loss, NULL, len, &cfg_q, NULL));
     }
     size_t d0 = drop_h.start_block;
     size_t d1 = d0 + drop_h.num_tokens;
@@ -1744,14 +1744,14 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
     /* Malformed INTRA_Q_EC bounds checks */
     uint8_t bad_pkt[64];
     memcpy(bad_pkt, sq.pkts, sq.lens[0] < sizeof(bad_pkt) ? sq.lens[0] : sizeof(bad_pkt));
-    bad_pkt[2] = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8, ZCRUDP_TERNARY_PKT_INTRA_Q_EC);
-    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ, can_loss, NULL, len, &cfg_q, NULL));
-    bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 0U;
-    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
-    bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 1U;
-    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
-    bad_pkt[ZCRUDP_TERNARY_PKT_HDR_SZ] = 65U;
-    assert(!zcrudp_ternary_decode_packet(bad_pkt, ZCRUDP_TERNARY_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
+    bad_pkt[2] = ZCRUDP_ZCVID_MAKE_PF(ZCRUDP_ZCVID_FMT_GRAY8, ZCRUDP_ZCVID_PKT_INTRA_Q_EC);
+    assert(!zcrudp_zcvid_decode_packet(bad_pkt, ZCRUDP_ZCVID_PKT_HDR_SZ, can_loss, NULL, len, &cfg_q, NULL));
+    bad_pkt[ZCRUDP_ZCVID_PKT_HDR_SZ] = 0U;
+    assert(!zcrudp_zcvid_decode_packet(bad_pkt, ZCRUDP_ZCVID_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
+    bad_pkt[ZCRUDP_ZCVID_PKT_HDR_SZ] = 1U;
+    assert(!zcrudp_zcvid_decode_packet(bad_pkt, ZCRUDP_ZCVID_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
+    bad_pkt[ZCRUDP_ZCVID_PKT_HDR_SZ] = 65U;
+    assert(!zcrudp_zcvid_decode_packet(bad_pkt, ZCRUDP_ZCVID_PKT_HDR_SZ + 4U, can_loss, NULL, len, &cfg_q, NULL));
 
     /* A picture equal to its prediction (flat 128) quantizes to all-zero
      * residuals: the range-coded stream is empty and each packet carries the
@@ -1764,11 +1764,11 @@ static void test_intra_q_ec_roundtrip_and_bounds(void) {
         memset(can_q, 77, len); /* stale decoder picture the anchor must replace */
         memset(ed, cfg_q.delta_min, len);
         memset(dd, cfg_q.delta_min, len);
-        zcrudp_ternary_encode_intra_range(src, ref_q, ed, 0, len, len, 0, 0, &cfg_q,
+        zcrudp_zcvid_encode_intra_range(src, ref_q, ed, 0, len, len, 0, 0, &cfg_q,
                                           pkt_buf, sink_cb, &sf);
         assert(sf.count > 0U);
         for (size_t i = 0; i < sf.count; i++) {
-            assert(zcrudp_ternary_decode_packet(sf.pkts + i * sf.mtu, sf.lens[i], can_q, dd, len,
+            assert(zcrudp_zcvid_decode_packet(sf.pkts + i * sf.mtu, sf.lens[i], can_q, dd, len,
                                                 &cfg_q, NULL));
         }
         assert(memcmp(ref_q, can_q, len) == 0);
@@ -1813,11 +1813,11 @@ static void test_detailed_photo_pan_prediction(void) {
     const int pans[2] = { 1, 3 };
     for (int pi = 0; pi < 2; pi++) {
         int pan = pans[pi];
-        zcrudp_ternary_config_t cfg = {
-            .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        zcrudp_zcvid_config_t cfg = {
+            .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
             .delta_min = 3, .delta_max = 32, .threshold = 3,
             .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-            .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 4
+            .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 4
         };
         pkt_sink_t st = { (uint8_t *)malloc(1024U * 1400U), (size_t *)malloc(1024U * sizeof(size_t)), 0, 1024, 1400, 0 };
         assert(st.pkts && st.lens);
@@ -1835,18 +1835,18 @@ static void test_detailed_photo_pan_prediction(void) {
             }
             st.count = 0;
             if (f == 0) {
-                zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
+                zcrudp_zcvid_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
                                                   pkt_buf, sink_cb, &st);
             } else {
-                zcrudp_ternary_estimate_tile_mv(src, ref, W, H, tile_sz, 16, enc_mvs);
-                zcrudp_ternary_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, (uint16_t)f, &cfg,
+                zcrudp_zcvid_estimate_tile_mv(src, ref, W, H, tile_sz, 16, enc_mvs);
+                zcrudp_zcvid_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, (uint16_t)f, &cfg,
                                                    pkt_buf, sink_cb, &st);
-                zcrudp_ternary_apply_tile_mv_state(ref, ref_mc, ed, ed_mc, W, H, tile_sz, enc_mvs);
+                zcrudp_zcvid_apply_tile_mv_state(ref, ref_mc, ed, ed_mc, W, H, tile_sz, enc_mvs);
                 memcpy(ref, ref_mc, len);
                 memcpy(ed, ed_mc, len);
-                zcrudp_ternary_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg,
+                zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg,
                                             pkt_buf, sink_cb, &st);
-                zcrudp_ternary_repair_disocclusions(src, ref, ed, len, 16, 0, (uint16_t)f, &cfg,
+                zcrudp_zcvid_repair_disocclusions(src, ref, ed, len, 16, 0, (uint16_t)f, &cfg,
                                                     pkt_buf, sink_cb, &st);
             }
 
@@ -1854,22 +1854,22 @@ static void test_detailed_photo_pan_prediction(void) {
             if (f > 0) {
                 while (pidx < st.count) {
                     const uint8_t *p = st.pkts + pidx * st.mtu;
-                    zcrudp_ternary_pkt_hdr_t h;
-                    if (!zcrudp_ternary_pkt_hdr_read_le(p, &h) ||
-                        ZCRUDP_TERNARY_HDR_TYPE(&h) != ZCRUDP_TERNARY_PKT_TILE_MV) {
+                    zcrudp_zcvid_pkt_hdr_t h;
+                    if (!zcrudp_zcvid_pkt_hdr_read_le(p, &h) ||
+                        ZCRUDP_ZCVID_HDR_TYPE(&h) != ZCRUDP_ZCVID_PKT_TILE_MV) {
                         break;
                     }
-                    assert(zcrudp_ternary_decode_tile_mv_pkt(p, st.lens[pidx],
+                    assert(zcrudp_zcvid_decode_tile_mv_pkt(p, st.lens[pidx],
                                                              dec_mvs, num_tiles));
                     pidx++;
                 }
-                zcrudp_ternary_apply_tile_mv_state(can, can_mc, dd, dd_mc, W, H, tile_sz, dec_mvs);
+                zcrudp_zcvid_apply_tile_mv_state(can, can_mc, dd, dd_mc, W, H, tile_sz, dec_mvs);
                 memcpy(can, can_mc, len);
                 memcpy(dd, dd_mc, len);
             }
-            zcrudp_ternary_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
+            zcrudp_zcvid_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
             for (; pidx < st.count; pidx++) {
-                assert(zcrudp_ternary_decode_packet(st.pkts + pidx * st.mtu, st.lens[pidx],
+                assert(zcrudp_zcvid_decode_packet(st.pkts + pidx * st.mtu, st.lens[pidx],
                                                     can, dd, len, &cfg, NULL));
             }
             assert(memcmp(ref, can, len) == 0);
@@ -1896,7 +1896,7 @@ static void test_detailed_photo_pan_prediction(void) {
 }
 
 int main(void) {
-    printf("=== zcrudp Ternary Codec Test & 1080p120 Benchmark ===\n");
+    printf("=== zcrudp Zcvid Codec Test & 1080p120 Benchmark ===\n");
 #ifdef __AVX2__
     printf("SIMD: AVX2 ENABLED\n\n");
 #else
@@ -1920,22 +1920,22 @@ int main(void) {
     test_intra_q_ec_roundtrip_and_bounds();
     test_detailed_photo_pan_prediction();
     test_3d_complex_scene_psnr(0U);
-    test_3d_complex_scene_psnr(ZCRUDP_TERNARY_EC_ALL);
+    test_3d_complex_scene_psnr(ZCRUDP_ZCVID_EC_ALL);
     test_tile_mv_3d_parallax_35db(0U);
-    test_tile_mv_3d_parallax_35db(ZCRUDP_TERNARY_EC_ALL);
+    test_tile_mv_3d_parallax_35db(ZCRUDP_ZCVID_EC_ALL);
     test_entropy_rate_quality();
     printf("\n[BENCHMARK] 1920x1080 @ 120 Hz -> 360 Hz (budget 2.778 ms/frame @ 360 Hz):\n");
-    bench_1080p120_format(ZCRUDP_TERNARY_FMT_NV12, "NV12", 0U);
-    bench_1080p120_format(ZCRUDP_TERNARY_FMT_NV12, "NV12", ZCRUDP_TERNARY_EC_ALL);
-    bench_1080p120_format(ZCRUDP_TERNARY_FMT_RGBA, "RGBA", 0U);
-    bench_1080p120_format(ZCRUDP_TERNARY_FMT_RGBA, "RGBA", ZCRUDP_TERNARY_EC_ALL);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_NV12, "NV12", 8, 0U);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_NV12, "NV12", 8, ZCRUDP_TERNARY_EC_REALLOC_V2);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_NV12, "NV12", 8, ZCRUDP_TERNARY_EC_ALL);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_NV12, "NV12", 8, ZCRUDP_TERNARY_EC_RANS);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_RGBA, "RGBA", 8, 0U);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_RGBA, "RGBA", 8, ZCRUDP_TERNARY_EC_ALL);
-    bench_1080p120_mt(ZCRUDP_TERNARY_FMT_RGBA, "RGBA", 8, ZCRUDP_TERNARY_EC_RANS);
+    bench_1080p120_format(ZCRUDP_ZCVID_FMT_NV12, "NV12", 0U);
+    bench_1080p120_format(ZCRUDP_ZCVID_FMT_NV12, "NV12", ZCRUDP_ZCVID_EC_ALL);
+    bench_1080p120_format(ZCRUDP_ZCVID_FMT_RGBA, "RGBA", 0U);
+    bench_1080p120_format(ZCRUDP_ZCVID_FMT_RGBA, "RGBA", ZCRUDP_ZCVID_EC_ALL);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_NV12, "NV12", 8, 0U);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_NV12, "NV12", 8, ZCRUDP_ZCVID_EC_REALLOC_V2);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_NV12, "NV12", 8, ZCRUDP_ZCVID_EC_ALL);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_NV12, "NV12", 8, ZCRUDP_ZCVID_EC_RANS);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_RGBA, "RGBA", 8, 0U);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_RGBA, "RGBA", 8, ZCRUDP_ZCVID_EC_ALL);
+    bench_1080p120_mt(ZCRUDP_ZCVID_FMT_RGBA, "RGBA", 8, ZCRUDP_ZCVID_EC_RANS);
 
     printf("\n=== ALL CODEC TESTS PASSED ===\n");
     return 0;

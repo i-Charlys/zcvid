@@ -1,5 +1,5 @@
 /-!
-# Contractive Lyapunov-Optimal Ternary ADM + Post-Decay Quantization (CL-ADM + PDQ)
+# Contractive Lyapunov-Optimal Zcvid ADM + Post-Decay Quantization (CL-ADM + PDQ)
 ## Machine-Checked Formal Proofs in Lean 4
 
 Proves all six core breakthrough theorems (**T1–T6**, including the amended T1(a)/(b)
@@ -37,7 +37,7 @@ dependencies, ZERO `sorry`, ZERO custom axioms):
   - `avx2_fast_skip_sound`: `|x - y| + max_decay_shift ≤ tau → pdqTrit = 0`.
 -/
 
-namespace TernVidCLADM
+namespace ZcvidCLADM
 
 /-! ## Shared Primitives -/
 
@@ -632,4 +632,4 @@ theorem avx2_fast_skip_sound (x y neutral gamma d tau : Int)
                   2 * (x - leakyDecay y neutral gamma) > d) := by omega
     simp only [hnc, ↓reduceIte]
 
-end TernVidCLADM
+end ZcvidCLADM

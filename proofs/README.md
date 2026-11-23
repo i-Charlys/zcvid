@@ -1,6 +1,6 @@
 # Machine-checked properties of the GPU encoder
 
-Proofs for `shaders/ternary_encode.hlsl`. Each one covers code that the
+Proofs for `shaders/zcvid_encode.hlsl`. Each one covers code that the
 tests in `tests/` only sample.
 
 | File | Tool | What is proved |

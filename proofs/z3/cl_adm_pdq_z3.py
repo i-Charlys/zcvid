@@ -1,12 +1,12 @@
 """
-Z3 SMT Formal Verification of the tern_vid Breakthrough:
-Contractive Lyapunov-Optimal Ternary ADM + Post-Decay Optimal Quantization (CL-ADM + PDQ)
+Z3 SMT Formal Verification of the zcvid Breakthrough:
+Contractive Lyapunov-Optimal Zcvid ADM + Post-Decay Optimal Quantization (CL-ADM + PDQ)
 
 Verifies Theorems T1, T2, T3, T4, T6, plus 80-px AVX2 fast-skip soundness,
 with exact integer / bit-vector / real SMT proofs (100% UNSAT).
 
 Run with:
-  C:\\Users\\charl\\.gemini\\mcp-venvs\\z3-mcp\\Scripts\\python.exe cl_adm_pdq_z3.py
+  python3 cl_adm_pdq_z3.py
 """
 
 import sys
@@ -273,7 +273,7 @@ def verify_T6_avx2_scalar_equivalence() -> None:
 
 
 if __name__ == "__main__":
-    print("=== tern_vid Z3 Formal Verification: CL-ADM + PDQ Breakthrough (T1-T4, T6) ===")
+    print("=== zcvid Z3 Formal Verification: CL-ADM + PDQ Breakthrough (T1-T4, T6) ===")
     verify_T1_pdq_descent_and_optimality()
     verify_T2_cl_adm_properties()
     verify_T3_finite_time_coalescence()

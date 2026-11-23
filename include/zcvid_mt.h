@@ -1,15 +1,15 @@
 /**
- * @file ternary_mt.h
- * @brief Zero-alloc-per-frame multi-threaded slice engine for ternary_codec.h
+ * @file zcvid_mt.h
+ * @brief Zero-alloc-per-frame multi-threaded slice engine for zcvid_codec.h
  *
  * Uses a persistent worker pool with C11 atomics + OS sleep/wake (Win32 Events
  * or POSIX condvars) to encode and decode horizontal frame slices in parallel.
  */
 
-#ifndef ZCRUDP_TERNARY_MT_H
-#define ZCRUDP_TERNARY_MT_H
+#ifndef ZCRUDP_ZCVID_MT_H
+#define ZCRUDP_ZCVID_MT_H
 
-#include "ternary_codec.h"
+#include "zcvid_codec.h"
 #include <stdatomic.h>
 
 #if defined(_WIN32)
@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ZCRUDP_TERNARY_MT_MAX_THREADS 16U
+#define ZCRUDP_ZCVID_MT_MAX_THREADS 16U
 
 /* Spin-wait hint, portable across GCC/Clang and MSVC, x86 and others. */
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -65,10 +65,10 @@ typedef struct {
     size_t   dropped_pkts;
 } zcrudp_mt_slice_sink_t;
 
-typedef struct zcrudp_ternary_mt_pool zcrudp_ternary_mt_pool_t;
+typedef struct zcrudp_zcvid_mt_pool zcrudp_zcvid_mt_pool_t;
 
 typedef struct {
-    ZCRUDP_MT_ALIGNAS64 zcrudp_ternary_mt_pool_t *pool;
+    ZCRUDP_MT_ALIGNAS64 zcrudp_zcvid_mt_pool_t *pool;
     uint32_t tid;
     uint8_t  pkt_scratch[1500];
     zcrudp_mt_slice_sink_t sink;
@@ -79,10 +79,10 @@ typedef struct {
 #endif
 } zcrudp_mt_worker_t;
 
-struct zcrudp_ternary_mt_pool {
+struct zcrudp_zcvid_mt_pool {
     uint32_t num_threads;
     size_t   last_dropped_pkts;
-    zcrudp_mt_worker_t workers[ZCRUDP_TERNARY_MT_MAX_THREADS];
+    zcrudp_mt_worker_t workers[ZCRUDP_ZCVID_MT_MAX_THREADS];
 
     ZCRUDP_MT_ALIGNAS64 atomic_uint_fast32_t gen;
     ZCRUDP_MT_ALIGNAS64 atomic_uint_fast32_t active_workers;
@@ -106,7 +106,7 @@ struct zcrudp_ternary_mt_pool {
     size_t                       intra_end;
     uint8_t                      plane_id;
     uint16_t                     frame_id;
-    const zcrudp_ternary_config_t *cfg;
+    const zcrudp_zcvid_config_t *cfg;
 
     /* For parallel packet decode */
     const uint8_t *pkt_in_base;
@@ -128,7 +128,7 @@ static inline void zcrudp_mt_slice_cb(const uint8_t *data, size_t len, void *ctx
     }
 }
 
-static inline void zcrudp_mt_wake_workers(zcrudp_ternary_mt_pool_t *p) {
+static inline void zcrudp_mt_wake_workers(zcrudp_zcvid_mt_pool_t *p) {
 #if defined(_WIN32)
     AcquireSRWLockExclusive(&p->work_lock);
     ReleaseSRWLockExclusive(&p->work_lock);
@@ -140,7 +140,7 @@ static inline void zcrudp_mt_wake_workers(zcrudp_ternary_mt_pool_t *p) {
 #endif
 }
 
-static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid) {
+static inline void zcrudp_mt_run_task(zcrudp_zcvid_mt_pool_t *p, uint32_t tid) {
     int op = atomic_load_explicit(&p->op, memory_order_relaxed);
     uint32_t n = p->num_threads;
 
@@ -156,12 +156,12 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         w->sink.dropped_pkts = 0;
         if (b0 < p->total_blocks) {
             if (b1 > p->total_blocks) b1 = p->total_blocks;
-            zcrudp_ternary_config_t slice_cfg = *p->cfg;
+            zcrudp_zcvid_config_t slice_cfg = *p->cfg;
             if (slice_cfg.ec_max_blocks > 0U && n > 1U) {
                 uint32_t share = (slice_cfg.ec_max_blocks + n - 1U) / n;
                 slice_cfg.ec_max_blocks = (share > 0U) ? share : 1U;
             }
-            zcrudp_ternary_encode_plane_range(
+            zcrudp_zcvid_encode_plane_range(
                 p->src, p->ref_or_canvas, p->delta_buf,
                 p->plane_len, b0, b1,
                 p->plane_id, p->frame_id, &slice_cfg,
@@ -175,7 +175,7 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         if (i0 < p->plane_len) {
             if (i1 > p->plane_len) i1 = p->plane_len;
             if (!p->cfg->no_decay) {
-                zcrudp_ternary_decay_plane(p->ref_or_canvas + i0, i1 - i0,
+                zcrudp_zcvid_decay_plane(p->ref_or_canvas + i0, i1 - i0,
                                            p->cfg->gamma_q8, p->cfg->neutral_y);
             }
         }
@@ -188,18 +188,18 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         for (size_t idx = s0; idx < s1; idx++) {
             const uint8_t *pd = p->pkt_in_base + idx * p->pkt_in_stride;
             size_t plen = p->pkt_in_lens[idx];
-            zcrudp_ternary_pkt_hdr_t hdr;
-            if (plen < ZCRUDP_TERNARY_PKT_HDR_SZ ||
-                !zcrudp_ternary_pkt_hdr_read_le(pd, &hdr)) continue;
+            zcrudp_zcvid_pkt_hdr_t hdr;
+            if (plen < ZCRUDP_ZCVID_PKT_HDR_SZ ||
+                !zcrudp_zcvid_pkt_hdr_read_le(pd, &hdr)) continue;
             /* hdr.plane comes off the wire: it selects the destination buffer,
              * so reject planes the configured pixel format does not have. */
-            uint8_t num_planes = (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_RGBA) ? 3U
-                               : (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12) ? 2U : 1U;
+            uint8_t num_planes = (p->cfg->pixfmt == ZCRUDP_ZCVID_FMT_RGBA) ? 3U
+                               : (p->cfg->pixfmt == ZCRUDP_ZCVID_FMT_NV12) ? 2U : 1U;
             if (hdr.plane >= num_planes) continue;
             size_t plane_off = (hdr.plane == 0) ? 0 : ((size_t)hdr.plane * p->y_sz);
-            size_t plane_len = (p->cfg->pixfmt == ZCRUDP_TERNARY_FMT_NV12 && hdr.plane == 1)
+            size_t plane_len = (p->cfg->pixfmt == ZCRUDP_ZCVID_FMT_NV12 && hdr.plane == 1)
                 ? (p->y_sz / 2U) : p->y_sz;
-            zcrudp_ternary_decode_packet(
+            zcrudp_zcvid_decode_packet(
                 pd, plen,
                 p->ref_or_canvas + plane_off,
                 p->delta_buf ? (p->delta_buf + plane_off) : NULL,
@@ -216,7 +216,7 @@ static inline void zcrudp_mt_run_task(zcrudp_ternary_mt_pool_t *p, uint32_t tid)
         w->sink.total_bytes = 0;
         w->sink.dropped_pkts = 0;
         if (b0 < b1) {
-            zcrudp_ternary_encode_intra_range(
+            zcrudp_zcvid_encode_intra_range(
                 p->src, p->ref_or_canvas, p->delta_buf,
                 b0, b1, p->plane_len,
                 p->plane_id, p->frame_id, p->cfg,
@@ -231,7 +231,7 @@ static DWORD WINAPI zcrudp_mt_worker_entry(LPVOID arg) {
 static void *zcrudp_mt_worker_entry(void *arg) {
 #endif
     zcrudp_mt_worker_t *w = (zcrudp_mt_worker_t *)arg;
-    zcrudp_ternary_mt_pool_t *p = w->pool;
+    zcrudp_zcvid_mt_pool_t *p = w->pool;
     uint32_t seen_gen = 0;
 
     for (;;) {
@@ -272,7 +272,7 @@ static void *zcrudp_mt_worker_entry(void *arg) {
 #endif
 }
 
-static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
+static inline void zcrudp_mt_dispatch(zcrudp_zcvid_mt_pool_t *p, int op) {
     atomic_store_explicit(&p->op, op, memory_order_relaxed);
     if (p->num_threads > 1U) {
         atomic_store_explicit(&p->active_workers, p->num_threads - 1U, memory_order_release);
@@ -303,14 +303,14 @@ static inline void zcrudp_mt_dispatch(zcrudp_ternary_mt_pool_t *p, int op) {
  *        If the OS refuses a thread the pool shrinks to the workers that did
  *        start (p->num_threads); it always keeps the calling thread.
  */
-static inline void zcrudp_ternary_mt_init(zcrudp_ternary_mt_pool_t *p,
+static inline void zcrudp_zcvid_mt_init(zcrudp_zcvid_mt_pool_t *p,
                                           uint32_t num_threads,
                                           uint8_t *slice_pkts_buf,
                                           size_t *slice_lens_buf,
                                           size_t max_pkts_per_thread,
                                           size_t mtu_stride) {
     if (num_threads < 1U) num_threads = 1U;
-    if (num_threads > ZCRUDP_TERNARY_MT_MAX_THREADS) num_threads = ZCRUDP_TERNARY_MT_MAX_THREADS;
+    if (num_threads > ZCRUDP_ZCVID_MT_MAX_THREADS) num_threads = ZCRUDP_ZCVID_MT_MAX_THREADS;
 
     memset(p, 0, sizeof(*p));
     p->num_threads = num_threads;
@@ -352,7 +352,7 @@ static inline void zcrudp_ternary_mt_init(zcrudp_ternary_mt_pool_t *p,
     }
 }
 
-static inline void zcrudp_ternary_mt_destroy(zcrudp_ternary_mt_pool_t *p) {
+static inline void zcrudp_zcvid_mt_destroy(zcrudp_zcvid_mt_pool_t *p) {
     if (p->num_threads > 1U) {
         atomic_store_explicit(&p->op, ZCRUDP_MT_OP_QUIT, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->gen, 1U, memory_order_release);
@@ -372,14 +372,14 @@ static inline void zcrudp_ternary_mt_destroy(zcrudp_ternary_mt_pool_t *p) {
 #endif
 }
 
-static inline size_t zcrudp_ternary_mt_encode_plane(zcrudp_ternary_mt_pool_t *p,
+static inline size_t zcrudp_zcvid_mt_encode_plane(zcrudp_zcvid_mt_pool_t *p,
                                                     const uint8_t *src,
                                                     uint8_t *ref,
                                                     uint8_t *delta_buf,
                                                     size_t len,
                                                     uint8_t plane_id,
                                                     uint16_t frame_id,
-                                                    const zcrudp_ternary_config_t *cfg,
+                                                    const zcrudp_zcvid_config_t *cfg,
                                                     size_t *out_total_pkts) {
     /* Workers packetize into a fixed per-thread scratch buffer. */
     if (cfg->mtu_payload > sizeof(p->workers[0].pkt_scratch)) {
@@ -410,14 +410,14 @@ static inline size_t zcrudp_ternary_mt_encode_plane(zcrudp_ternary_mt_pool_t *p,
     return bytes;
 }
 
-static inline size_t zcrudp_ternary_mt_dropped_pkts(const zcrudp_ternary_mt_pool_t *p) {
+static inline size_t zcrudp_zcvid_mt_dropped_pkts(const zcrudp_zcvid_mt_pool_t *p) {
     return p ? p->last_dropped_pkts : 0U;
 }
 
-static inline void zcrudp_ternary_mt_decay_plane(zcrudp_ternary_mt_pool_t *p,
+static inline void zcrudp_zcvid_mt_decay_plane(zcrudp_zcvid_mt_pool_t *p,
                                                  uint8_t *canvas,
                                                  size_t len,
-                                                 const zcrudp_ternary_config_t *cfg) {
+                                                 const zcrudp_zcvid_config_t *cfg) {
     if (cfg->no_decay) {
         return;
     }
@@ -429,12 +429,12 @@ static inline void zcrudp_ternary_mt_decay_plane(zcrudp_ternary_mt_pool_t *p,
 
 /** True for packets that overwrite samples (anchors) rather than add to them. */
 static inline bool zcrudp_mt_pkt_is_anchor(const uint8_t *pkt, size_t len) {
-    if (len < ZCRUDP_TERNARY_PKT_HDR_SZ) {
+    if (len < ZCRUDP_ZCVID_PKT_HDR_SZ) {
         return false;
     }
     uint8_t ptype = (uint8_t)((pkt[2] >> 4) & 0x0FU);
-    return ptype == ZCRUDP_TERNARY_PKT_INTRA || ptype == ZCRUDP_TERNARY_PKT_INTRA_EC ||
-           ptype == ZCRUDP_TERNARY_PKT_INTRA_Q_EC;
+    return ptype == ZCRUDP_ZCVID_PKT_INTRA || ptype == ZCRUDP_ZCVID_PKT_INTRA_EC ||
+           ptype == ZCRUDP_ZCVID_PKT_INTRA_Q_EC;
 }
 
 /**
@@ -450,11 +450,11 @@ static inline bool zcrudp_mt_pkt_is_anchor(const uint8_t *pkt, size_t len) {
  * Range-coded packets carry many more blocks each, so a frame has fewer of
  * them to spread over the threads.
  */
-static inline void zcrudp_ternary_mt_decode_packets(zcrudp_ternary_mt_pool_t *p,
+static inline void zcrudp_zcvid_mt_decode_packets(zcrudp_zcvid_mt_pool_t *p,
                                                     uint8_t *canvas,
                                                     uint8_t *delta_buf,
                                                     size_t y_sz,
-                                                    const zcrudp_ternary_config_t *cfg,
+                                                    const zcrudp_zcvid_config_t *cfg,
                                                     const uint8_t *pkts_base,
                                                     const size_t *pkt_lens,
                                                     size_t mtu_stride,
@@ -484,11 +484,11 @@ static inline void zcrudp_ternary_mt_decode_packets(zcrudp_ternary_mt_pool_t *p,
 }
 
 /**
- * @brief Parallelizes zcrudp_ternary_encode_intra_range across worker threads.
+ * @brief Parallelizes zcrudp_zcvid_encode_intra_range across worker threads.
  *        Each thread encodes an independent contiguous byte slice into its own
  *        per-thread sink buffer (disjoint ref/delta_buf writes, zero data race).
  */
-static inline size_t zcrudp_ternary_mt_encode_intra_range(zcrudp_ternary_mt_pool_t *p,
+static inline size_t zcrudp_zcvid_mt_encode_intra_range(zcrudp_zcvid_mt_pool_t *p,
                                                           const uint8_t *src,
                                                           uint8_t *ref,
                                                           uint8_t *delta_buf,
@@ -497,7 +497,7 @@ static inline size_t zcrudp_ternary_mt_encode_intra_range(zcrudp_ternary_mt_pool
                                                           size_t plane_len,
                                                           uint8_t plane_id,
                                                           uint16_t frame_id,
-                                                          const zcrudp_ternary_config_t *cfg,
+                                                          const zcrudp_zcvid_config_t *cfg,
                                                           size_t *out_total_pkts) {
     if (cfg->mtu_payload > sizeof(p->workers[0].pkt_scratch)) {
         if (out_total_pkts) *out_total_pkts = 0U;
@@ -531,4 +531,4 @@ static inline size_t zcrudp_ternary_mt_encode_intra_range(zcrudp_ternary_mt_pool
 }
 #endif
 
-#endif /* ZCRUDP_TERNARY_MT_H */
+#endif /* ZCRUDP_ZCVID_MT_H */

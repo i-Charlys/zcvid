@@ -1,6 +1,6 @@
 /**
- * @file ternary_entropy.h
- * @brief Adaptive binary range coder and context models for the ternary codec.
+ * @file zcvid_entropy.h
+ * @brief Adaptive binary range coder and context models for the zcvid codec.
  *
  * Fixed base-3 packing spends 1.6 bit per trit whatever the picture. Trits are
  * far from uniform (most are 0, and the others cluster along moving edges), so
@@ -16,13 +16,24 @@
  * reads past the payload (missing bytes read as 0) and yields bounded values.
  */
 
-#ifndef ZCRUDP_TERNARY_ENTROPY_H
-#define ZCRUDP_TERNARY_ENTROPY_H
+#ifndef ZCRUDP_ZCVID_ENTROPY_H
+#define ZCRUDP_ZCVID_ENTROPY_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define ZCRUDP_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define ZCRUDP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define ZCRUDP_LIKELY(x)   (x)
+#define ZCRUDP_UNLIKELY(x) (x)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,11 +80,9 @@ static inline uint32_t zcrudp_rc_prob_p12(const zcrudp_rc_prob_t *p) {
 }
 
 static inline void zcrudp_rc_prob_update(zcrudp_rc_prob_t *p, uint32_t bit) {
-    if (bit == 0U) {
-        p->p0 = (uint16_t)(p->p0 + ((32768U - p->p0) >> ZCRUDP_RC_RATE_SHIFT));
-    } else {
-        p->p0 = (uint16_t)(p->p0 - (p->p0 >> ZCRUDP_RC_RATE_SHIFT));
-    }
+    uint32_t p0 = p->p0;
+    p->p0 = (uint16_t)(bit ? (p0 - (p0 >> ZCRUDP_RC_RATE_SHIFT))
+                           : (p0 + ((32768U - p0) >> ZCRUDP_RC_RATE_SHIFT)));
 }
 
 /* =========================================================================
@@ -136,16 +145,31 @@ static inline size_t zcrudp_rc_enc_pending(const zcrudp_rc_enc_t *e) {
 }
 
 static inline void zcrudp_rc_enc_bit(zcrudp_rc_enc_t *e, zcrudp_rc_prob_t *p, uint32_t bit) {
-    uint32_t bound = (e->range >> ZCRUDP_RC_PROB_BITS) * zcrudp_rc_prob_p12(p);
-    if (bit == 0U) {
-        e->range = bound;
-    } else {
-        e->low += bound;
-        e->range -= bound;
+    uint32_t p0 = p->p0;
+    uint32_t range = e->range;
+    uint32_t bound = (range >> ZCRUDP_RC_PROB_BITS) * (p0 >> 3);
+    e->low += bit ? (uint64_t)bound : 0ULL;
+    range = bit ? (range - bound) : bound;
+    p->p0 = (uint16_t)(bit ? (p0 - (p0 >> ZCRUDP_RC_RATE_SHIFT))
+                           : (p0 + ((32768U - p0) >> ZCRUDP_RC_RATE_SHIFT)));
+    e->range = range;
+    if (range < ZCRUDP_RC_TOP) {
+        e->range = range << 8;
+        zcrudp_rc_enc_shift_low(e);
+        if (ZCRUDP_UNLIKELY(e->range < ZCRUDP_RC_TOP)) {
+            e->range <<= 8;
+            zcrudp_rc_enc_shift_low(e);
+        }
     }
-    zcrudp_rc_prob_update(p, bit);
-    while (e->range < ZCRUDP_RC_TOP) {
-        e->range <<= 8;
+}
+
+/** Fast 1-bit equiprobable bypass encode (bit-exact with zcrudp_rc_enc_direct(e, bit, 1)). */
+static inline void zcrudp_rc_enc_bit_bypass(zcrudp_rc_enc_t *e, uint32_t bit) {
+    uint32_t r = e->range >> 1;
+    e->range = r;
+    e->low += bit ? (uint64_t)r : 0ULL;
+    if (r < ZCRUDP_RC_TOP) {
+        e->range = r << 8;
         zcrudp_rc_enc_shift_low(e);
     }
 }
@@ -153,12 +177,12 @@ static inline void zcrudp_rc_enc_bit(zcrudp_rc_enc_t *e, zcrudp_rc_prob_t *p, ui
 /** Codes the low @p nbits of @p val, most significant first, at 1 bit each. */
 static inline void zcrudp_rc_enc_direct(zcrudp_rc_enc_t *e, uint64_t val, uint32_t nbits) {
     while (nbits-- > 0U) {
-        e->range >>= 1;
-        if ((val >> nbits) & 1U) {
-            e->low += e->range;
-        }
-        while (e->range < ZCRUDP_RC_TOP) {
-            e->range <<= 8;
+        uint32_t r = e->range >> 1;
+        e->range = r;
+        uint32_t bit = (uint32_t)((val >> nbits) & 1U);
+        e->low += bit ? (uint64_t)r : 0ULL;
+        if (r < ZCRUDP_RC_TOP) {
+            e->range = r << 8;
             zcrudp_rc_enc_shift_low(e);
         }
     }
@@ -203,7 +227,7 @@ typedef struct {
 } zcrudp_rc_dec_t;
 
 static inline uint8_t zcrudp_rc_dec_byte(zcrudp_rc_dec_t *d) {
-    return (d->pos < d->len) ? d->in[d->pos++] : (uint8_t)0;
+    return ZCRUDP_LIKELY(d->pos < d->len) ? d->in[d->pos++] : (uint8_t)0;
 }
 
 static inline void zcrudp_rc_dec_init(zcrudp_rc_dec_t *d, const uint8_t *in, size_t len) {
@@ -218,38 +242,59 @@ static inline void zcrudp_rc_dec_init(zcrudp_rc_dec_t *d, const uint8_t *in, siz
 }
 
 static inline uint32_t zcrudp_rc_dec_bit(zcrudp_rc_dec_t *d, zcrudp_rc_prob_t *p) {
-    uint32_t bound = (d->range >> ZCRUDP_RC_PROB_BITS) * zcrudp_rc_prob_p12(p);
-    uint32_t bit;
-    if (d->code < bound) {
-        d->range = bound;
-        bit = 0U;
-    } else {
-        d->code -= bound;
-        d->range -= bound;
-        bit = 1U;
+    uint32_t p0 = p->p0;
+    uint32_t range = d->range;
+    uint32_t code = d->code;
+    uint32_t bound = (range >> ZCRUDP_RC_PROB_BITS) * (p0 >> 3);
+    uint32_t bit = (code >= bound) ? 1U : 0U;
+    code = bit ? (code - bound) : code;
+    range = bit ? (range - bound) : bound;
+    p->p0 = (uint16_t)(bit ? (p0 - (p0 >> ZCRUDP_RC_RATE_SHIFT))
+                           : (p0 + ((32768U - p0) >> ZCRUDP_RC_RATE_SHIFT)));
+    if (range < ZCRUDP_RC_TOP) {
+        range <<= 8;
+        code = (code << 8) | zcrudp_rc_dec_byte(d);
+        if (ZCRUDP_UNLIKELY(range < ZCRUDP_RC_TOP)) {
+            range <<= 8;
+            code = (code << 8) | zcrudp_rc_dec_byte(d);
+        }
     }
-    zcrudp_rc_prob_update(p, bit);
-    while (d->range < ZCRUDP_RC_TOP) {
-        d->range <<= 8;
-        d->code = (d->code << 8) | zcrudp_rc_dec_byte(d);
+    d->range = range;
+    d->code = code;
+    return bit;
+}
+
+/** Fast 1-bit equiprobable bypass decode (bit-exact with zcrudp_rc_dec_direct(d, 1)). */
+static inline uint32_t zcrudp_rc_dec_bit_bypass(zcrudp_rc_dec_t *d) {
+    uint32_t range = d->range >> 1;
+    uint32_t code = d->code;
+    uint32_t bit = (code >= range) ? 1U : 0U;
+    code = bit ? (code - range) : code;
+    if (range < ZCRUDP_RC_TOP) {
+        range <<= 8;
+        code = (code << 8) | zcrudp_rc_dec_byte(d);
     }
+    d->range = range;
+    d->code = code;
     return bit;
 }
 
 static inline uint64_t zcrudp_rc_dec_direct(zcrudp_rc_dec_t *d, uint32_t nbits) {
     uint64_t val = 0;
+    uint32_t range = d->range;
+    uint32_t code = d->code;
     while (nbits-- > 0U) {
-        d->range >>= 1;
-        uint32_t bit = (d->code >= d->range) ? 1U : 0U;
-        if (bit) {
-            d->code -= d->range;
-        }
+        range >>= 1;
+        uint32_t bit = (code >= range) ? 1U : 0U;
+        code = bit ? (code - range) : code;
         val = (val << 1) | bit;
-        while (d->range < ZCRUDP_RC_TOP) {
-            d->range <<= 8;
-            d->code = (d->code << 8) | zcrudp_rc_dec_byte(d);
+        if (range < ZCRUDP_RC_TOP) {
+            range <<= 8;
+            code = (code << 8) | zcrudp_rc_dec_byte(d);
         }
     }
+    d->range = range;
+    d->code = code;
     return val;
 }
 
@@ -260,14 +305,31 @@ static inline uint64_t zcrudp_rc_dec_direct(zcrudp_rc_dec_t *d, uint32_t nbits) 
 /** Codes v >= 0. @p ctx must hold @p nctx models; lengths past it share the last. */
 static inline void zcrudp_rc_enc_egk(zcrudp_rc_enc_t *e, zcrudp_rc_prob_t *ctx,
                                      uint32_t nctx, uint32_t max_len, uint64_t v) {
+    if (max_len > 63U) max_len = 63U;
+    if (v == 0U) {
+        if (max_len > 0U) zcrudp_rc_enc_bit(e, &ctx[0], 0U);
+        return;
+    }
     uint64_t x = v + 1U;
     uint32_t n = 0;
-    while ((x >> (n + 1U)) != 0U) {
-        n++;
+    if (x == 0U) {
+        n = 63U;
+    } else {
+#if defined(__GNUC__) || defined(__clang__)
+        n = 63U - (uint32_t)__builtin_clzll(x);
+#elif defined(_MSC_VER) && defined(_M_X64)
+        unsigned long idx_bsr = 0;
+        _BitScanReverse64(&idx_bsr, x);
+        n = (uint32_t)idx_bsr;
+#else
+        while ((x >> (n + 1U)) != 0U) {
+            n++;
+        }
+#endif
     }
     if (n > max_len) {
         n = max_len;
-        x = ((uint64_t)1 << (n + 1U)) - 1U;
+        x = (n >= 63U) ? UINT64_MAX : (((uint64_t)1 << (n + 1U)) - 1U);
     }
     for (uint32_t i = 0; i < n; i++) {
         zcrudp_rc_enc_bit(e, &ctx[(i < nctx) ? i : (nctx - 1U)], 1U);
@@ -280,7 +342,11 @@ static inline void zcrudp_rc_enc_egk(zcrudp_rc_enc_t *e, zcrudp_rc_prob_t *ctx,
 
 static inline uint64_t zcrudp_rc_dec_egk(zcrudp_rc_dec_t *d, zcrudp_rc_prob_t *ctx,
                                          uint32_t nctx, uint32_t max_len) {
-    uint32_t n = 0;
+    if (max_len > 63U) max_len = 63U;
+    if (max_len == 0U || zcrudp_rc_dec_bit(d, &ctx[0]) == 0U) {
+        return 0U;
+    }
+    uint32_t n = 1U;
     while (n < max_len &&
            zcrudp_rc_dec_bit(d, &ctx[(n < nctx) ? n : (nctx - 1U)]) != 0U) {
         n++;
@@ -299,7 +365,7 @@ static inline uint64_t zcrudp_rc_dec_egk(zcrudp_rc_dec_t *d, zcrudp_rc_prob_t *c
  * packet (or the plane, the index then wraps inside the ring) was cleared by
  * zcrudp_tec_model_reset() and reads as 0, "nothing known".
  *
- * Contexts (built in ternary_codec.h, which knows the block geometry):
+ * Contexts (built in zcvid_codec.h, which knows the block geometry):
  *   zero flag: (left != 0) | (left2 != 0) << 1 | (up != 0) << 2 |
  *              ((up-left != 0) + (up-right != 0)) << 3          -> 24 contexts
  *   sign:      left * 3 + (up, else up-left, else up-right)     ->  9 contexts
@@ -350,6 +416,16 @@ static inline void zcrudp_tec_model_reset(zcrudp_tec_model_t *m, size_t stride, 
     /* The row above must lie outside the block being coded (20 samples at most). */
     m->stride = (stride >= 32U && stride + 4U * lstep + 8U <= ZCRUDP_TEC_HIST_SZ) ? stride : 0U;
     memset(m->hist, 0, sizeof(m->hist));
+}
+
+/** Fast reset of ONLY the run-length coder state (skips 8 KB hist memset for non-trit classes). */
+static inline void zcrudp_tec_run_reset(zcrudp_tec_model_t *m) {
+    for (uint32_t s = 0; s < ZCRUDP_TEC_RUN_SETS; s++) {
+        for (uint32_t c = 0; c < ZCRUDP_TEC_RUN_CTX; c++) {
+            zcrudp_rc_prob_init(&m->run[s][c], 16384U);
+        }
+    }
+    m->run_set = 0;
 }
 
 /** Marks samples [from, to) as zero (blocks skipped inside the packet). */
@@ -466,4 +542,4 @@ static inline int32_t zcrudp_iec_dec_residual(zcrudp_rc_dec_t *d, zcrudp_iec_mod
 }
 #endif
 
-#endif /* ZCRUDP_TERNARY_ENTROPY_H */
+#endif /* ZCRUDP_ZCVID_ENTROPY_H */

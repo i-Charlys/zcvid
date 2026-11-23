@@ -1,8 +1,8 @@
 /-!
-# TernVid Core Codec Formal Verification (Lean 4)
+# Zcvid Core Codec Formal Verification (Lean 4)
 
-Machine-checked proofs for `tern_vid` core primitives (`protocol_ternary.h`,
-`ternary_rans.h`, `ternary_codec.h`), using pure Lean 4 core (no external
+Machine-checked proofs for `zcvid` core primitives (`protocol_zcvid.h`,
+`zcvid_rans.h`, `zcvid_codec.h`), using pure Lean 4 core (no external
 dependencies), ZERO `sorry`, and ZERO custom axioms:
 
 1. **Base-3 5-trit & 10-trit packing bijection and Granlund-Montgomery division**:
@@ -24,7 +24,7 @@ dependencies), ZERO `sorry`, and ZERO custom axioms:
    - Single-step rANS encode/decode exact invertibility and `uint32` no-overflow bound.
 -/
 
-namespace TernVidCore
+namespace ZcvidCore
 
 /-! ## Section 1: Base-3 5-Trit & 10-Trit Bijection + Granlund-Montgomery -/
 
@@ -38,7 +38,7 @@ def tritToUtrit (t : Int) : Nat := (t + 1).toNat
 def pack5U (u0 u1 u2 u3 u4 : Nat) : Nat :=
   u0 + 3 * u1 + 9 * u2 + 27 * u3 + 81 * u4
 
-/-- Scalar Granlund-Montgomery 5-trit unpack from `protocol_ternary.h:133-144`. -/
+/-- Scalar Granlund-Montgomery 5-trit unpack from `protocol_zcvid.h:133-144`. -/
 def unpack5U (v : Nat) : Nat × Nat × Nat × Nat × Nat :=
   let q1 := (v * 21846) >>> 16
   let q2 := (v * 7282)  >>> 16
@@ -95,14 +95,14 @@ theorem pack5U_unpack5U (v : Nat) (hv : v < 243) :
 
 theorem pack5U_all_zero : pack5U 1 1 1 1 1 = 121 := rfl
 
-/-- Scalar Granlund-Montgomery division by 243 (`protocol_ternary.h:193`). -/
+/-- Scalar Granlund-Montgomery division by 243 (`protocol_zcvid.h:193`). -/
 theorem gm_div243_scalar_exact (w : Nat) (hw : w < 59049) :
     (w * 69043) >>> 24 = w / 243 := by
   have hshift : (w * 69043) >>> 24 = (w * 69043) / 16777216 := by
     simp [Nat.shiftRight_eq_div_pow]
   rw [hshift]; omega
 
-/-- AVX2 16-bit Granlund-Montgomery division by 243 (`ternary_codec.h:440`)
+/-- AVX2 16-bit Granlund-Montgomery division by 243 (`zcvid_codec.h:440`)
     and proof that the intermediate sum `w + mulhi_epu16(w, 3507)` never overflows `uint16_t`. -/
 theorem gm_div243_avx2_exact (w : Nat) (hw : w < 59049) :
     (w + ((w * 3507) >>> 16)) >>> 8 = w / 243 ∧
@@ -116,7 +116,7 @@ theorem gm_div243_avx2_exact (w : Nat) (hw : w < 59049) :
 /-- Pack 10 unsigned trits as `lo + 243 * hi`. -/
 def pack10U (lo hi : Nat) : Nat := lo + 243 * hi
 
-/-- Unpack 10-trit word into `(lo, hi)` using scalar Granlund-Montgomery (`protocol_ternary.h:191-196`). -/
+/-- Unpack 10-trit word into `(lo, hi)` using scalar Granlund-Montgomery (`protocol_zcvid.h:191-196`). -/
 def unpack10Split (w : Nat) : Nat × Nat :=
   let hi := (w * 69043) >>> 24
   let lo := w - hi * 243
@@ -151,7 +151,7 @@ def clampU8 (x : Int) : Int :=
 def leakyDecay (prev neutral gamma : Int) : Int :=
   neutral + Int.tdiv ((prev - neutral) * gamma) 256
 
-/-- Full leaky integrator step (`protocol_ternary.h:314-331`) for `gamma < 256`. -/
+/-- Full leaky integrator step (`protocol_zcvid.h:314-331`) for `gamma < 256`. -/
 def leakyStep (prev trit delta gamma neutral : Int) : Int :=
   clampU8 (leakyDecay prev neutral gamma + trit * delta)
 
@@ -166,7 +166,7 @@ theorem leakyStep_bounds (prev trit delta gamma neutral : Int) :
     leakyStep prev trit delta gamma neutral ≤ 255 :=
   clampU8_bounds _
 
-/-- AVX2 `decay_plane` formula (`ternary_codec.h:209-211`):
+/-- AVX2 `decay_plane` formula (`zcvid_codec.h:209-211`):
     `neutral + sign(d) * ((|d| * gamma) / 256)`. -/
 def avx2Decay (prev neutral gamma : Int) : Int :=
   let d := prev - neutral
@@ -350,7 +350,7 @@ theorem leakyStep_nonexpansive (y1 y2 trit delta gamma neutral : Int)
 
 /-! ## Section 3: 4-Way Static 12-Bit rANS Tables, Bit-Cost Bounds & Invertibility -/
 
-/-- Exact copy of `ZCRUDP_RANS_CUM` from `ternary_rans.h:39-48`. -/
+/-- Exact copy of `ZCRUDP_RANS_CUM` from `zcvid_rans.h:39-48`. -/
 def ransCumList (p : Nat) : List Nat :=
   match p with
   | 0 => [0, 720, 1080, 1340, 1540, 1700, 1830, 1940, 2030, 2110, 2180, 2240, 2295, 2345, 2390, 3420, 4096]
@@ -364,7 +364,7 @@ def ransCum (p i : Nat) : Nat := (ransCumList p).getD i 0
 def ransFreq (p s : Nat) : Nat :=
   ransCum p (s + 1) - ransCum p s
 
-/-- Per-symbol worst-case bit-cost table from `ternary_codec.h:1100,1106,1115`. -/
+/-- Per-symbol worst-case bit-cost table from `zcvid_codec.h:1100,1106,1115`. -/
 def ransWorstBitCost (s : Nat) : Nat :=
   if s == 0 then 3
   else if s ≤ 2 then 4
@@ -386,7 +386,7 @@ theorem rans_worst_bit_cost_sound :
       4096 ≤ ransFreq p.val s.val * (2 ^ ransWorstBitCost s.val) := by
   decide
 
-/-- Exact branchless binary search `zcrudp_rans_find_sym` from `ternary_rans.h:60-67`. -/
+/-- Exact branchless binary search `zcrudp_rans_find_sym` from `zcvid_rans.h:60-67`. -/
 def ransFindSym (cf p : Nat) : Nat :=
   let s1 := if cf ≥ ransCum p 8 then 8 else 0
   let s2 := if cf ≥ ransCum p (s1 + 4) then s1 + 4 else s1
@@ -436,12 +436,12 @@ theorem ransFindSym_correct (p : Fin 4) (cf : Nat) (hcf : cf < 4096) :
       · split <;> rename_i h1 <;> simp only [Nat.reduceAdd] at * <;> omega
       · split <;> rename_i h1 <;> simp only [Nat.reduceAdd] at * <;> omega
 
-/-- Single-step rANS encode state transition (`ternary_rans.h:102`):
+/-- Single-step rANS encode state transition (`zcvid_rans.h:102`):
     `x' = ((x / freq) << 12) + (x % freq) + start`. -/
 def ransEncStep (x start freq : Nat) : Nat :=
   (x / freq) * 4096 + (x % freq) + start
 
-/-- Single-step rANS decode state transition (`ternary_rans.h:160`):
+/-- Single-step rANS decode state transition (`zcvid_rans.h:160`):
     `x = freq * (x' >> 12) + ((x' & 4095) - start)`. -/
 def ransDecStep (x' start freq : Nat) : Nat :=
   freq * (x' / 4096) + (x' % 4096 - start)
@@ -485,4 +485,4 @@ theorem rans_step_invertible (x start freq : Nat)
   · omega
   · omega
 
-end TernVidCore
+end ZcvidCore

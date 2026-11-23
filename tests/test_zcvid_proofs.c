@@ -1,6 +1,6 @@
 /**
- * @file test_ternary_proofs.c
- * @brief Exhaustive & adversarial proofs of tern_vid mathematical invariants.
+ * @file test_zcvid_proofs.c
+ * @brief Exhaustive & adversarial proofs of zcvid mathematical invariants.
  *
  * Unlike sample-based unit tests, every check here either:
  *  1. Exhaustively verifies the entire finite input domain (all 256x256x63
@@ -16,8 +16,9 @@
 #include <math.h>
 #include <assert.h>
 
-#include "ternary_codec.h"
-#include "ternary_mt.h"
+#include "zcvid_codec.h"
+#include "zcvid_mt.h"
+#include "zcvid_gpu_cpu_dec.h"
 
 typedef struct {
     uint8_t (*pkts)[1400];
@@ -113,11 +114,11 @@ static void prove_intra_q_ec_extreme_residual_parity(void) {
         src[i] = (i & 1U) ? 255U : 0U;
     }
 
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 2
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 2
     };
     proof_sink_t s = { malloc(64U * 1400U), malloc(64U * sizeof(size_t)), 0, 64 };
     assert(s.pkts && s.lens);
@@ -128,10 +129,10 @@ static void prove_intra_q_ec_extreme_residual_parity(void) {
     memset(ed, cfg.delta_min, len);
     memset(dd, cfg.delta_min, len);
 
-    zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
+    zcrudp_zcvid_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
                                       pkt_buf, proof_cb, &s);
     for (size_t i = 0; i < s.count; i++) {
-        assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+        assert(zcrudp_zcvid_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
     }
     assert(memcmp(ref, can, len) == 0);
     assert(memcmp(ed, dd, len) == 0);
@@ -167,11 +168,11 @@ static void prove_universal_worst_case_psnr_bound(void) {
     assert(src && ref && can && ed && dd && s.pkts && s.lens);
     uint8_t pkt_buf[1400];
 
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = Q
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = Q
     };
 
     uint32_t rng = 0xDEADBEEFU;
@@ -209,14 +210,14 @@ static void prove_universal_worst_case_psnr_bound(void) {
             }
 
             s.count = 0;
-            zcrudp_ternary_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg,
+            zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg,
                                         pkt_buf, proof_cb, &s);
-            zcrudp_ternary_repair_disocclusions(src, ref, ed, len, E, 0, (uint16_t)f, &cfg,
+            zcrudp_zcvid_repair_disocclusions(src, ref, ed, len, E, 0, (uint16_t)f, &cfg,
                                                 pkt_buf, proof_cb, &s);
 
-            zcrudp_ternary_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
+            zcrudp_zcvid_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
             for (size_t i = 0; i < s.count; i++) {
-                assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+                assert(zcrudp_zcvid_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
             }
             assert(memcmp(ref, can, len) == 0);
             assert(memcmp(ed, dd, len) == 0);
@@ -274,11 +275,11 @@ static void prove_tile_mv_pan_directions(void) {
         { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 },
         { 1, 1 }, { 3, -2 }, { -5, 4 }, { 13, -9 }
     };
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 4
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 4
     };
     uint8_t pkt_buf[1400];
 
@@ -295,10 +296,10 @@ static void prove_tile_mv_pan_directions(void) {
             memcpy(src + (size_t)y * W, photo + (size_t)(y + oy0) * IW + (size_t)ox0, W);
         }
         s.count = 0;
-        zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
+        zcrudp_zcvid_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg,
                                           pkt_buf, proof_cb, &s);
         for (size_t i = 0; i < s.count; i++) {
-            assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+            assert(zcrudp_zcvid_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
         }
 
         /* Frame 1 shifted by (vx, vy) */
@@ -306,26 +307,26 @@ static void prove_tile_mv_pan_directions(void) {
             memcpy(src + (size_t)y * W, photo + (size_t)(y + oy1) * IW + (size_t)ox1, W);
         }
         s.count = 0;
-        zcrudp_ternary_estimate_tile_mv(src, ref, W, H, tile_sz, 16, enc_mvs);
-        zcrudp_ternary_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, 1, &cfg, pkt_buf, proof_cb, &s);
-        zcrudp_ternary_apply_tile_mv_state(ref, ref_mc, ed, ed_mc, W, H, tile_sz, enc_mvs);
+        zcrudp_zcvid_estimate_tile_mv(src, ref, W, H, tile_sz, 16, enc_mvs);
+        zcrudp_zcvid_encode_tile_mv_pkts(enc_mvs, num_tiles, 0, 1, &cfg, pkt_buf, proof_cb, &s);
+        zcrudp_zcvid_apply_tile_mv_state(ref, ref_mc, ed, ed_mc, W, H, tile_sz, enc_mvs);
         memcpy(ref, ref_mc, len); memcpy(ed, ed_mc, len);
-        zcrudp_ternary_encode_plane(src, ref, ed, len, 0, 1, &cfg, pkt_buf, proof_cb, &s);
-        zcrudp_ternary_repair_disocclusions(src, ref, ed, len, 4, 0, 1, &cfg, pkt_buf, proof_cb, &s);
+        zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, 1, &cfg, pkt_buf, proof_cb, &s);
+        zcrudp_zcvid_repair_disocclusions(src, ref, ed, len, 4, 0, 1, &cfg, pkt_buf, proof_cb, &s);
 
         size_t idx = 0;
         while (idx < s.count) {
-            zcrudp_ternary_pkt_hdr_t h;
-            if (!zcrudp_ternary_pkt_hdr_read_le(s.pkts[idx], &h) ||
-                ZCRUDP_TERNARY_HDR_TYPE(&h) != ZCRUDP_TERNARY_PKT_TILE_MV) break;
-            assert(zcrudp_ternary_decode_tile_mv_pkt(s.pkts[idx], s.lens[idx], dec_mvs, num_tiles));
+            zcrudp_zcvid_pkt_hdr_t h;
+            if (!zcrudp_zcvid_pkt_hdr_read_le(s.pkts[idx], &h) ||
+                ZCRUDP_ZCVID_HDR_TYPE(&h) != ZCRUDP_ZCVID_PKT_TILE_MV) break;
+            assert(zcrudp_zcvid_decode_tile_mv_pkt(s.pkts[idx], s.lens[idx], dec_mvs, num_tiles));
             idx++;
         }
-        zcrudp_ternary_apply_tile_mv_state(can, can_mc, dd, dd_mc, W, H, tile_sz, dec_mvs);
+        zcrudp_zcvid_apply_tile_mv_state(can, can_mc, dd, dd_mc, W, H, tile_sz, dec_mvs);
         memcpy(can, can_mc, len); memcpy(dd, dd_mc, len);
-        zcrudp_ternary_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
         for (; idx < s.count; idx++) {
-            assert(zcrudp_ternary_decode_packet(s.pkts[idx], s.lens[idx], can, dd, len, &cfg, NULL));
+            assert(zcrudp_zcvid_decode_packet(s.pkts[idx], s.lens[idx], can, dd, len, &cfg, NULL));
         }
 
         assert(memcmp(ref, can, len) == 0);
@@ -348,7 +349,7 @@ static void prove_tile_mv_pan_directions(void) {
 /*
  * Proof 6: Exhaustive Leaky Decay AVX2 vs Scalar Parity (all 16,777,216 triples).
  * Verifies every (pixel, neutral_y, gamma_q8) in [0..255]^3 produces identical
- * output in zcrudp_ternary_decay_plane() and scalar zcrudp_leaky_integrator_step().
+ * output in zcrudp_zcvid_decay_plane() and scalar zcrudp_leaky_integrator_step().
  */
 static void prove_decay_exhaustive_parity(void) {
     printf("[PROOF 6] Exhaustive Decay Parity (all 256x256x256 = 16777216 triples)... ");
@@ -360,7 +361,7 @@ static void prove_decay_exhaustive_parity(void) {
             for (int px = 0; px <= 255; px++) {
                 buf[px] = (uint8_t)px;
             }
-            zcrudp_ternary_decay_plane(buf, 256U, (uint8_t)g, (uint8_t)n);
+            zcrudp_zcvid_decay_plane(buf, 256U, (uint8_t)g, (uint8_t)n);
             for (int px = 0; px <= 255; px++) {
                 uint8_t exp = zcrudp_leaky_integrator_step((uint8_t)px, 0, 0, (uint8_t)g, (uint8_t)n);
                 assert(buf[px] == exp);
@@ -392,7 +393,7 @@ static void prove_divfree_unpack_exhaustive(void) {
         for (uint32_t k = 0; k < 16U; k++) {
             toks[k] = (uint16_t)((base + k < 59049U) ? (base + k) : 0U);
         }
-        zcrudp_ternary_unpack10_x16_avx2(toks, out);
+        zcrudp_zcvid_unpack10_x16_avx2(toks, out);
         for (uint32_t k = 0; k < 16U; k++) {
             zcrudp_trit_t exp[10];
             zcrudp_unpack_10trits(toks[k], exp);
@@ -420,14 +421,14 @@ static void prove_rans_and_fused_decode_parity(void) {
     assert(src && ref_t && ref_r && can_t && can_r && can_f &&
            ed_t && ed_r && dd_t && dd_r && dd_f && st.pkts && st.lens && sr.pkts && sr.lens);
 
-    zcrudp_ternary_config_t cfg_t = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg_t = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 248, .neutral_y = 128, .mtu_payload = 1380,
         .entropy = 0U
     };
-    zcrudp_ternary_config_t cfg_r = cfg_t;
-    cfg_r.entropy = ZCRUDP_TERNARY_EC_RANS;
+    zcrudp_zcvid_config_t cfg_r = cfg_t;
+    cfg_r.entropy = ZCRUDP_ZCVID_EC_RANS;
 
     memset(ref_t, 128, len); memset(ref_r, 128, len);
     memset(can_t, 128, len); memset(can_r, 128, len); memset(can_f, 128, len);
@@ -447,20 +448,20 @@ static void prove_rans_and_fused_decode_parity(void) {
             }
         }
         st.count = 0; sr.count = 0;
-        tok_bytes  += zcrudp_ternary_encode_plane(src, ref_t, ed_t, len, 0, (uint16_t)f, &cfg_t, pkt_buf, proof_cb, &st);
-        rans_bytes += zcrudp_ternary_encode_plane(src, ref_r, ed_r, len, 0, (uint16_t)f, &cfg_r, pkt_buf, proof_cb, &sr);
+        tok_bytes  += zcrudp_zcvid_encode_plane(src, ref_t, ed_t, len, 0, (uint16_t)f, &cfg_t, pkt_buf, proof_cb, &st);
+        rans_bytes += zcrudp_zcvid_encode_plane(src, ref_r, ed_r, len, 0, (uint16_t)f, &cfg_r, pkt_buf, proof_cb, &sr);
 
-        zcrudp_ternary_decay_plane(can_t, len, cfg_t.gamma_q8, cfg_t.neutral_y);
+        zcrudp_zcvid_decay_plane(can_t, len, cfg_t.gamma_q8, cfg_t.neutral_y);
         for (size_t i = 0; i < st.count; i++) {
-            assert(zcrudp_ternary_decode_packet(st.pkts[i], st.lens[i], can_t, dd_t, len, &cfg_t, NULL));
+            assert(zcrudp_zcvid_decode_packet(st.pkts[i], st.lens[i], can_t, dd_t, len, &cfg_t, NULL));
         }
-        zcrudp_ternary_decay_plane(can_r, len, cfg_r.gamma_q8, cfg_r.neutral_y);
+        zcrudp_zcvid_decay_plane(can_r, len, cfg_r.gamma_q8, cfg_r.neutral_y);
         for (size_t i = 0; i < sr.count; i++) {
-            assert(zcrudp_ternary_decode_packet(sr.pkts[i], sr.lens[i], can_r, dd_r, len, &cfg_r, NULL));
+            assert(zcrudp_zcvid_decode_packet(sr.pkts[i], sr.lens[i], can_r, dd_r, len, &cfg_r, NULL));
         }
         const uint8_t *ptrs[512];
         for (size_t i = 0; i < sr.count; i++) ptrs[i] = sr.pkts[i];
-        assert(zcrudp_ternary_decode_packets_fused(ptrs, sr.lens, sr.count, can_f, dd_f, len, &cfg_r));
+        assert(zcrudp_zcvid_decode_packets_fused(ptrs, sr.lens, sr.count, can_f, dd_f, len, &cfg_r));
 
         assert(memcmp(ref_t, ref_r, len) == 0);
         assert(memcmp(can_t, can_r, len) == 0);
@@ -473,13 +474,13 @@ static void prove_rans_and_fused_decode_parity(void) {
     /* Hostile DELTA_RANS packet bounds check */
     uint8_t bad[64];
     memset(bad, 0xFF, sizeof(bad));
-    zcrudp_ternary_pkt_hdr_t bh = {
-        .magic = ZCRUDP_TERNARY_PKT_MAGIC,
-        .pixfmt = ZCRUDP_TERNARY_MAKE_PF(ZCRUDP_TERNARY_FMT_GRAY8, ZCRUDP_TERNARY_PKT_DELTA_RANS),
+    zcrudp_zcvid_pkt_hdr_t bh = {
+        .magic = ZCRUDP_ZCVID_PKT_MAGIC,
+        .pixfmt = ZCRUDP_ZCVID_MAKE_PF(ZCRUDP_ZCVID_FMT_GRAY8, ZCRUDP_ZCVID_PKT_DELTA_RANS),
         .plane = 0, .frame_id = 0, .start_block = 0, .num_tokens = 10
     };
-    zcrudp_ternary_pkt_hdr_write_le(bad, &bh);
-    assert(!zcrudp_ternary_decode_packet(bad, sizeof(bad), can_f, dd_f, len, &cfg_r, NULL));
+    zcrudp_zcvid_pkt_hdr_write_le(bad, &bh);
+    assert(!zcrudp_zcvid_decode_packet(bad, sizeof(bad), can_f, dd_f, len, &cfg_r, NULL));
 
     free(src); free(ref_t); free(ref_r); free(can_t); free(can_r); free(can_f);
     free(ed_t); free(ed_r); free(dd_t); free(dd_r); free(dd_f);
@@ -504,13 +505,13 @@ static void prove_jnd_edge_protection_and_savings(void) {
     assert(src && ref0 && can0 && refj && canj && ed0 && dd0 && edj && ddj &&
            s0.pkts && s0.lens && sj.pkts && sj.lens);
 
-    zcrudp_ternary_config_t cfg0 = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg0 = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 2, .delta_max = 32, .threshold = 2,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .jnd_boost = 0U
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .jnd_boost = 0U
     };
-    zcrudp_ternary_config_t cfgj = cfg0;
+    zcrudp_zcvid_config_t cfgj = cfg0;
     cfgj.jnd_boost = 6U;
 
     memset(ref0, 128, len); memset(can0, 128, len);
@@ -540,20 +541,20 @@ static void prove_jnd_edge_protection_and_savings(void) {
         }
         s0.count = 0; sj.count = 0;
         if (f == 0) {
-            zcrudp_ternary_encode_intra_range(src, ref0, ed0, 0, len, len, 0, 0, &cfg0, pkt_buf, proof_cb, &s0);
-            zcrudp_ternary_encode_intra_range(src, refj, edj, 0, len, len, 0, 0, &cfgj, pkt_buf, proof_cb, &sj);
+            zcrudp_zcvid_encode_intra_range(src, ref0, ed0, 0, len, len, 0, 0, &cfg0, pkt_buf, proof_cb, &s0);
+            zcrudp_zcvid_encode_intra_range(src, refj, edj, 0, len, len, 0, 0, &cfgj, pkt_buf, proof_cb, &sj);
         } else {
-            bytes0 += zcrudp_ternary_encode_plane(src, ref0, ed0, len, 0, (uint16_t)f, &cfg0, pkt_buf, proof_cb, &s0);
-            bytesj += zcrudp_ternary_encode_plane(src, refj, edj, len, 0, (uint16_t)f, &cfgj, pkt_buf, proof_cb, &sj);
+            bytes0 += zcrudp_zcvid_encode_plane(src, ref0, ed0, len, 0, (uint16_t)f, &cfg0, pkt_buf, proof_cb, &s0);
+            bytesj += zcrudp_zcvid_encode_plane(src, refj, edj, len, 0, (uint16_t)f, &cfgj, pkt_buf, proof_cb, &sj);
         }
 
-        zcrudp_ternary_decay_plane(can0, len, cfg0.gamma_q8, cfg0.neutral_y);
+        zcrudp_zcvid_decay_plane(can0, len, cfg0.gamma_q8, cfg0.neutral_y);
         for (size_t i = 0; i < s0.count; i++) {
-            assert(zcrudp_ternary_decode_packet(s0.pkts[i], s0.lens[i], can0, dd0, len, &cfg0, NULL));
+            assert(zcrudp_zcvid_decode_packet(s0.pkts[i], s0.lens[i], can0, dd0, len, &cfg0, NULL));
         }
-        zcrudp_ternary_decay_plane(canj, len, cfgj.gamma_q8, cfgj.neutral_y);
+        zcrudp_zcvid_decay_plane(canj, len, cfgj.gamma_q8, cfgj.neutral_y);
         for (size_t i = 0; i < sj.count; i++) {
-            assert(zcrudp_ternary_decode_packet(sj.pkts[i], sj.lens[i], canj, ddj, len, &cfgj, NULL));
+            assert(zcrudp_zcvid_decode_packet(sj.pkts[i], sj.lens[i], canj, ddj, len, &cfgj, NULL));
         }
         assert(memcmp(ref0, can0, len) == 0);
         assert(memcmp(refj, canj, len) == 0);
@@ -594,11 +595,11 @@ static void prove_gilbert_elliott_burst_resilience(void) {
     proof_sink_t s = { malloc(512U * 1400U), malloc(512U * sizeof(size_t)), 0, 512 };
     assert(src && ref && can && ed && dd && s.pkts && s.lens);
 
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 240, .neutral_y = 128, .mtu_payload = 300,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 4
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 4
     };
 
     memset(ref, 128, len); memset(can, 128, len);
@@ -620,24 +621,24 @@ static void prove_gilbert_elliott_burst_resilience(void) {
         }
         s.count = 0;
         if (f == 0) {
-            zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg, pkt_buf, proof_cb, &s);
+            zcrudp_zcvid_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &cfg, pkt_buf, proof_cb, &s);
         } else {
-            zcrudp_ternary_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
+            zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
             size_t i0 = (size_t)(f % 16) * slice;
-            zcrudp_ternary_encode_intra_range(src, ref, ed, i0, i0 + slice, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
+            zcrudp_zcvid_encode_intra_range(src, ref, ed, i0, i0 + slice, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
         }
 
-        zcrudp_ternary_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
+        zcrudp_zcvid_decay_plane(can, len, cfg.gamma_q8, cfg.neutral_y);
         for (size_t i = 0; i < s.count; i++) {
-            zcrudp_ternary_pkt_hdr_t h;
-            assert(zcrudp_ternary_pkt_hdr_read_le(s.pkts[i], &h));
-            uint8_t pt = ZCRUDP_TERNARY_HDR_TYPE(&h);
+            zcrudp_zcvid_pkt_hdr_t h;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(s.pkts[i], &h));
+            uint8_t pt = ZCRUDP_ZCVID_HDR_TYPE(&h);
             bool drop = false;
             /* Only drop unreliable DELTA packets during frames 4..20 (burst window) */
             if (f >= 4 && f <= 20 &&
-                pt != ZCRUDP_TERNARY_PKT_INTRA &&
-                pt != ZCRUDP_TERNARY_PKT_INTRA_EC &&
-                pt != ZCRUDP_TERNARY_PKT_INTRA_Q_EC) {
+                pt != ZCRUDP_ZCVID_PKT_INTRA &&
+                pt != ZCRUDP_ZCVID_PKT_INTRA_EC &&
+                pt != ZCRUDP_ZCVID_PKT_INTRA_Q_EC) {
                 total_unrel++;
                 rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
                 uint32_t r = rng % 1000U;
@@ -651,7 +652,7 @@ static void prove_gilbert_elliott_burst_resilience(void) {
                 if (drop) dropped++;
             }
             if (!drop) {
-                assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+                assert(zcrudp_zcvid_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
             }
         }
         if (f == 39) {
@@ -687,14 +688,14 @@ static void prove_realloc_v2_exhaustive(void) {
     assert(src && ref_a && ref_b && can_a && can_b && ed_a && ed_b &&
            dd_a && dd_b && sa.pkts && sa.lens && sb.pkts && sb.lens);
 
-    zcrudp_ternary_config_t cfg_a = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg_a = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 250, .neutral_y = 128, .mtu_payload = 1380,
         .entropy = 0U
     };
-    zcrudp_ternary_config_t cfg_b = cfg_a;
-    cfg_b.entropy = ZCRUDP_TERNARY_EC_REALLOC_V2;
+    zcrudp_zcvid_config_t cfg_b = cfg_a;
+    cfg_b.entropy = ZCRUDP_ZCVID_EC_REALLOC_V2;
 
     memset(src, 128, len);
     memset(ref_a, 128, len); memset(ref_b, 128, len);
@@ -730,16 +731,16 @@ static void prove_realloc_v2_exhaustive(void) {
     }
 
     uint8_t pkt_buf[1400];
-    size_t bytes_a = zcrudp_ternary_encode_plane(src, ref_a, ed_a, len, 0, 1, &cfg_a, pkt_buf, proof_cb, &sa);
-    size_t bytes_b = zcrudp_ternary_encode_plane(src, ref_b, ed_b, len, 0, 1, &cfg_b, pkt_buf, proof_cb, &sb);
+    size_t bytes_a = zcrudp_zcvid_encode_plane(src, ref_a, ed_a, len, 0, 1, &cfg_a, pkt_buf, proof_cb, &sa);
+    size_t bytes_b = zcrudp_zcvid_encode_plane(src, ref_b, ed_b, len, 0, 1, &cfg_b, pkt_buf, proof_cb, &sb);
 
-    zcrudp_ternary_decay_plane(can_a, len, cfg_a.gamma_q8, cfg_a.neutral_y);
+    zcrudp_zcvid_decay_plane(can_a, len, cfg_a.gamma_q8, cfg_a.neutral_y);
     for (size_t i = 0; i < sa.count; i++) {
-        assert(zcrudp_ternary_decode_packet(sa.pkts[i], sa.lens[i], can_a, dd_a, len, &cfg_a, NULL));
+        assert(zcrudp_zcvid_decode_packet(sa.pkts[i], sa.lens[i], can_a, dd_a, len, &cfg_a, NULL));
     }
-    zcrudp_ternary_decay_plane(can_b, len, cfg_b.gamma_q8, cfg_b.neutral_y);
+    zcrudp_zcvid_decay_plane(can_b, len, cfg_b.gamma_q8, cfg_b.neutral_y);
     for (size_t i = 0; i < sb.count; i++) {
-        assert(zcrudp_ternary_decode_packet(sb.pkts[i], sb.lens[i], can_b, dd_b, len, &cfg_b, NULL));
+        assert(zcrudp_zcvid_decode_packet(sb.pkts[i], sb.lens[i], can_b, dd_b, len, &cfg_b, NULL));
     }
 
     assert(memcmp(ref_a, ref_b, len) == 0);
@@ -777,8 +778,8 @@ static void prove_tile_mv_dpcm_and_uv_sharing(void) {
             }
         }
     }
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380
     };
@@ -787,10 +788,10 @@ static void prove_tile_mv_dpcm_and_uv_sharing(void) {
     assert(sr.pkts && sr.lens && sd.pkts && sd.lens);
     uint8_t pkt_buf[1400];
 
-    size_t raw_b = zcrudp_ternary_encode_tile_mv_pkts(mvs, num_tiles, 0, 1, &cfg, pkt_buf, proof_cb, &sr);
-    size_t dpcm_b = zcrudp_ternary_encode_tile_mv_dpcm(mvs, num_tiles, tx, 0, 1, &cfg, pkt_buf, proof_cb, &sd);
+    size_t raw_b = zcrudp_zcvid_encode_tile_mv_pkts(mvs, num_tiles, 0, 1, &cfg, pkt_buf, proof_cb, &sr);
+    size_t dpcm_b = zcrudp_zcvid_encode_tile_mv_dpcm(mvs, num_tiles, tx, 0, 1, &cfg, pkt_buf, proof_cb, &sd);
     for (size_t i = 0; i < sd.count; i++) {
-        assert(zcrudp_ternary_decode_tile_mv_dpcm(sd.pkts[i], sd.lens[i], tx, dec_mvs, num_tiles));
+        assert(zcrudp_zcvid_decode_tile_mv_dpcm(sd.pkts[i], sd.lens[i], tx, dec_mvs, num_tiles));
     }
     assert(memcmp(mvs, dec_mvs, num_tiles * 2U) == 0);
     assert(dpcm_b < raw_b);
@@ -803,7 +804,7 @@ static void prove_tile_mv_dpcm_and_uv_sharing(void) {
         uv_prev[i + 0U] = 60U;
         uv_prev[i + 1U] = 200U;
     }
-    zcrudp_ternary_apply_tile_mv_nv12_state(uv_prev, uv_mc, NULL, NULL, W, H, TILE, dec_mvs);
+    zcrudp_zcvid_apply_tile_mv_nv12_state(uv_prev, uv_mc, NULL, NULL, W, H, TILE, dec_mvs);
     for (size_t i = 0; i < uv_sz; i += 2U) {
         assert(uv_mc[i + 0U] == 60U && uv_mc[i + 1U] == 200U);
     }
@@ -827,31 +828,31 @@ static void prove_mt_parallel_intra(void) {
     assert(src && ref && can && ed && dd && slice_pkts && slice_lens);
 
     for (size_t i = 0; i < len; i++) src[i] = (uint8_t)((i * 7U + 33U) & 0xFFU);
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 254, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_ALL, .intra_qstep = 4
+        .entropy = ZCRUDP_ZCVID_EC_ALL, .intra_qstep = 4
     };
     memset(ref, 128, len); memset(can, 128, len);
     memset(ed, cfg.delta_min, len); memset(dd, cfg.delta_min, len);
 
-    zcrudp_ternary_mt_pool_t pool;
-    zcrudp_ternary_mt_init(&pool, 4U, slice_pkts, slice_lens, 64U, 1400U);
+    zcrudp_zcvid_mt_pool_t pool;
+    zcrudp_zcvid_mt_init(&pool, 4U, slice_pkts, slice_lens, 64U, 1400U);
     size_t total_pkts = 0U;
-    size_t bytes = zcrudp_ternary_mt_encode_intra_range(&pool, src, ref, ed, 0U, len, len, 0, 0, &cfg, &total_pkts);
+    size_t bytes = zcrudp_zcvid_mt_encode_intra_range(&pool, src, ref, ed, 0U, len, len, 0, 0, &cfg, &total_pkts);
     assert(bytes > 0U && total_pkts >= 4U);
 
     for (uint32_t t = 0; t < pool.num_threads; t++) {
         for (size_t k = 0; k < pool.workers[t].sink.count; k++) {
             const uint8_t *pd = pool.workers[t].sink.pkts_base + k * pool.workers[t].sink.mtu_stride;
-            assert(zcrudp_ternary_decode_packet(pd, pool.workers[t].sink.lens_base[k], can, dd, len, &cfg, NULL));
+            assert(zcrudp_zcvid_decode_packet(pd, pool.workers[t].sink.lens_base[k], can, dd, len, &cfg, NULL));
         }
     }
     assert(memcmp(ref, can, len) == 0);
     assert(memcmp(ed, dd, len) == 0);
 
-    zcrudp_ternary_mt_destroy(&pool);
+    zcrudp_zcvid_mt_destroy(&pool);
     free(src); free(ref); free(can); free(ed); free(dd); free(slice_pkts); free(slice_lens);
     printf("PROVEN (%zu pkts, %zu B, 0 px differ)\n", total_pkts, bytes);
 }
@@ -869,8 +870,8 @@ static void prove_no_decay_and_safety_guards(void) {
     proof_sink_t s = { malloc(128U * 1400U), malloc(128U * sizeof(size_t)), 0, 128 };
     assert(src && ref && can && can_f && ed && dd && dd_f && s.pkts && s.lens);
 
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
         .delta_min = 2, .delta_max = 32, .threshold = 2,
         .gamma_q8 = 200, .neutral_y = 128, .mtu_payload = 1380,
         .entropy = 0U, .no_decay = 1U
@@ -887,14 +888,14 @@ static void prove_no_decay_and_safety_guards(void) {
             }
         }
         s.count = 0;
-        zcrudp_ternary_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
-        zcrudp_ternary_decay_plane_cfg(can, len, &cfg);
+        zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, (uint16_t)f, &cfg, pkt_buf, proof_cb, &s);
+        zcrudp_zcvid_decay_plane_cfg(can, len, &cfg);
         for (size_t i = 0; i < s.count; i++) {
-            assert(zcrudp_ternary_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
+            assert(zcrudp_zcvid_decode_packet(s.pkts[i], s.lens[i], can, dd, len, &cfg, NULL));
         }
         const uint8_t *ptrs[128];
         for (size_t i = 0; i < s.count; i++) ptrs[i] = s.pkts[i];
-        assert(zcrudp_ternary_decode_packets_fused(ptrs, s.lens, s.count, can_f, dd_f, len, &cfg));
+        assert(zcrudp_zcvid_decode_packets_fused(ptrs, s.lens, s.count, can_f, dd_f, len, &cfg));
         assert(memcmp(ref, can, len) == 0);
         assert(memcmp(ref, can_f, len) == 0);
         assert(memcmp(ed, dd, len) == 0);
@@ -911,19 +912,19 @@ static void prove_no_decay_and_safety_guards(void) {
     int8_t omvs[2 * 3 * 2] = { 3, 2, -5, 4, 1, -2, 0, 0, 7, 3, -3, -1 };
     assert(uv_p && uv_m);
     memset(uv_p, 128, ouv_sz);
-    zcrudp_ternary_apply_tile_mv_nv12_state(uv_p, uv_m, NULL, NULL, OW, OH, OTILE, omvs);
+    zcrudp_zcvid_apply_tile_mv_nv12_state(uv_p, uv_m, NULL, NULL, OW, OH, OTILE, omvs);
     free(uv_p); free(uv_m);
 
     /* Guard small mtu_payload (<= 13) in all packet emitters */
     uint8_t tiny_pkt[16];
     for (uint16_t mtu = 0; mtu <= 13U; mtu++) {
-        zcrudp_ternary_config_t tcfg = cfg;
+        zcrudp_zcvid_config_t tcfg = cfg;
         tcfg.mtu_payload = mtu;
         s.count = 0;
-        assert(zcrudp_ternary_encode_plane(src, ref, ed, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
-        assert(zcrudp_ternary_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
-        assert(zcrudp_ternary_encode_tile_mv_pkts(omvs, 6, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
-        assert(zcrudp_ternary_encode_tile_mv_dpcm(omvs, 6, 3, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_zcvid_encode_plane(src, ref, ed, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_zcvid_encode_intra_range(src, ref, ed, 0, len, len, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_zcvid_encode_tile_mv_pkts(omvs, 6, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
+        assert(zcrudp_zcvid_encode_tile_mv_dpcm(omvs, 6, 3, 0, 0, &tcfg, tiny_pkt, proof_cb, &s) == 0U);
         assert(s.count == 0U);
     }
 
@@ -941,9 +942,9 @@ static void prove_jnd_mt_and_nv12(void) {
     uint8_t ui_line[32];
     memset(ui_line, 20, sizeof(ui_line));
     ui_line[14] = 240; /* 1px vertical thin line */
-    assert(zcrudp_ternary_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
+    assert(zcrudp_zcvid_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
     ui_line[15] = 240; /* 2px vertical thin line */
-    assert(zcrudp_ternary_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
+    assert(zcrudp_zcvid_block_jnd_threshold(ui_line, 10, sizeof(ui_line), 32, 1, 2, 8) == 2U);
 
     /* 2. Verify MT JND on NV12 (Y + interleaved UV plane 1) matches sequential bit-for-bit */
     const uint16_t W = 320, H = 160;
@@ -965,39 +966,39 @@ static void prove_jnd_mt_and_nv12(void) {
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
         src[i] = (uint8_t)(90U + (rng % 80U));
     }
-    zcrudp_ternary_config_t cfg = {
-        .width = W, .height = H, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+    zcrudp_zcvid_config_t cfg = {
+        .width = W, .height = H, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
         .delta_min = 3, .delta_max = 32, .threshold = 3,
         .gamma_q8 = 250, .neutral_y = 128, .mtu_payload = 1380,
-        .entropy = ZCRUDP_TERNARY_EC_RANS, .jnd_boost = 6U
+        .entropy = ZCRUDP_ZCVID_EC_RANS, .jnd_boost = 6U
     };
     memset(ref_s, 128, y_sz + uv_sz); memset(ref_m, 128, y_sz + uv_sz);
     memset(can_s, 128, y_sz + uv_sz); memset(can_m, 128, y_sz + uv_sz);
     memset(ed_s, cfg.delta_min, y_sz + uv_sz); memset(ed_m, cfg.delta_min, y_sz + uv_sz);
     memset(dd_s, cfg.delta_min, y_sz + uv_sz); memset(dd_m, cfg.delta_min, y_sz + uv_sz);
 
-    zcrudp_ternary_mt_pool_t pool;
-    zcrudp_ternary_mt_init(&pool, 4U, slice_pkts, slice_lens, 64U, 1400U);
+    zcrudp_zcvid_mt_pool_t pool;
+    zcrudp_zcvid_mt_init(&pool, 4U, slice_pkts, slice_lens, 64U, 1400U);
 
     uint8_t pkt_buf[1400];
     for (uint8_t pl = 0; pl < 2U; pl++) {
         size_t off = (pl == 0U) ? 0U : y_sz;
         size_t plen = (pl == 0U) ? y_sz : uv_sz;
         ss.count = 0;
-        zcrudp_ternary_encode_plane(src + off, ref_s + off, ed_s + off, plen, pl, 1, &cfg, pkt_buf, proof_cb, &ss);
-        zcrudp_ternary_decay_plane_cfg(can_s + off, plen, &cfg);
+        zcrudp_zcvid_encode_plane(src + off, ref_s + off, ed_s + off, plen, pl, 1, &cfg, pkt_buf, proof_cb, &ss);
+        zcrudp_zcvid_decay_plane_cfg(can_s + off, plen, &cfg);
         for (size_t i = 0; i < ss.count; i++) {
-            assert(zcrudp_ternary_decode_packet(ss.pkts[i], ss.lens[i], can_s + off, dd_s + off, plen, &cfg, NULL));
+            assert(zcrudp_zcvid_decode_packet(ss.pkts[i], ss.lens[i], can_s + off, dd_s + off, plen, &cfg, NULL));
         }
 
         size_t mpkts = 0U;
-        zcrudp_ternary_mt_encode_plane(&pool, src + off, ref_m + off, ed_m + off, plen, pl, 1, &cfg, &mpkts);
-        assert(zcrudp_ternary_mt_dropped_pkts(&pool) == 0U);
-        zcrudp_ternary_mt_decay_plane(&pool, can_m + off, plen, &cfg);
+        zcrudp_zcvid_mt_encode_plane(&pool, src + off, ref_m + off, ed_m + off, plen, pl, 1, &cfg, &mpkts);
+        assert(zcrudp_zcvid_mt_dropped_pkts(&pool) == 0U);
+        zcrudp_zcvid_mt_decay_plane(&pool, can_m + off, plen, &cfg);
         for (uint32_t t = 0; t < pool.num_threads; t++) {
             for (size_t k = 0; k < pool.workers[t].sink.count; k++) {
                 const uint8_t *pd = pool.workers[t].sink.pkts_base + k * pool.workers[t].sink.mtu_stride;
-                assert(zcrudp_ternary_decode_packet(pd, pool.workers[t].sink.lens_base[k],
+                assert(zcrudp_zcvid_decode_packet(pd, pool.workers[t].sink.lens_base[k],
                                                     can_m + off, dd_m + off, plen, &cfg, NULL));
             }
         }
@@ -1007,18 +1008,18 @@ static void prove_jnd_mt_and_nv12(void) {
     }
 
     /* 3. Verify dropped_pkts is surfaced when max_pkts_per_thread is too small */
-    zcrudp_ternary_mt_pool_t tiny_pool;
-    zcrudp_ternary_mt_init(&tiny_pool, 2U, slice_pkts, slice_lens, 1U, 1400U);
-    zcrudp_ternary_config_t tok_cfg = cfg;
+    zcrudp_zcvid_mt_pool_t tiny_pool;
+    zcrudp_zcvid_mt_init(&tiny_pool, 2U, slice_pkts, slice_lens, 1U, 1400U);
+    zcrudp_zcvid_config_t tok_cfg = cfg;
     tok_cfg.entropy = 0U;
     tok_cfg.mtu_payload = 64U;
     memset(ref_m, 128, y_sz);
     size_t tpkts = 0U;
-    zcrudp_ternary_mt_encode_plane(&tiny_pool, src, ref_m, ed_m, y_sz, 0, 2, &tok_cfg, &tpkts);
-    assert(zcrudp_ternary_mt_dropped_pkts(&tiny_pool) > 0U);
-    zcrudp_ternary_mt_destroy(&tiny_pool);
+    zcrudp_zcvid_mt_encode_plane(&tiny_pool, src, ref_m, ed_m, y_sz, 0, 2, &tok_cfg, &tpkts);
+    assert(zcrudp_zcvid_mt_dropped_pkts(&tiny_pool) > 0U);
+    zcrudp_zcvid_mt_destroy(&tiny_pool);
 
-    zcrudp_ternary_mt_destroy(&pool);
+    zcrudp_zcvid_mt_destroy(&pool);
     free(src); free(ref_s); free(ref_m); free(can_s); free(can_m);
     free(ed_s); free(ed_m); free(dd_s); free(dd_m);
     free(slice_pkts); free(slice_lens); free(ss.pkts); free(ss.lens);
@@ -1029,7 +1030,7 @@ typedef struct {
     uint8_t *canvas;
     uint8_t *delta;
     size_t len;
-    const zcrudp_ternary_config_t *cfg;
+    const zcrudp_zcvid_config_t *cfg;
     size_t pkts;
     size_t bad;
 } rans_fuzz_ctx_t;
@@ -1038,7 +1039,7 @@ static void rans_fuzz_cb(const uint8_t *pkt, size_t len, void *ctx) {
     rans_fuzz_ctx_t *f = (rans_fuzz_ctx_t *)ctx;
     f->pkts++;
     if (len > f->cfg->mtu_payload ||
-        !zcrudp_ternary_decode_packet(pkt, len, f->canvas, f->delta, f->len, f->cfg, NULL)) {
+        !zcrudp_zcvid_decode_packet(pkt, len, f->canvas, f->delta, f->len, f->cfg, NULL)) {
         f->bad++;
     }
 }
@@ -1081,17 +1082,17 @@ static void prove_rans_fuzz_and_edge_fixes(void) {
                 }
             }
         }
-        zcrudp_ternary_config_t cfg = {
-            .width = 160, .height = 100, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        zcrudp_zcvid_config_t cfg = {
+            .width = 160, .height = 100, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
             .delta_min = 2, .delta_max = (run & 1) ? 32 : 2, .threshold = 2,
             .gamma_q8 = 250, .neutral_y = 128, .mtu_payload = mtu,
-            .entropy = ZCRUDP_TERNARY_EC_RANS, .no_decay = (uint8_t)((run >> 1) & 1)
+            .entropy = ZCRUDP_ZCVID_EC_RANS, .no_decay = (uint8_t)((run >> 1) & 1)
         };
         memset(ed, cfg.delta_min, plen);
         memset(dd, cfg.delta_min, plen);
-        zcrudp_ternary_decay_plane_cfg(can, plen, &cfg);
+        zcrudp_zcvid_decay_plane_cfg(can, plen, &cfg);
         rans_fuzz_ctx_t fctx = { can, (cfg.delta_max > cfg.delta_min) ? dd : NULL, plen, &cfg, 0, 0 };
-        zcrudp_ternary_encode_plane(src, ref, (cfg.delta_max > cfg.delta_min) ? ed : NULL,
+        zcrudp_zcvid_encode_plane(src, ref, (cfg.delta_max > cfg.delta_min) ? ed : NULL,
                                     plen, 0, (uint16_t)run, &cfg, pkt_buf, rans_fuzz_cb, &fctx);
         assert(fctx.bad == 0U);
         assert(memcmp(ref, can, plen) == 0);
@@ -1106,15 +1107,15 @@ static void prove_rans_fuzz_and_edge_fixes(void) {
         int8_t dec[12] = { 0 };
         proof_sink_t sm = { malloc(32U * 1400U), malloc(32U * sizeof(size_t)), 0, 32 };
         assert(sm.pkts && sm.lens);
-        zcrudp_ternary_config_t mcfg = {
-            .width = 192, .height = 64, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        zcrudp_zcvid_config_t mcfg = {
+            .width = 192, .height = 64, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
             .delta_min = 2, .delta_max = 2, .threshold = 2,
             .gamma_q8 = 255, .neutral_y = 128, .mtu_payload = 14
         };
-        size_t mb = zcrudp_ternary_encode_tile_mv_dpcm(mvs, 6, 3, 0, 1, &mcfg, pkt_buf, proof_cb, &sm);
+        size_t mb = zcrudp_zcvid_encode_tile_mv_dpcm(mvs, 6, 3, 0, 1, &mcfg, pkt_buf, proof_cb, &sm);
         assert(mb > 0U && sm.count > 0U);
         for (size_t i = 0; i < sm.count; i++) {
-            assert(zcrudp_ternary_decode_tile_mv_dpcm(sm.pkts[i], sm.lens[i], 3, dec, 6));
+            assert(zcrudp_zcvid_decode_tile_mv_dpcm(sm.pkts[i], sm.lens[i], 3, dec, 6));
         }
         assert(memcmp(mvs, dec, sizeof(mvs)) == 0);
         free(sm.pkts); free(sm.lens);
@@ -1122,8 +1123,8 @@ static void prove_rans_fuzz_and_edge_fixes(void) {
 
     /* NV12 RC chroma threshold saturation (threshold = 254 must not wrap to 0) */
     {
-        zcrudp_ternary_config_t rcfg = {
-            .width = 64, .height = 64, .pixfmt = ZCRUDP_TERNARY_FMT_NV12,
+        zcrudp_zcvid_config_t rcfg = {
+            .width = 64, .height = 64, .pixfmt = ZCRUDP_ZCVID_FMT_NV12,
             .delta_min = 2, .delta_max = 2, .threshold = 254,
             .gamma_q8 = 255, .neutral_y = 128, .mtu_payload = 1380, .no_decay = 1
         };
@@ -1135,11 +1136,11 @@ static void prove_rans_fuzz_and_edge_fixes(void) {
         memset(src + y_sz, 138, uv_sz);
         proof_sink_t sr = { malloc(32U * 1400U), malloc(32U * sizeof(size_t)), 0, 32 };
         assert(sr.pkts && sr.lens);
-        zcrudp_ternary_encode_nv12_rc(src, ref, NULL, 0, 1U, 0U, &rcfg, pkt_buf, proof_cb, &sr);
+        zcrudp_zcvid_encode_nv12_rc(src, ref, NULL, 0, 1U, 0U, &rcfg, pkt_buf, proof_cb, &sr);
         /* With saturated threshold 255, UV delta of 10 must produce zero UV packets */
         for (size_t i = 0; i < sr.count; i++) {
-            zcrudp_ternary_pkt_hdr_t h;
-            assert(zcrudp_ternary_pkt_hdr_read_le(sr.pkts[i], &h));
+            zcrudp_zcvid_pkt_hdr_t h;
+            assert(zcrudp_zcvid_pkt_hdr_read_le(sr.pkts[i], &h));
             assert(h.plane == 0U);
         }
         free(sr.pkts); free(sr.lens);
@@ -1157,14 +1158,14 @@ static void prove_pdq_optimal_and_fast_skip_parity(void) {
 
     /* Counterexample from pre-decay bug: x=203, y=210, gamma=240, y0=128, thr=3, d=8 */
     {
-        zcrudp_ternary_config_t cfg = {
-            .width = 16, .height = 1, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        zcrudp_zcvid_config_t cfg = {
+            .width = 16, .height = 1, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
             .delta_min = 4, .delta_max = 32, .threshold = 3,
             .gamma_q8 = 240, .neutral_y = 128, .mtu_payload = 1380
         };
         uint8_t ref = 210;
         bool shrink = false;
-        zcrudp_trit_t t = zcrudp_ternary_encode_sample(203, &ref, 8, true, &cfg, &shrink);
+        zcrudp_trit_t t = zcrudp_zcvid_encode_sample(203, &ref, 8, true, &cfg, &shrink);
         assert(t == 0);
         assert(ref == 204); /* |203 - 204| = 1 instead of pre-decay's 196 (err=7) */
         assert(!shrink);
@@ -1194,8 +1195,8 @@ static void prove_pdq_optimal_and_fast_skip_parity(void) {
 
     uint32_t rng = 0x13579BDFU;
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
-        zcrudp_ternary_config_t cfg = {
-            .width = (uint16_t)W, .height = (uint16_t)H, .pixfmt = ZCRUDP_TERNARY_FMT_GRAY8,
+        zcrudp_zcvid_config_t cfg = {
+            .width = (uint16_t)W, .height = (uint16_t)H, .pixfmt = ZCRUDP_ZCVID_FMT_GRAY8,
             .delta_min = 3, .delta_max = 32, .threshold = cases[ci].threshold,
             .gamma_q8 = cases[ci].gamma_q8, .neutral_y = cases[ci].neutral_y,
             .mtu_payload = 1380, .jnd_boost = cases[ci].jnd_boost,
@@ -1222,15 +1223,15 @@ static void prove_pdq_optimal_and_fast_skip_parity(void) {
         /* Pure scalar reference over all 10-px blocks */
         for (size_t blk = 0; blk < len / 10U; blk++) {
             size_t base = blk * 10U;
-            zcrudp_ternary_config_t bcfg = cfg;
+            zcrudp_zcvid_config_t bcfg = cfg;
             if (cfg.jnd_boost > 0U) {
-                bcfg.threshold = zcrudp_ternary_block_jnd_threshold(
+                bcfg.threshold = zcrudp_zcvid_block_jnd_threshold(
                     src, base, len, cfg.width, 1U, cfg.threshold, cfg.jnd_boost);
             }
             zcrudp_trit_t trits[10] = { 0 };
             bool coded = false;
             for (size_t j = 0; j < 10U; j++) {
-                trits[j] = zcrudp_ternary_encode_sample(
+                trits[j] = zcrudp_zcvid_encode_sample(
                     src[base + j], &ref_s[base + j], ed_s[base + j], true, &bcfg, &coded);
                 if (trits[j] != 0) coded = true;
             }
@@ -1244,11 +1245,11 @@ static void prove_pdq_optimal_and_fast_skip_parity(void) {
 
         proof_sink_t sink = { malloc(64U * 1400U), malloc(64U * sizeof(size_t)), 0, 64 };
         assert(sink.pkts && sink.lens);
-        zcrudp_ternary_encode_plane(src, ref_v, ed_v, len, 0, (uint16_t)ci, &cfg,
+        zcrudp_zcvid_encode_plane(src, ref_v, ed_v, len, 0, (uint16_t)ci, &cfg,
                                     pkt_buf, proof_cb, &sink);
-        zcrudp_ternary_decay_plane_cfg(can_v, len, &cfg);
+        zcrudp_zcvid_decay_plane_cfg(can_v, len, &cfg);
         for (size_t p = 0; p < sink.count; p++) {
-            assert(zcrudp_ternary_decode_packet(sink.pkts[p], sink.lens[p],
+            assert(zcrudp_zcvid_decode_packet(sink.pkts[p], sink.lens[p],
                                                 can_v, dd_v, len, &cfg, NULL));
         }
         assert(memcmp(ref_v, ref_s, len) == 0);
@@ -1262,8 +1263,105 @@ static void prove_pdq_optimal_and_fast_skip_parity(void) {
     printf("PROVEN (counterexample optimal, 6/6 fast-skip configs bit-exact)\n");
 }
 
+/*
+ * Proof 18: Portable C11 GPU-bitstream CPU decoder (zcvid_gpu_cpu_dec.h).
+ * Verifies:
+ *  - 4-px 6-bit intra decodes pure black (Y=0, Cb=32<<2=128, Cr=32<<2=128)
+ *    to exact RGB (0, 0, 0) with zero violet tint.
+ *  - 2-px 4:2:2 8-bit intra, 1x and 2x zcvid delta records, quarter-pel
+ *    motion compensation, and 4x4 H.264 integer transform intra/inter.
+ */
+static void prove_portable_gpu_cpu_decoder(void) {
+    printf("[PROOF 18] Portable C11 GPU-Bitstream CPU Decoder (black/delta/MC/4x4)... ");
+    const uint32_t W = 64u, H = 32u;
+    zcvid_gpu_dec_state_t dec;
+    assert(zcvid_gpu_dec_init(&dec, W, H) == 0);
+    zcvid_gpu_dec_reset(&dec, 128u, 4u);
+
+    zcvid_gpu_dec_params_t p = {
+        .width = W, .height = H,
+        .delta_min = 4u, .delta_max = 32u,
+        .gamma_q8 = 256u, .neutral_y = 128u,
+        .mv_qpel = 1u, .post_thr = 0u
+    };
+
+    /* Frame 1: 4-px 6-bit intra pure black (y=0, cb_q6=32, cr_q6=32) at idx=0,
+     * 2-px 8-bit intra at idx=10, and 4x4 transform intra DC at block 1 (x=4,y=0). */
+    uint32_t recs[10];
+    uint32_t nwords = 0;
+
+    /* 4-px 6-bit intra at idx=0: cr_q6=32, cb_q6=32, y0..y3=0 */
+    recs[nwords++] = (3u << 30) | (1u << 29) | (32u << 22) | (0u >> 1);
+    recs[nwords++] = (32u << 24);
+    /* 2-px 8-bit intra at idx=10: y0=200, cb=128, y1=100, cr=128 */
+    recs[nwords++] = (3u << 30) | 10u;
+    recs[nwords++] = 200u | (128u << 8) | (100u << 16) | (128u << 24);
+    /* 4x4 transform intra at block 1 (x=4..7, y=0..3), Y DC level=16, qp=12:
+     * dequant = 16 * 10 << 2 = 640; TqInverse DC -> (640 + 32) >> 6 = 10; 128 + 10 = 138 */
+    uint32_t b1_pid = 1u * 48u + 0u;
+    recs[nwords++] = (3u << 30) | (1u << 29) | (1u << 28) | b1_pid;
+    recs[nwords++] = (16u & 0xFFFFu) | (12u << 16) | (0u << 24);
+
+    assert(zcvid_gpu_dec_decode_frame(&dec, &p, NULL, recs, nwords) == 0);
+
+    uint8_t *rgba = (uint8_t *)malloc((size_t)W * H * 4u);
+    assert(rgba != NULL);
+    zcvid_gpu_dec_to_rgba(&dec, &p, rgba);
+
+    /* Pure black must be exact (0, 0, 0, 255) — no violet tint! */
+    for (uint32_t i = 0; i < 4u; ++i) {
+        assert((dec.prev_yuvd[i] & 0xFFu) == 0u);
+        assert(((dec.prev_yuvd[i] >> 8) & 0xFFu) == 128u);
+        assert(((dec.prev_yuvd[i] >> 16) & 0xFFu) == 128u);
+        assert(rgba[i * 4u + 0u] == 0u && rgba[i * 4u + 1u] == 0u &&
+               rgba[i * 4u + 2u] == 0u && rgba[i * 4u + 3u] == 255u);
+    }
+    /* 2-px 8-bit intra */
+    assert((dec.prev_yuvd[10] & 0xFFu) == 200u);
+    assert((dec.prev_yuvd[11] & 0xFFu) == 100u);
+    /* 4x4 transform intra block 1 */
+    assert((dec.prev_yuvd[4] & 0xFFu) == 138u);
+    assert((dec.prev_yuvd[3u * W + 7u] & 0xFFu) == 138u);
+
+    /* Frame 2: quarter-pel MV (+4, 0) = +1 px right shift + 1x luma delta +1 on px 0.
+     * Block 0 has 10 trits: trit[0] = +1 (code 2), trits[1..9] = 0 (code 1):
+     * w1 = 2 + 1*3 + 1*9 + 1*27 + 1*81 + 243*(1 + 3 + 9 + 27 + 81) = 29525.
+     * Also verify 8x8 transform intra (pred=2) at superblock (bx=4, by=0 -> x=16..23, y=0..7)
+     * with Y DC level=16, qp=12 -> 128 + 10 = 138 across all 8x8 pixels. */
+    zcvid_mv_t mvs[2] = { { 4, 0 }, { 0, 0 } };
+    uint32_t b4_pid = 4u * 48u + 0u;
+    uint32_t recs2[4] = {
+        (0u << 30) | 0u, 29525u,
+        (3u << 30) | (1u << 29) | (1u << 28) | b4_pid,
+        (16u & 0xFFFFu) | (12u << 16) | (2u << 24)
+    };
+    assert(zcvid_gpu_dec_decode_frame(&dec, &p, mvs, recs2, 4u) == 0);
+    /* px 0 shifted from px max(0, 0-1)=0 (Y=0, d=4) + trit(+1)*4 = 4, d_next=8 */
+    assert((dec.prev_yuvd[0] & 0xFFu) == 4u);
+    assert(((dec.prev_yuvd[0] >> 24) & 0xFFu) == 8u);
+    /* px 11 shifted from px 10 (Y=200) */
+    assert((dec.prev_yuvd[11] & 0xFFu) == 200u);
+    /* 8x8 intra (pred=2) superblock covers x=16..23, y=0..7 */
+    assert((dec.prev_yuvd[0u * W + 16u] & 0xFFu) == 138u);
+    assert((dec.prev_yuvd[7u * W + 23u] & 0xFFu) == 138u);
+
+    /* Frame 3: 8x8 transform inter (pred=3) on the same superblock (bx=4, by=0):
+     * add Y DC level=8, qp=12 -> dequant = 8*10<<2 = 320 -> (320+32)>>6 = +5 -> 138 + 5 = 143. */
+    uint32_t recs3[2] = {
+        (3u << 30) | (1u << 29) | (1u << 28) | b4_pid,
+        (8u & 0xFFFFu) | (12u << 16) | (3u << 24)
+    };
+    assert(zcvid_gpu_dec_decode_frame(&dec, &p, NULL, recs3, 2u) == 0);
+    assert((dec.prev_yuvd[0u * W + 16u] & 0xFFu) == 143u);
+    assert((dec.prev_yuvd[7u * W + 23u] & 0xFFu) == 143u);
+
+    free(rgba);
+    zcvid_gpu_dec_destroy(&dec);
+    printf("PROVEN (0 violet, exact MC/delta/4x4/8x8)\n");
+}
+
 int main(void) {
-    printf("=== zcrudp Ternary Formal & Exhaustive Proof Suite ===\n\n");
+    printf("=== zcrudp Zcvid Formal & Exhaustive Proof Suite ===\n\n");
     prove_quant_strict_descent();
     prove_intra_q_ec_domain_bound();
     prove_intra_q_ec_extreme_residual_parity();
@@ -1281,6 +1379,7 @@ int main(void) {
     prove_jnd_mt_and_nv12();
     prove_rans_fuzz_and_edge_fixes();
     prove_pdq_optimal_and_fast_skip_parity();
+    prove_portable_gpu_cpu_decoder();
     printf("\n=== ALL PROOFS VERIFIED ===\n");
     return 0;
 }
