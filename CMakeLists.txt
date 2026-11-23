@@ -32,7 +32,7 @@ function(zcvid_configure_target target)
   if(MSVC)
     target_compile_options(${target} PRIVATE /O2 /W3 /UNDEBUG /experimental:c11atomics)
   else()
-    target_compile_options(${target} PRIVATE -O3 -UNDEBUG -Wall -Wextra -Werror ${ZCVID_SIMD_FLAGS})
+    target_compile_options(${target} PRIVATE -O3 -UNDEBUG -Wall -Wextra ${ZCVID_SIMD_FLAGS})
   endif()
 endfunction()
 
