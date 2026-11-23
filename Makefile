@@ -51,18 +51,18 @@ sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_p
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_packing.c -o tests/test_zcvid_packing_san$(EXE)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_codec.c -o tests/test_zcvid_codec_san$(EXE) $(LDFLAGS)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_proofs.c -o tests/test_zcvid_proofs_san$(EXE) $(LDFLAGS)
-	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_packing_san$(EXE),./tests/test_zcvid_packing_san$(EXE)))
-	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_codec_san$(EXE),./tests/test_zcvid_codec_san$(EXE)))
-	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_proofs_san$(EXE),./tests/test_zcvid_proofs_san$(EXE)))
+	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_packing_san$(EXE),./tests/test_zcvid_packing_san$(EXE))
+	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_codec_san$(EXE),./tests/test_zcvid_codec_san$(EXE))
+	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_proofs_san$(EXE),./tests/test_zcvid_proofs_san$(EXE))
 
 # Token vs entropy-coded size on a real picture: make bench-image IMG=photo.pgm
 bench-image: tests/bench_image.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h
 	$(CC) $(CFLAGS) $< -o tests/bench_image$(EXE) $(LDFLAGS)
-	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/bench_image$(EXE),./tests/bench_image)) $(IMG)
+	$(if $(filter Windows_NT,$(OS)),tests\bench_image$(EXE),./tests/bench_image) $(IMG)
 
 # Latent factorization & hybrid RD benchmark
 bench-latent: $(TARGET_LATENT)
-	$(subst /,\,$(if $(filter Windows_NT,$(OS)),$(TARGET_LATENT),./$(TARGET_LATENT)))
+	$(if $(filter Windows_NT,$(OS)),$(subst /,\,$(TARGET_LATENT)),./$(TARGET_LATENT))
 
 $(TARGET_LATENT): tests/bench_latent_hybrid.c include/zcvid_latent_hybrid.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
