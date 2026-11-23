@@ -48,9 +48,9 @@ $(TARGET_PROOFS): tests/test_zcvid_proofs.c include/zcvid_codec.h include/zcvid_
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_proofs.c include/protocol_zcvid.h include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h
-	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude $(SIMD_FLAGS) -fsanitize=address,undefined tests/test_zcvid_packing.c -o tests/test_zcvid_packing_san$(EXE)
-	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude $(SIMD_FLAGS) -fsanitize=address,undefined tests/test_zcvid_codec.c -o tests/test_zcvid_codec_san$(EXE) $(LDFLAGS)
-	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude $(SIMD_FLAGS) -fsanitize=address,undefined tests/test_zcvid_proofs.c -o tests/test_zcvid_proofs_san$(EXE) $(LDFLAGS)
+	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_packing.c -o tests/test_zcvid_packing_san$(EXE)
+	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_codec.c -o tests/test_zcvid_codec_san$(EXE) $(LDFLAGS)
+	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_proofs.c -o tests/test_zcvid_proofs_san$(EXE) $(LDFLAGS)
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_packing_san$(EXE),./tests/test_zcvid_packing_san$(EXE)))
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_codec_san$(EXE),./tests/test_zcvid_codec_san$(EXE)))
 	$(subst /,\,$(if $(filter Windows_NT,$(OS)),tests/test_zcvid_proofs_san$(EXE),./tests/test_zcvid_proofs_san$(EXE)))

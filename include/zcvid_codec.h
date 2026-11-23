@@ -480,16 +480,16 @@ static inline void zcrudp_zcvid_unpack10_x16_avx2(const uint16_t toks[16],
     const __m256i t9 = _mm256_sub_epi16(hq4, v1);
 
     ZCRUDP_ALIGNAS32 int16_t rows[10][16];
-    _mm256_store_si256((__m256i *)rows[0], t0);
-    _mm256_store_si256((__m256i *)rows[1], t1);
-    _mm256_store_si256((__m256i *)rows[2], t2);
-    _mm256_store_si256((__m256i *)rows[3], t3);
-    _mm256_store_si256((__m256i *)rows[4], t4);
-    _mm256_store_si256((__m256i *)rows[5], t5);
-    _mm256_store_si256((__m256i *)rows[6], t6);
-    _mm256_store_si256((__m256i *)rows[7], t7);
-    _mm256_store_si256((__m256i *)rows[8], t8);
-    _mm256_store_si256((__m256i *)rows[9], t9);
+    _mm256_storeu_si256((__m256i *)rows[0], t0);
+    _mm256_storeu_si256((__m256i *)rows[1], t1);
+    _mm256_storeu_si256((__m256i *)rows[2], t2);
+    _mm256_storeu_si256((__m256i *)rows[3], t3);
+    _mm256_storeu_si256((__m256i *)rows[4], t4);
+    _mm256_storeu_si256((__m256i *)rows[5], t5);
+    _mm256_storeu_si256((__m256i *)rows[6], t6);
+    _mm256_storeu_si256((__m256i *)rows[7], t7);
+    _mm256_storeu_si256((__m256i *)rows[8], t8);
+    _mm256_storeu_si256((__m256i *)rows[9], t9);
 
     for (size_t k = 0; k < 16U; k++) {
         for (size_t j = 0; j < 10U; j++) {
