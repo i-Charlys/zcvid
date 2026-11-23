@@ -5,19 +5,52 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
+  makefile-and-sanitizers:
+    name: Linux Makefile & Sanitizers
+    runs-on: ubuntu-24.04
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Tests and benchmark (GCC, -O3 -mavx2)
-      run: make clean && make CC=gcc test
+      - name: Ensure Clang is installed
+        run: command -v clang >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends clang)
 
-    - name: Tests under ASan + UBSan (scalar path)
-      run: make clean && make CC=gcc sanitize
+      - name: Tests and benchmark (GCC, -O3 -mavx2)
+        run: make clean && make CC=gcc test
 
-    - name: Tests (Clang, -O3 -mavx2)
-      run: make clean && make CC=clang test
+      - name: Tests under ASan + UBSan
+        run: make clean && make CC=gcc sanitize
+
+      - name: Tests (Clang, -O3 -mavx2)
+        run: make clean && make CC=clang test
+
+  cmake-matrix:
+    name: CMake (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 (GCC)
+            os: ubuntu-24.04
+          - name: Linux ARM64 (GCC)
+            os: ubuntu-24.04-arm
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+          - name: Windows ARM64 (MSVC)
+            os: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZCVID_BUILD_BENCH=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
