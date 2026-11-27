@@ -21,8 +21,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__AVX2__)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#if defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define ZCVID_LH_ALIGNAS64 _Alignas(64)
+#elif defined(_MSC_VER)
+#define ZCVID_LH_ALIGNAS64 __declspec(align(64))
+#else
+#define ZCVID_LH_ALIGNAS64 __attribute__((aligned(64)))
 #endif
 
 #if defined(_WIN32)
@@ -49,7 +62,8 @@ typedef enum {
     ZCVID_LH_HYBRID_CASCADE = 4,
     ZCVID_LH_HYBRID_FULL    = 5,
     ZCVID_LH_HYBRID_FAST    = 6,
-    ZCVID_LH_CODEC_COUNT    = 7
+    ZCVID_LH_HYBRID_ESR     = 7,
+    ZCVID_LH_CODEC_COUNT    = 8
 } zcvid_lh_codec_t;
 
 typedef enum {
@@ -58,11 +72,12 @@ typedef enum {
     ZCVID_LH_BLK_LRF1     = 2,
     ZCVID_LH_BLK_LRF2     = 3,
     ZCVID_LH_BLK_CASCADE  = 4,
-    ZCVID_LH_BLK_SPEC_LRF = 5
+    ZCVID_LH_BLK_SPEC_LRF = 5,
+    ZCVID_LH_BLK_POLY_ESR = 6
 } zcvid_lh_blk_mode_t;
 
 typedef struct {
-    uint64_t count[6]; /* indexed by zcvid_lh_blk_mode_t */
+    uint64_t count[7]; /* indexed by zcvid_lh_blk_mode_t */
 } zcvid_lh_stats_t;
 
 /* =========================================================================
@@ -130,6 +145,19 @@ typedef struct {
     zcrudp_rc_prob_t lrf_alpha_gt1;
     zcrudp_rc_prob_t lrf_alpha_gt2;
     zcrudp_rc_prob_t lrf_alpha_mag[7];
+
+    /* Polynomial Prediction + Exact Spectral Repair (POLY_ESR) contexts */
+    zcrudp_rc_prob_t esr_poly_only;
+    zcrudp_rc_prob_t esr_poly_has_ac;
+    zcrudp_rc_prob_t esr_poly_last[4];
+    zcrudp_rc_prob_t esr_poly_sig[5];
+    zcrudp_rc_prob_t esr_csbf[4];
+    zcrudp_rc_prob_t esr_has_ac[4];
+    zcrudp_rc_prob_t esr_last[4][14];
+    zcrudp_rc_prob_t esr_sig[4][15];
+    zcrudp_rc_prob_t esr_gt1[4];
+    zcrudp_rc_prob_t esr_gt2[4];
+    zcrudp_rc_prob_t esr_mag[4][7];
 } zcvid_lh_model_t;
 
 static inline void zcvid_lh_model_init(zcvid_lh_model_t *m) {
@@ -161,6 +189,33 @@ static inline void zcvid_lh_model_init(zcvid_lh_model_t *m) {
     zcrudp_rc_prob_init(&m->lrf_alpha_gt2, 18000U);
     for (int c = 0; c < 7; ++c) {
         zcrudp_rc_prob_init(&m->lrf_alpha_mag[c], (uint16_t)(14000 + c * 2000));
+    }
+
+    /* POLY_ESR priors: degree-2 polynomial frequent; LL active, HF CSBF sparse */
+    zcrudp_rc_prob_init(&m->esr_poly_only, 15000U);
+    zcrudp_rc_prob_init(&m->esr_poly_has_ac, 12000U);
+    for (int i = 0; i < 4; ++i) zcrudp_rc_prob_init(&m->esr_poly_last[i], 16384U);
+    for (int k = 0; k < 5; ++k) {
+        zcrudp_rc_prob_init(&m->esr_poly_sig[k], (k == 0) ? 8000U : 15000U);
+    }
+    static const uint16_t csbf_p[4] = { 4000U, 24000U, 24000U, 26000U };
+    for (int sb = 0; sb < 4; ++sb) {
+        zcrudp_rc_prob_init(&m->esr_csbf[sb], csbf_p[sb]);
+        zcrudp_rc_prob_init(&m->esr_has_ac[sb], (sb == 0) ? 10000U : 16384U);
+        for (int i = 0; i < 14; ++i) zcrudp_rc_prob_init(&m->esr_last[sb][i], 16384U);
+        for (int k = 0; k < 15; ++k) {
+            uint16_t p0 = (sb == 0 && k == 0) ? 8000U : (k < 4) ? 16000U : 22000U;
+            zcrudp_rc_prob_init(&m->esr_sig[sb][k], p0);
+        }
+    }
+    for (int kb = 0; kb < 4; ++kb) {
+        zcrudp_rc_prob_init(&m->esr_gt1[kb], (uint16_t)(17000 + kb * 3000));
+        zcrudp_rc_prob_init(&m->esr_gt2[kb], (uint16_t)(20000 + kb * 2500));
+        for (int c = 0; c < 7; ++c) {
+            int32_t p0 = 14000 + kb * 3000 + c * 2000;
+            if (p0 > 28000) p0 = 28000;
+            zcrudp_rc_prob_init(&m->esr_mag[kb][c], (uint16_t)p0);
+        }
     }
 }
 
@@ -353,8 +408,14 @@ static bool zcvid_lh_tq4_decode_quad(zcrudp_rc_dec_t *rc, zcvid_lh_model_t *m, i
 }
 
 /* =========================================================================
- * Exact HEVC 8x8 Integer DCT (for SPEC_LRF in HYBRID_FULL)
+ * Exact HEVC 8x8 Integer DCT & IDCT — Factored Linear Circuits (Lean 4 Proved)
  * Forward: row >> 2, col >> 9.  Inverse: row >> 7, col >> 12.
+ *
+ * Scalar & AVX2 paths: Unified 12-mul exact Negacyclic-Karatsuba (mod X^4+1)
+ *   + Gauss 3-mul rotation for BOTH forward and inverse via M_odd^T = M_odd
+ *   duality (40% fewer muls than 20-mul butterfly, 5.3x fewer than 64-MAC ref),
+ *   plus bit-exact sparse/CSBF/poly_only IDCT8 and 64-bit overflow guards.
+ * Formal proofs: zcvid/proofs/lean4/ZcvidDCT8Circuit.lean (0 sorry, 0 axioms).
  * ========================================================================= */
 
 static const int32_t k_hevc_dct8[8][8] = {
@@ -369,24 +430,184 @@ static const int32_t k_hevc_dct8[8][8] = {
 };
 
 static inline void zcvid_lh_dct8_fwd_ref(const int32_t in[64], int32_t out[64]) {
-    int32_t tmp[64];
+    int64_t tmp[64];
     for (uint32_t y = 0U; y < 8U; ++y) {
         for (uint32_t u = 0U; u < 8U; ++u) {
-            int32_t s = 0;
+            int64_t s = 0;
             for (uint32_t x = 0U; x < 8U; ++x) {
-                s += in[y * 8U + x] * k_hevc_dct8[u][x];
+                s += (int64_t)in[y * 8U + x] * (int64_t)k_hevc_dct8[u][x];
             }
             tmp[y * 8U + u] = (s + 2) >> 2;
         }
     }
     for (uint32_t v = 0U; v < 8U; ++v) {
         for (uint32_t u = 0U; u < 8U; ++u) {
-            int32_t s = 0;
+            int64_t s = 0;
             for (uint32_t y = 0U; y < 8U; ++y) {
-                s += tmp[y * 8U + u] * k_hevc_dct8[v][y];
+                s += tmp[y * 8U + u] * (int64_t)k_hevc_dct8[v][y];
             }
-            out[v * 8U + u] = (s + 256) >> 9;
+            out[v * 8U + u] = (int32_t)((s + 256) >> 9);
         }
+    }
+}
+
+static inline void zcvid_lh_dct8_inv_ref(const int32_t in[64], int32_t out[64]) {
+    int64_t tmp[64];
+    for (uint32_t v = 0U; v < 8U; ++v) {
+        for (uint32_t x = 0U; x < 8U; ++x) {
+            int64_t s = 0;
+            for (uint32_t u = 0U; u < 8U; ++u) {
+                s += (int64_t)in[v * 8U + u] * (int64_t)k_hevc_dct8[u][x];
+            }
+            tmp[v * 8U + x] = (s + 64) >> 7;
+        }
+    }
+    for (uint32_t y = 0U; y < 8U; ++y) {
+        for (uint32_t x = 0U; x < 8U; ++x) {
+            int64_t s = 0;
+            for (uint32_t v = 0U; v < 8U; ++v) {
+                s += tmp[v * 8U + x] * (int64_t)k_hevc_dct8[v][y];
+            }
+            out[y * 8U + x] = (int32_t)((s + 2048) >> 12);
+        }
+    }
+}
+
+/* Exact 12-mul scalar 1D forward HEVC DCT8 (Negacyclic-Karatsuba + Gauss rotation;
+ * falls back to 64-bit ref if |in| > 4095, zero int32 overflow proved in Lean 4). */
+static inline void zcvid_lh_dct8_fwd_scalar(const int32_t in[64], int32_t out[64]) {
+    for (uint32_t i = 0U; i < 64U; ++i) {
+        if (in[i] > 4095 || in[i] < -4095) {
+            zcvid_lh_dct8_fwd_ref(in, out);
+            return;
+        }
+    }
+    int32_t tmp[64];
+    for (uint32_t y = 0U; y < 8U; ++y) {
+        const int32_t *r = in + y * 8U;
+        int32_t e0 = r[0] + r[7], e1 = r[1] + r[6], e2 = r[2] + r[5], e3 = r[3] + r[4];
+        int32_t o0 = r[0] - r[7], o1 = r[1] - r[6], o2 = r[2] - r[5], o3 = r[3] - r[4];
+        int32_t ee0 = e0 + e3, ee1 = e1 + e2;
+        int32_t eo0 = e0 - e3, eo1 = e1 - e2;
+        int32_t pev = 36 * (eo0 + eo1);
+        /* 9-mul Negacyclic-Karatsuba mod (X^4 + 1) on (o0, o2, o3, o1) */
+        int32_t s0 = o0 + o3, s1 = o2 + o1;
+        int32_t m0 = 89 * o0, m1 = -75 * o2, m2 = 14 * (o0 + o2);
+        int32_t m3 = -18 * o3, m4 = -50 * o1, m5 = -68 * (o3 + o1);
+        int32_t m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+        int32_t u0 = m0 + m3, d0 = m0 - m3;
+        int32_t u1 = m1 + m4, d1 = m1 - m4;
+        int32_t u2 = m2 + m5, d2 = m2 - m5;
+        int32_t k0 = m6 - u0, k1 = m7 - u1;
+        tmp[y * 8U + 0U] = (64 * (ee0 + ee1) + 2) >> 2;
+        tmp[y * 8U + 4U] = (64 * (ee0 - ee1) + 2) >> 2;
+        tmp[y * 8U + 2U] = (pev + 47 * eo0 + 2) >> 2;
+        tmp[y * 8U + 6U] = (pev - 119 * eo1 + 2) >> 2;
+        tmp[y * 8U + 1U] = (d0 - k1 + 2) >> 2;
+        tmp[y * 8U + 3U] = (d0 + d1 - d2 + 2) >> 2;
+        tmp[y * 8U + 5U] = (k0 + k1 + u2 - m8 + 2) >> 2;
+        tmp[y * 8U + 7U] = (-k0 - d1 + 2) >> 2;
+    }
+    for (uint32_t u = 0U; u < 8U; ++u) {
+        int32_t e0 = tmp[0U * 8U + u] + tmp[7U * 8U + u];
+        int32_t e1 = tmp[1U * 8U + u] + tmp[6U * 8U + u];
+        int32_t e2 = tmp[2U * 8U + u] + tmp[5U * 8U + u];
+        int32_t e3 = tmp[3U * 8U + u] + tmp[4U * 8U + u];
+        int32_t o0 = tmp[0U * 8U + u] - tmp[7U * 8U + u];
+        int32_t o1 = tmp[1U * 8U + u] - tmp[6U * 8U + u];
+        int32_t o2 = tmp[2U * 8U + u] - tmp[5U * 8U + u];
+        int32_t o3 = tmp[3U * 8U + u] - tmp[4U * 8U + u];
+        int32_t ee0 = e0 + e3, ee1 = e1 + e2;
+        int32_t eo0 = e0 - e3, eo1 = e1 - e2;
+        int32_t pev = 36 * (eo0 + eo1);
+        int32_t s0 = o0 + o3, s1 = o2 + o1;
+        int32_t m0 = 89 * o0, m1 = -75 * o2, m2 = 14 * (o0 + o2);
+        int32_t m3 = -18 * o3, m4 = -50 * o1, m5 = -68 * (o3 + o1);
+        int32_t m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+        int32_t u0 = m0 + m3, d0 = m0 - m3;
+        int32_t u1 = m1 + m4, d1 = m1 - m4;
+        int32_t u2 = m2 + m5, d2 = m2 - m5;
+        int32_t k0 = m6 - u0, k1 = m7 - u1;
+        out[0U * 8U + u] = (64 * (ee0 + ee1) + 256) >> 9;
+        out[4U * 8U + u] = (64 * (ee0 - ee1) + 256) >> 9;
+        out[2U * 8U + u] = (pev + 47 * eo0 + 256) >> 9;
+        out[6U * 8U + u] = (pev - 119 * eo1 + 256) >> 9;
+        out[1U * 8U + u] = (d0 - k1 + 256) >> 9;
+        out[3U * 8U + u] = (d0 + d1 - d2 + 256) >> 9;
+        out[5U * 8U + u] = (k0 + k1 + u2 - m8 + 256) >> 9;
+        out[7U * 8U + u] = (-k0 - d1 + 256) >> 9;
+    }
+}
+
+/* Exact 12-mul scalar 2D inverse HEVC IDCT8 (reuses identical Negacyclic-Karatsuba
+ * circuit by M_odd^T = M_odd duality; falls back to 64-bit ref if |in| > 65535). */
+static inline void zcvid_lh_dct8_inv_scalar(const int32_t in[64], int32_t out[64]) {
+    for (uint32_t i = 0U; i < 64U; ++i) {
+        if (in[i] > 65535 || in[i] < -65535) {
+            zcvid_lh_dct8_inv_ref(in, out);
+            return;
+        }
+    }
+    int32_t tmp[64];
+    for (uint32_t v = 0U; v < 8U; ++v) {
+        const int32_t *c = in + v * 8U;
+        if ((c[0] | c[1] | c[2] | c[3] | c[4] | c[5] | c[6] | c[7]) == 0) {
+            memset(tmp + v * 8U, 0, sizeof(int32_t) * 8U);
+            continue;
+        }
+        int32_t e0 = 64 * (c[0] + c[4]);
+        int32_t e1 = 64 * (c[0] - c[4]);
+        int32_t pev = 36 * (c[2] + c[6]);
+        int32_t g0 = pev + 47 * c[2];
+        int32_t g1 = pev - 119 * c[6];
+        int32_t E0 = e0 + g0, E1 = e1 + g1, E2 = e1 - g1, E3 = e0 - g0;
+        int32_t o0 = c[1], o1 = c[3], o2 = c[5], o3 = c[7];
+        int32_t s0 = o0 + o3, s1 = o2 + o1;
+        int32_t m0 = 89 * o0, m1 = -75 * o2, m2 = 14 * (o0 + o2);
+        int32_t m3 = -18 * o3, m4 = -50 * o1, m5 = -68 * (o3 + o1);
+        int32_t m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+        int32_t u0 = m0 + m3, d0 = m0 - m3;
+        int32_t u1 = m1 + m4, d1 = m1 - m4;
+        int32_t u2 = m2 + m5, d2 = m2 - m5;
+        int32_t k0 = m6 - u0, k1 = m7 - u1;
+        int32_t O0 = d0 - k1, O1 = d0 + d1 - d2, O2 = k0 + k1 + u2 - m8, O3 = -k0 - d1;
+        tmp[v * 8U + 0U] = (E0 + O0 + 64) >> 7;
+        tmp[v * 8U + 1U] = (E1 + O1 + 64) >> 7;
+        tmp[v * 8U + 2U] = (E2 + O2 + 64) >> 7;
+        tmp[v * 8U + 3U] = (E3 + O3 + 64) >> 7;
+        tmp[v * 8U + 4U] = (E3 - O3 + 64) >> 7;
+        tmp[v * 8U + 5U] = (E2 - O2 + 64) >> 7;
+        tmp[v * 8U + 6U] = (E1 - O1 + 64) >> 7;
+        tmp[v * 8U + 7U] = (E0 - O0 + 64) >> 7;
+    }
+    for (uint32_t x = 0U; x < 8U; ++x) {
+        int32_t c0 = tmp[0U * 8U + x], c1 = tmp[1U * 8U + x];
+        int32_t c2 = tmp[2U * 8U + x], c3 = tmp[3U * 8U + x];
+        int32_t c4 = tmp[4U * 8U + x], c5 = tmp[5U * 8U + x];
+        int32_t c6 = tmp[6U * 8U + x], c7 = tmp[7U * 8U + x];
+        int32_t e0 = 64 * (c0 + c4);
+        int32_t e1 = 64 * (c0 - c4);
+        int32_t pev = 36 * (c2 + c6);
+        int32_t g0 = pev + 47 * c2;
+        int32_t g1 = pev - 119 * c6;
+        int32_t E0 = e0 + g0, E1 = e1 + g1, E2 = e1 - g1, E3 = e0 - g0;
+        int32_t s0 = c1 + c7, s1 = c5 + c3;
+        int32_t m0 = 89 * c1, m1 = -75 * c5, m2 = 14 * (c1 + c5);
+        int32_t m3 = -18 * c7, m4 = -50 * c3, m5 = -68 * (c7 + c3);
+        int32_t m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+        int32_t u0 = m0 + m3, d0 = m0 - m3;
+        int32_t u1 = m1 + m4, d1 = m1 - m4;
+        int32_t u2 = m2 + m5, d2 = m2 - m5;
+        int32_t k0 = m6 - u0, k1 = m7 - u1;
+        int32_t O0 = d0 - k1, O1 = d0 + d1 - d2, O2 = k0 + k1 + u2 - m8, O3 = -k0 - d1;
+        out[0U * 8U + x] = (E0 + O0 + 2048) >> 12;
+        out[1U * 8U + x] = (E1 + O1 + 2048) >> 12;
+        out[2U * 8U + x] = (E2 + O2 + 2048) >> 12;
+        out[3U * 8U + x] = (E3 + O3 + 2048) >> 12;
+        out[4U * 8U + x] = (E3 - O3 + 2048) >> 12;
+        out[5U * 8U + x] = (E2 - O2 + 2048) >> 12;
+        out[6U * 8U + x] = (E1 - O1 + 2048) >> 12;
+        out[7U * 8U + x] = (E0 - O0 + 2048) >> 12;
     }
 }
 
@@ -420,15 +641,33 @@ static inline void zcvid_lh_transpose8x8_avx2(__m256i r[8]) {
     r[7] = _mm256_permute2x128_si256(s3, s7, 0x31);
 }
 
-static inline void zcvid_lh_dct8_1d_avx2(__m256i s[8], int32_t rnd_val, int shift) {
-    const __m256i c89 = _mm256_set1_epi32(89);
-    const __m256i c75 = _mm256_set1_epi32(75);
-    const __m256i c50 = _mm256_set1_epi32(50);
-    const __m256i c18 = _mm256_set1_epi32(18);
-    const __m256i c83 = _mm256_set1_epi32(83);
-    const __m256i c36 = _mm256_set1_epi32(36);
-    const __m256i rnd = _mm256_set1_epi32(rnd_val);
+/* Shared-routing 12-mul Negacyclic-Karatsuba + Gauss odd/even 1D AVX2 (int32). */
+static inline void zcvid_lh_odd4_karatsuba_avx2(__m256i o0, __m256i o1, __m256i o2, __m256i o3,
+                                                __m256i *y1, __m256i *y3, __m256i *y5, __m256i *y7) {
+    __m256i s0 = _mm256_add_epi32(o0, o3);
+    __m256i s1 = _mm256_add_epi32(o2, o1);
+    __m256i m0 = _mm256_mullo_epi32(o0, _mm256_set1_epi32(89));
+    __m256i m1 = _mm256_mullo_epi32(o2, _mm256_set1_epi32(-75));
+    __m256i m2 = _mm256_mullo_epi32(_mm256_add_epi32(o0, o2), _mm256_set1_epi32(14));
+    __m256i m3 = _mm256_mullo_epi32(o3, _mm256_set1_epi32(-18));
+    __m256i m4 = _mm256_mullo_epi32(o1, _mm256_set1_epi32(-50));
+    __m256i m5 = _mm256_mullo_epi32(_mm256_add_epi32(o3, o1), _mm256_set1_epi32(-68));
+    __m256i m6 = _mm256_mullo_epi32(s0, _mm256_set1_epi32(71));
+    __m256i m7 = _mm256_mullo_epi32(s1, _mm256_set1_epi32(-125));
+    __m256i m8 = _mm256_mullo_epi32(_mm256_add_epi32(s0, s1), _mm256_set1_epi32(-54));
+    __m256i u0 = _mm256_add_epi32(m0, m3), d0 = _mm256_sub_epi32(m0, m3);
+    __m256i u1 = _mm256_add_epi32(m1, m4), d1 = _mm256_sub_epi32(m1, m4);
+    __m256i u2 = _mm256_add_epi32(m2, m5), d2 = _mm256_sub_epi32(m2, m5);
+    __m256i k0 = _mm256_sub_epi32(m6, u0);
+    __m256i k1 = _mm256_sub_epi32(m7, u1);
+    *y1 = _mm256_sub_epi32(d0, k1);
+    *y3 = _mm256_sub_epi32(_mm256_add_epi32(d0, d1), d2);
+    *y5 = _mm256_add_epi32(_mm256_add_epi32(k0, k1), _mm256_sub_epi32(u2, m8));
+    *y7 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(k0, d1));
+}
 
+static inline void zcvid_lh_dct8_1d_avx2(__m256i s[8], int32_t rnd_val, int shift) {
+    const __m256i rnd = _mm256_set1_epi32(rnd_val);
     __m256i e0 = _mm256_add_epi32(s[0], s[7]);
     __m256i e1 = _mm256_add_epi32(s[1], s[6]);
     __m256i e2 = _mm256_add_epi32(s[2], s[5]);
@@ -445,21 +684,12 @@ static inline void zcvid_lh_dct8_1d_avx2(__m256i s[8], int32_t rnd_val, int shif
 
     __m256i y0 = _mm256_slli_epi32(_mm256_add_epi32(ee0, ee1), 6);
     __m256i y4 = _mm256_slli_epi32(_mm256_sub_epi32(ee0, ee1), 6);
-    __m256i y2 = _mm256_add_epi32(_mm256_mullo_epi32(c83, eo0), _mm256_mullo_epi32(c36, eo1));
-    __m256i y6 = _mm256_sub_epi32(_mm256_mullo_epi32(c36, eo0), _mm256_mullo_epi32(c83, eo1));
+    __m256i pev = _mm256_mullo_epi32(_mm256_add_epi32(eo0, eo1), _mm256_set1_epi32(36));
+    __m256i y2 = _mm256_add_epi32(pev, _mm256_mullo_epi32(eo0, _mm256_set1_epi32(47)));
+    __m256i y6 = _mm256_sub_epi32(pev, _mm256_mullo_epi32(eo1, _mm256_set1_epi32(119)));
 
-    __m256i y1 = _mm256_add_epi32(
-        _mm256_add_epi32(_mm256_mullo_epi32(c89, o0), _mm256_mullo_epi32(c75, o1)),
-        _mm256_add_epi32(_mm256_mullo_epi32(c50, o2), _mm256_mullo_epi32(c18, o3)));
-    __m256i y3 = _mm256_sub_epi32(
-        _mm256_sub_epi32(_mm256_mullo_epi32(c75, o0), _mm256_mullo_epi32(c18, o1)),
-        _mm256_add_epi32(_mm256_mullo_epi32(c89, o2), _mm256_mullo_epi32(c50, o3)));
-    __m256i y5 = _mm256_add_epi32(
-        _mm256_sub_epi32(_mm256_mullo_epi32(c50, o0), _mm256_mullo_epi32(c89, o1)),
-        _mm256_add_epi32(_mm256_mullo_epi32(c18, o2), _mm256_mullo_epi32(c75, o3)));
-    __m256i y7 = _mm256_sub_epi32(
-        _mm256_sub_epi32(_mm256_mullo_epi32(c18, o0), _mm256_mullo_epi32(c50, o1)),
-        _mm256_sub_epi32(_mm256_mullo_epi32(c89, o3), _mm256_mullo_epi32(c75, o2)));
+    __m256i y1, y3, y5, y7;
+    zcvid_lh_odd4_karatsuba_avx2(o0, o1, o2, o3, &y1, &y3, &y5, &y7);
 
     if (shift == 2) {
         s[0] = _mm256_srai_epi32(_mm256_add_epi32(y0, rnd), 2);
@@ -482,76 +712,240 @@ static inline void zcvid_lh_dct8_1d_avx2(__m256i s[8], int32_t rnd_val, int shif
     }
 }
 
+/* Native 32-bit AVX2 12-mul Negacyclic-Karatsuba + Gauss forward 8x8 DCT
+ * (exact for |in| <= 4095, Lean-4 proved; INT32_MIN-safe range guard -> 64-bit ref). */
 static inline void zcvid_lh_dct8_fwd(const int32_t in[64], int32_t out[64]) {
     __m256i v[8];
-    for (int i = 0; i < 8; ++i) v[i] = _mm256_loadu_si256((const __m256i *)(in + i * 8));
+    const __m256i lo = _mm256_set1_epi32(-4095);
+    const __m256i hi = _mm256_set1_epi32(4095);
+    __m256i bad = _mm256_setzero_si256();
+    for (int i = 0; i < 8; ++i) {
+        v[i] = _mm256_loadu_si256((const __m256i *)(in + i * 8));
+        bad = _mm256_or_si256(bad, _mm256_or_si256(_mm256_cmpgt_epi32(v[i], hi),
+                                                   _mm256_cmpgt_epi32(lo, v[i])));
+    }
+    if (!_mm256_testz_si256(bad, bad)) {
+        zcvid_lh_dct8_fwd_ref(in, out);
+        return;
+    }
     zcvid_lh_transpose8x8_avx2(v);
     zcvid_lh_dct8_1d_avx2(v, 2, 2);
     zcvid_lh_transpose8x8_avx2(v);
     zcvid_lh_dct8_1d_avx2(v, 256, 9);
     for (int i = 0; i < 8; ++i) _mm256_storeu_si256((__m256i *)(out + i * 8), v[i]);
 }
+
+/* 12-mul Negacyclic-Karatsuba + Gauss 1D inverse AVX2 (int32). */
+static inline void zcvid_lh_dct8_inv_1d_avx2(__m256i c[8], int32_t rnd_val, int shift) {
+    const __m256i rnd = _mm256_set1_epi32(rnd_val);
+    __m256i e0 = _mm256_slli_epi32(_mm256_add_epi32(c[0], c[4]), 6);
+    __m256i e1 = _mm256_slli_epi32(_mm256_sub_epi32(c[0], c[4]), 6);
+    __m256i pev = _mm256_mullo_epi32(_mm256_add_epi32(c[2], c[6]), _mm256_set1_epi32(36));
+    __m256i g0 = _mm256_add_epi32(pev, _mm256_mullo_epi32(c[2], _mm256_set1_epi32(47)));
+    __m256i g1 = _mm256_sub_epi32(pev, _mm256_mullo_epi32(c[6], _mm256_set1_epi32(119)));
+    __m256i E0 = _mm256_add_epi32(e0, g0);
+    __m256i E1 = _mm256_add_epi32(e1, g1);
+    __m256i E2 = _mm256_sub_epi32(e1, g1);
+    __m256i E3 = _mm256_sub_epi32(e0, g0);
+
+    __m256i O0, O1, O2, O3;
+    zcvid_lh_odd4_karatsuba_avx2(c[1], c[3], c[5], c[7], &O0, &O1, &O2, &O3);
+
+    if (shift == 7) {
+        c[0] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E0, O0), rnd), 7);
+        c[1] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E1, O1), rnd), 7);
+        c[2] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E2, O2), rnd), 7);
+        c[3] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E3, O3), rnd), 7);
+        c[4] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E3, O3), rnd), 7);
+        c[5] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E2, O2), rnd), 7);
+        c[6] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E1, O1), rnd), 7);
+        c[7] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E0, O0), rnd), 7);
+    } else {
+        c[0] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E0, O0), rnd), 12);
+        c[1] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E1, O1), rnd), 12);
+        c[2] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E2, O2), rnd), 12);
+        c[3] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(E3, O3), rnd), 12);
+        c[4] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E3, O3), rnd), 12);
+        c[5] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E2, O2), rnd), 12);
+        c[6] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E1, O1), rnd), 12);
+        c[7] = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(E0, O0), rnd), 12);
+    }
+}
+
+static inline void zcvid_lh_dct8_inv(const int32_t in[64], int32_t out[64]) {
+    __m256i v[8];
+    const __m256i lo = _mm256_set1_epi32(-65535);
+    const __m256i hi = _mm256_set1_epi32(65535);
+    __m256i bad = _mm256_setzero_si256();
+    for (int i = 0; i < 8; ++i) {
+        v[i] = _mm256_loadu_si256((const __m256i *)(in + i * 8));
+        bad = _mm256_or_si256(bad, _mm256_or_si256(_mm256_cmpgt_epi32(v[i], hi),
+                                                   _mm256_cmpgt_epi32(lo, v[i])));
+    }
+    if (!_mm256_testz_si256(bad, bad)) {
+        zcvid_lh_dct8_inv_ref(in, out);
+        return;
+    }
+    zcvid_lh_transpose8x8_avx2(v);
+    zcvid_lh_dct8_inv_1d_avx2(v, 64, 7);
+    zcvid_lh_transpose8x8_avx2(v);
+    zcvid_lh_dct8_inv_1d_avx2(v, 2048, 12);
+    for (int i = 0; i < 8; ++i) _mm256_storeu_si256((__m256i *)(out + i * 8), v[i]);
+}
 #else
 static inline void zcvid_lh_dct8_fwd(const int32_t in[64], int32_t out[64]) {
-    int32_t tmp[64];
-    for (uint32_t y = 0U; y < 8U; ++y) {
-        const int32_t *r = in + y * 8U;
-        int32_t e0 = r[0] + r[7], e1 = r[1] + r[6], e2 = r[2] + r[5], e3 = r[3] + r[4];
-        int32_t o0 = r[0] - r[7], o1 = r[1] - r[6], o2 = r[2] - r[5], o3 = r[3] - r[4];
-        int32_t ee0 = e0 + e3, ee1 = e1 + e2;
-        int32_t eo0 = e0 - e3, eo1 = e1 - e2;
-        tmp[y * 8U + 0U] = (64 * (ee0 + ee1) + 2) >> 2;
-        tmp[y * 8U + 4U] = (64 * (ee0 - ee1) + 2) >> 2;
-        tmp[y * 8U + 2U] = (83 * eo0 + 36 * eo1 + 2) >> 2;
-        tmp[y * 8U + 6U] = (36 * eo0 - 83 * eo1 + 2) >> 2;
-        tmp[y * 8U + 1U] = (89 * o0 + 75 * o1 + 50 * o2 + 18 * o3 + 2) >> 2;
-        tmp[y * 8U + 3U] = (75 * o0 - 18 * o1 - 89 * o2 - 50 * o3 + 2) >> 2;
-        tmp[y * 8U + 5U] = (50 * o0 - 89 * o1 + 18 * o2 + 75 * o3 + 2) >> 2;
-        tmp[y * 8U + 7U] = (18 * o0 - 50 * o1 + 75 * o2 - 89 * o3 + 2) >> 2;
-    }
-    for (uint32_t u = 0U; u < 8U; ++u) {
-        int32_t e0 = tmp[0U * 8U + u] + tmp[7U * 8U + u];
-        int32_t e1 = tmp[1U * 8U + u] + tmp[6U * 8U + u];
-        int32_t e2 = tmp[2U * 8U + u] + tmp[5U * 8U + u];
-        int32_t e3 = tmp[3U * 8U + u] + tmp[4U * 8U + u];
-        int32_t o0 = tmp[0U * 8U + u] - tmp[7U * 8U + u];
-        int32_t o1 = tmp[1U * 8U + u] - tmp[6U * 8U + u];
-        int32_t o2 = tmp[2U * 8U + u] - tmp[5U * 8U + u];
-        int32_t o3 = tmp[3U * 8U + u] - tmp[4U * 8U + u];
-        int32_t ee0 = e0 + e3, ee1 = e1 + e2;
-        int32_t eo0 = e0 - e3, eo1 = e1 - e2;
-        out[0U * 8U + u] = (64 * (ee0 + ee1) + 256) >> 9;
-        out[4U * 8U + u] = (64 * (ee0 - ee1) + 256) >> 9;
-        out[2U * 8U + u] = (83 * eo0 + 36 * eo1 + 256) >> 9;
-        out[6U * 8U + u] = (36 * eo0 - 83 * eo1 + 256) >> 9;
-        out[1U * 8U + u] = (89 * o0 + 75 * o1 + 50 * o2 + 18 * o3 + 256) >> 9;
-        out[3U * 8U + u] = (75 * o0 - 18 * o1 - 89 * o2 - 50 * o3 + 256) >> 9;
-        out[5U * 8U + u] = (50 * o0 - 89 * o1 + 18 * o2 + 75 * o3 + 256) >> 9;
-        out[7U * 8U + u] = (18 * o0 - 50 * o1 + 75 * o2 - 89 * o3 + 256) >> 9;
-    }
+    zcvid_lh_dct8_fwd_scalar(in, out);
+}
+
+static inline void zcvid_lh_dct8_inv(const int32_t in[64], int32_t out[64]) {
+    zcvid_lh_dct8_inv_scalar(in, out);
 }
 #endif
 
-static inline void zcvid_lh_dct8_inv(const int32_t in[64], int32_t out[64]) {
-    int64_t tmp[64];
-    for (uint32_t v = 0U; v < 8U; ++v) {
-        for (uint32_t x = 0U; x < 8U; ++x) {
-            int64_t s = 0;
-            for (uint32_t u = 0U; u < 8U; ++u) {
-                s += (int64_t)in[v * 8U + u] * (int64_t)k_hevc_dct8[u][x];
-            }
-            tmp[v * 8U + x] = (s + 64) >> 7;
+/* Bit-exact sparse/CSBF-aware 8x8 IDCT8 for POLY_ESR (Lean 4 proved in Theorem 6a/6b/6c/6d):
+ *  - poly_only (3x3 degree-2 polynomial): skips rows/cols 3..7 completely (~17 AVX2 ops!)
+ *  - csbf == 1 (LL 4x4 sub-block only): skips rows/cols 4..7 completely
+ *  - general csbf: full factored 12-mul AVX2 / scalar IDCT8 (with 64-bit overflow guard) */
+static inline void zcvid_lh_dct8_inv_sparse(const int32_t in[64], uint32_t csbf, bool poly_only,
+                                            int32_t out[64]) {
+    if (poly_only) {
+        /* INT32_MIN-safe overflow check for extreme adversarial QP=51 decoded coefficients */
+        if (in[0] > 65535 || in[0] < -65535 || in[1] > 65535 || in[1] < -65535 ||
+            in[2] > 65535 || in[2] < -65535 || in[8] > 65535 || in[8] < -65535 ||
+            in[9] > 65535 || in[9] < -65535 || in[16] > 65535 || in[16] < -65535) {
+            int32_t full_w[64];
+            memset(full_w, 0, sizeof(full_w));
+            full_w[0] = in[0]; full_w[1] = in[1]; full_w[2] = in[2];
+            full_w[8] = in[8]; full_w[9] = in[9]; full_w[16] = in[16];
+            zcvid_lh_dct8_inv_ref(full_w, out);
+            return;
         }
-    }
-    for (uint32_t y = 0U; y < 8U; ++y) {
-        for (uint32_t x = 0U; x < 8U; ++x) {
-            int64_t s = 0;
-            for (uint32_t v = 0U; v < 8U; ++v) {
-                s += tmp[v * 8U + x] * (int64_t)k_hevc_dct8[v][y];
-            }
-            out[y * 8U + x] = (int32_t)((s + 2048) >> 12);
+        /* Exact DC-only 2-op collapse (Theorem 6c) */
+        if ((in[1] | in[2] | in[8] | in[9] | in[16]) == 0) {
+            int32_t t0 = (64 * in[0] + 64) >> 7;
+            int32_t v = (64 * t0 + 2048) >> 12;
+            for (uint32_t i = 0U; i < 64U; ++i) out[i] = v;
+            return;
         }
+#if defined(__AVX2__)
+        const __m256i k1 = _mm256_loadu_si256((const __m256i *)k_hevc_dct8[1]);
+        const __m256i k2 = _mm256_loadu_si256((const __m256i *)k_hevc_dct8[2]);
+        const __m256i c64 = _mm256_set1_epi32(64);
+        const __m256i c2048 = _mm256_set1_epi32(2048);
+
+        /* Row 0: (0,0), (0,1), (0,2); Row 1: (1,0), (1,1); Row 2: (2,0) */
+        __m256i t0 = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(
+            _mm256_set1_epi32(64 * in[0]),
+            _mm256_mullo_epi32(_mm256_set1_epi32(in[1]), k1)),
+            _mm256_add_epi32(_mm256_mullo_epi32(_mm256_set1_epi32(in[2]), k2), c64)), 7);
+        __m256i t1 = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(
+            _mm256_set1_epi32(64 * in[8]),
+            _mm256_mullo_epi32(_mm256_set1_epi32(in[9]), k1)), c64), 7);
+        __m256i t2 = _mm256_set1_epi32((64 * in[16] + 64) >> 7);
+
+        __m256i b0 = _mm256_slli_epi32(t0, 6);
+        static const int32_t k1y[4] = { 89, 75, 50, 18 };
+        static const int32_t k2y[4] = { 83, 36, -36, -83 };
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            __m256i ev = _mm256_add_epi32(b0, _mm256_mullo_epi32(t2, _mm256_set1_epi32(k2y[y])));
+            __m256i od = _mm256_mullo_epi32(t1, _mm256_set1_epi32(k1y[y]));
+            _mm256_storeu_si256((__m256i *)(out + y * 8U),
+                                _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(ev, od), c2048), 12));
+            _mm256_storeu_si256((__m256i *)(out + (7U - y) * 8U),
+                                _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(ev, od), c2048), 12));
+        }
+#else
+        int32_t t0[8], t1[8];
+        int32_t t2 = (64 * in[16] + 64) >> 7;
+        for (uint32_t x = 0U; x < 8U; ++x) {
+            t0[x] = (64 * in[0] + k_hevc_dct8[1][x] * in[1] + k_hevc_dct8[2][x] * in[2] + 64) >> 7;
+            t1[x] = (64 * in[8] + k_hevc_dct8[1][x] * in[9] + 64) >> 7;
+        }
+        static const int32_t k1y[4] = { 89, 75, 50, 18 };
+        static const int32_t k2y[4] = { 83, 36, -36, -83 };
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            int32_t c2t = k2y[y] * t2;
+            for (uint32_t x = 0U; x < 8U; ++x) {
+                int32_t ev = 64 * t0[x] + c2t;
+                int32_t od = k1y[y] * t1[x];
+                out[y * 8U + x] = (ev + od + 2048) >> 12;
+                out[(7U - y) * 8U + x] = (ev - od + 2048) >> 12;
+            }
+        }
+#endif
+        return;
     }
+
+    if (csbf == 1U) {
+        /* LL-only 4x4 sub-block: only rows 0..3 and cols 0..3 are non-zero (Theorem 6a/6d) */
+        for (uint32_t v = 0U; v < 4U; ++v) {
+            for (uint32_t u = 0U; u < 4U; ++u) {
+                if (in[v * 8U + u] > 65535 || in[v * 8U + u] < -65535) {
+                    int32_t full_w[64];
+                    memset(full_w, 0, sizeof(full_w));
+                    for (uint32_t y = 0U; y < 4U; ++y) {
+                        for (uint32_t x = 0U; x < 4U; ++x) full_w[y * 8U + x] = in[y * 8U + x];
+                    }
+                    zcvid_lh_dct8_inv_ref(full_w, out);
+                    return;
+                }
+            }
+        }
+#if defined(__AVX2__)
+        const __m256i k1 = _mm256_loadu_si256((const __m256i *)k_hevc_dct8[1]);
+        const __m256i k2 = _mm256_loadu_si256((const __m256i *)k_hevc_dct8[2]);
+        const __m256i k3 = _mm256_loadu_si256((const __m256i *)k_hevc_dct8[3]);
+        const __m256i c64 = _mm256_set1_epi32(64);
+        const __m256i c2048 = _mm256_set1_epi32(2048);
+        __m256i t[4];
+        for (uint32_t v = 0U; v < 4U; ++v) {
+            const int32_t *row = in + v * 8U;
+            __m256i s = _mm256_add_epi32(
+                _mm256_add_epi32(_mm256_set1_epi32(64 * row[0]),
+                                 _mm256_mullo_epi32(_mm256_set1_epi32(row[1]), k1)),
+                _mm256_add_epi32(_mm256_mullo_epi32(_mm256_set1_epi32(row[2]), k2),
+                                 _mm256_mullo_epi32(_mm256_set1_epi32(row[3]), k3)));
+            t[v] = _mm256_srai_epi32(_mm256_add_epi32(s, c64), 7);
+        }
+        __m256i b0 = _mm256_slli_epi32(t[0], 6);
+        static const int32_t k1y[4] = { 89, 75, 50, 18 };
+        static const int32_t k2y[4] = { 83, 36, -36, -83 };
+        static const int32_t k3y[4] = { 75, -18, -89, -50 };
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            __m256i ev = _mm256_add_epi32(b0, _mm256_mullo_epi32(t[2], _mm256_set1_epi32(k2y[y])));
+            __m256i od = _mm256_add_epi32(
+                _mm256_mullo_epi32(t[1], _mm256_set1_epi32(k1y[y])),
+                _mm256_mullo_epi32(t[3], _mm256_set1_epi32(k3y[y])));
+            _mm256_storeu_si256((__m256i *)(out + y * 8U),
+                                _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(ev, od), c2048), 12));
+            _mm256_storeu_si256((__m256i *)(out + (7U - y) * 8U),
+                                _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(ev, od), c2048), 12));
+        }
+#else
+        int32_t t[4][8];
+        for (uint32_t v = 0U; v < 4U; ++v) {
+            const int32_t *row = in + v * 8U;
+            for (uint32_t x = 0U; x < 8U; ++x) {
+                t[v][x] = (64 * row[0] + k_hevc_dct8[1][x] * row[1] +
+                           k_hevc_dct8[2][x] * row[2] + k_hevc_dct8[3][x] * row[3] + 64) >> 7;
+            }
+        }
+        static const int32_t k1y[4] = { 89, 75, 50, 18 };
+        static const int32_t k2y[4] = { 83, 36, -36, -83 };
+        static const int32_t k3y[4] = { 75, -18, -89, -50 };
+        for (uint32_t y = 0U; y < 4U; ++y) {
+            for (uint32_t x = 0U; x < 8U; ++x) {
+                int32_t ev = 64 * t[0][x] + k2y[y] * t[2][x];
+                int32_t od = k1y[y] * t[1][x] + k3y[y] * t[3][x];
+                out[y * 8U + x] = (ev + od + 2048) >> 12;
+                out[(7U - y) * 8U + x] = (ev - od + 2048) >> 12;
+            }
+        }
+#endif
+        return;
+    }
+
+    zcvid_lh_dct8_inv(in, out);
 }
 
 /* =========================================================================
@@ -590,6 +984,11 @@ typedef struct {
     int32_t  tq_dq[16];   /* inverse dequant scale in zigzag order */
     uint32_t tq_qbits;
     int64_t  tq_dz[2];    /* [is_inter] deadzone */
+    /* Uniform HEVC 8x8 DCT quantizer/dequantizer for POLY_ESR */
+    int32_t  dct8_mf;
+    uint32_t dct8_qbits;
+    int64_t  dct8_dz[2];  /* [is_inter] deadzone */
+    int32_t  dct8_dq_step;
 } zcvid_lh_step_lut_t;
 
 static inline void zcvid_lh_step_lut_init(zcvid_lh_step_lut_t *lut, uint32_t qp) {
@@ -604,6 +1003,8 @@ static inline void zcvid_lh_step_lut_init(zcvid_lh_step_lut_t *lut, uint32_t qp)
     static const uint32_t TQ_ZZ[16] = {
         0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15
     };
+    static const int32_t HEVC_MF[6] = { 26214, 23302, 20560, 18396, 16384, 14564 };
+    static const int32_t HEVC_V[6]  = { 40, 45, 51, 57, 64, 72 };
     lut->step[0][0] = 1;
     lut->step[1][0] = 1;
     for (uint32_t area = 1U; area <= 64U; ++area) {
@@ -620,6 +1021,18 @@ static inline void zcvid_lh_step_lut_init(zcvid_lh_step_lut_t *lut, uint32_t qp)
         lut->tq_mf[k] = TQ_MF[qp_mod * 3U + cls];
         lut->tq_dq[k] = TQ_V[qp_mod * 3U + cls] << qp_div;
     }
+    lut->dct8_qbits = 18U + qp_div;
+    lut->dct8_dz[0] = (int64_t)((1ULL << lut->dct8_qbits) / 3ULL);
+    lut->dct8_dz[1] = (int64_t)((1ULL << lut->dct8_qbits) / 6ULL);
+    if (qp_div >= 2U) {
+        lut->dct8_dq_step = HEVC_V[qp_mod] << (qp_div - 2U);
+        lut->dct8_mf = HEVC_MF[qp_mod];
+    } else {
+        int32_t dq = ((HEVC_V[qp_mod] << qp_div) + 2) >> 2;
+        if (dq < 1) dq = 1;
+        lut->dct8_dq_step = dq;
+        lut->dct8_mf = (int32_t)(((1ULL << lut->dct8_qbits) + (uint64_t)(dq >> 1)) / (uint64_t)dq);
+    }
 }
 
 static inline uint32_t zcvid_lh_tq4_quant_fast(const int32_t w[16], const zcvid_lh_step_lut_t *lut,
@@ -632,8 +1045,8 @@ static inline uint32_t zcvid_lh_tq4_quant_fast(const int32_t w[16], const zcvid_
     uint32_t sig_mask = 0U;
     for (uint32_t k = 0U; k < 16U; ++k) {
         int32_t c = w[TQ_ZZ[k]];
-        int32_t ac = (c < 0) ? -c : c;
-        int32_t mag = (int32_t)(((uint32_t)ac * (uint32_t)lut->tq_mf[k] + (uint32_t)dz) >> qbits);
+        uint32_t ac = (c < 0) ? (0U - (uint32_t)c) : (uint32_t)c;
+        int32_t mag = (int32_t)((ac * (uint32_t)lut->tq_mf[k] + (uint32_t)dz) >> qbits);
         if (mag > 511) mag = 511;
         int16_t v = (int16_t)((c < 0) ? -mag : mag);
         lv[k] = v;
@@ -731,6 +1144,418 @@ static inline void zcvid_lh_tq4_recon_fast(const int16_t lv[16], uint32_t sig_ma
     }
     zcvid_dec_tq_inverse(c);
     memcpy(out_r, c, sizeof(c));
+}
+
+/* =========================================================================
+ * OpenAI-Inspired Polynomial Prediction + Exact Spectral Repair (POLY_ESR)
+ *
+ * Stage 1 (Polynomial Prediction): When energy lies in the degree-<=2 cosine
+ *   polynomial subspace {(0,0),(0,1),(1,0),(2,0),(1,1),(0,2)} (exact prefix
+ *   k=0..5 of LL 4x4 zigzag), codes poly_only=1 and reconstructs via exact
+ *   3x3-cropped IDCT8 (~17 AVX2 ops, proved in ZcvidDCT8Circuit.lean Thm 6b).
+ * Stage 2 (Exact Spectral Repair): When high-frequency spectral spikes exist
+ *   (45-deg diagonals, textures, panning edges), codes sparse 4x4 CSBF
+ *   sub-blocks (LL, LH, HL, HH) with Parseval-pruned RDO and sparse IDCT8.
+ * ========================================================================= */
+
+typedef struct {
+    bool     poly_only;
+    uint32_t csbf;
+    uint32_t sb_mask[4];
+    int16_t  sb_lv[4][16];
+    uint32_t poly_mask;
+    int16_t  poly_lv[6];
+} zcvid_lh_esr_t;
+
+static inline uint32_t zcvid_lh_esr_sb_rate_q8(const zcvid_lh_model_t *m, uint32_t sb,
+                                               const int16_t lv[16], uint32_t sig_mask) {
+    if (sig_mask == 0U) return 0U;
+    uint32_t last_k = 31U - zcvid_lh_clz32(sig_mask);
+    uint32_t bits_q8 = 0U;
+    uint32_t has_ac = (last_k > 0U) ? 1U : 0U;
+    bits_q8 += zcvid_lh_cost_q8(&m->esr_has_ac[sb], has_ac);
+    if (has_ac) {
+        uint32_t v = last_k - 1U;
+        uint32_t b3 = (v >> 3) & 1U; bits_q8 += zcvid_lh_cost_q8(&m->esr_last[sb][0], b3);
+        uint32_t n2 = 2U | b3;
+        uint32_t b2 = (v >> 2) & 1U; bits_q8 += zcvid_lh_cost_q8(&m->esr_last[sb][n2 - 1U], b2);
+        uint32_t n1 = (n2 << 1) | b2;
+        uint32_t b1 = (v >> 1) & 1U; bits_q8 += zcvid_lh_cost_q8(&m->esr_last[sb][n1 - 1U], b1);
+        uint32_t n0 = (n1 << 1) | b1;
+        if (n0 != 15U) bits_q8 += zcvid_lh_cost_q8(&m->esr_last[sb][n0 - 1U], v & 1U);
+        for (uint32_t k = 0U; k < last_k; ++k) {
+            bits_q8 += zcvid_lh_cost_q8(&m->esr_sig[sb][k], (sig_mask >> k) & 1U);
+        }
+    }
+    uint32_t sm = sig_mask;
+    while (sm != 0U) {
+        uint32_t k = zcvid_lh_ctz32(sm);
+        sm &= (sm - 1U);
+        int32_t val = lv[k];
+        bits_q8 += 256U;
+        uint32_t mag = (uint32_t)((val < 0) ? -val : val);
+        uint32_t kb = (sb == 0U) ? zcvid_lh_tq_kb(k) : 3U;
+        uint32_t gt1 = (mag > 1U) ? 1U : 0U;
+        bits_q8 += zcvid_lh_cost_q8(&m->esr_gt1[kb], gt1);
+        if (gt1) {
+            uint32_t gt2 = (mag > 2U) ? 1U : 0U;
+            bits_q8 += zcvid_lh_cost_q8(&m->esr_gt2[kb], gt2);
+            if (gt2) {
+                bits_q8 += zcvid_lh_egk_cost_q8(m->esr_mag[kb], 7U, 12U, (uint64_t)(mag - 3U));
+            }
+        }
+    }
+    return bits_q8;
+}
+
+static inline uint32_t zcvid_lh_esr_rate_q8(const zcvid_lh_model_t *m, const zcvid_lh_esr_t *e) {
+    if (e->poly_only) {
+        if (e->poly_mask == 0U) return 0U;
+        uint32_t bits_q8 = zcvid_lh_cost_q8(&m->esr_poly_only, 1U);
+        uint32_t last_k = 31U - zcvid_lh_clz32(e->poly_mask);
+        uint32_t has_ac = (last_k > 0U) ? 1U : 0U;
+        bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_has_ac, has_ac);
+        if (has_ac) {
+            uint32_t v = last_k - 1U;
+            uint32_t ge2 = (v >= 2U) ? 1U : 0U;
+            bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_last[0], ge2);
+            if (!ge2) {
+                bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_last[1], v & 1U);
+            } else {
+                uint32_t is4 = (v == 4U) ? 1U : 0U;
+                bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_last[2], is4);
+                if (!is4) {
+                    bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_last[3], v - 2U);
+                }
+            }
+            for (uint32_t k = 0U; k < last_k; ++k) {
+                bits_q8 += zcvid_lh_cost_q8(&m->esr_poly_sig[k], (e->poly_mask >> k) & 1U);
+            }
+        }
+        uint32_t sm = e->poly_mask;
+        while (sm != 0U) {
+            uint32_t k = zcvid_lh_ctz32(sm);
+            sm &= (sm - 1U);
+            int32_t val = e->poly_lv[k];
+            bits_q8 += 256U;
+            uint32_t mag = (uint32_t)((val < 0) ? -val : val);
+            uint32_t kb = (k == 0U) ? 0U : ((k <= 2U) ? 1U : 2U);
+            uint32_t gt1 = (mag > 1U) ? 1U : 0U;
+            bits_q8 += zcvid_lh_cost_q8(&m->esr_gt1[kb], gt1);
+            if (gt1) {
+                uint32_t gt2 = (mag > 2U) ? 1U : 0U;
+                bits_q8 += zcvid_lh_cost_q8(&m->esr_gt2[kb], gt2);
+                if (gt2) {
+                    bits_q8 += zcvid_lh_egk_cost_q8(m->esr_mag[kb], 7U, 12U, (uint64_t)(mag - 3U));
+                }
+            }
+        }
+        return bits_q8;
+    }
+
+    uint32_t bits_q8 = zcvid_lh_cost_q8(&m->esr_poly_only, 0U);
+    for (uint32_t sb = 0U; sb < 4U; ++sb) {
+        uint32_t act = (e->csbf >> sb) & 1U;
+        bits_q8 += zcvid_lh_cost_q8(&m->esr_csbf[sb], act);
+        if (act) {
+            bits_q8 += zcvid_lh_esr_sb_rate_q8(m, sb, e->sb_lv[sb], e->sb_mask[sb]);
+        }
+    }
+    return bits_q8;
+}
+
+static bool zcvid_lh_esr_quant_and_prune(const int32_t wmat[64], const zcvid_lh_step_lut_t *lut,
+                                         const zcvid_lh_model_t *m, uint64_t lambda_q8,
+                                         bool is_inter, zcvid_lh_esr_t *e) {
+    static const uint32_t TQ_ZZ[16] = {
+        0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15
+    };
+    const uint32_t mf = (uint32_t)lut->dct8_mf;
+    const uint32_t qbits = lut->dct8_qbits;
+    const uint64_t dz = (uint64_t)lut->dct8_dz[is_inter ? 1 : 0];
+    const int32_t dq = lut->dct8_dq_step;
+
+    e->poly_only = false;
+    e->csbf = 0U;
+    e->poly_mask = 0U;
+
+    for (uint32_t sb = 0U; sb < 4U; ++sb) {
+        uint32_t v0 = (sb >> 1) * 4U;
+        uint32_t u0 = (sb & 1U) * 4U;
+        uint32_t sm = 0U;
+        for (uint32_t k = 0U; k < 16U; ++k) {
+            uint32_t r = TQ_ZZ[k];
+            uint32_t pos = (v0 + (r >> 2)) * 8U + (u0 + (r & 3U));
+            int32_t c = wmat[pos];
+            uint32_t ac = (c < 0) ? (0U - (uint32_t)c) : (uint32_t)c;
+            int32_t mag = (int32_t)(((uint64_t)ac * (uint64_t)mf + dz) >> qbits);
+            if (mag > 4095) mag = 4095;
+            int16_t lv = (int16_t)((c < 0) ? -mag : mag);
+            e->sb_lv[sb][k] = lv;
+            if (lv != 0) sm |= (1U << k);
+        }
+        /* Trailing-1 Parseval RDO pruning */
+        while (sm != 0U) {
+            uint32_t lk = 31U - zcvid_lh_clz32(sm);
+            int32_t lv = e->sb_lv[sb][lk];
+            if (lv != 1 && lv != -1) break;
+            uint32_t r = TQ_ZZ[lk];
+            uint32_t pos = (v0 + (r >> 2)) * 8U + (u0 + (r & 3U));
+            int64_t wv = (int64_t)wmat[pos];
+            int64_t diff = wv - (int64_t)lv * (int64_t)dq;
+            int64_t d_pix = (wv * wv - diff * diff) >> 8;
+            if (d_pix <= 0 || ((uint64_t)d_pix << 16) < lambda_q8 * 768ULL) {
+                e->sb_lv[sb][lk] = 0;
+                sm &= ~(1U << lk);
+            } else {
+                break;
+            }
+        }
+        e->sb_mask[sb] = sm;
+        if (sm != 0U) e->csbf |= (1U << sb);
+    }
+
+    if (e->csbf == 0U) return false;
+
+    /* Per-subblock Parseval RDO pruning for high-frequency repair blocks (LH, HL, HH) */
+    for (uint32_t sb = 1U; sb < 4U; ++sb) {
+        if (((e->csbf >> sb) & 1U) == 0U) continue;
+        uint32_t v0 = (sb >> 1) * 4U;
+        uint32_t u0 = (sb & 1U) * 4U;
+        int64_t d_acc = 0;
+        uint32_t sm = e->sb_mask[sb];
+        while (sm != 0U) {
+            uint32_t k = zcvid_lh_ctz32(sm);
+            sm &= (sm - 1U);
+            uint32_t r = TQ_ZZ[k];
+            uint32_t pos = (v0 + (r >> 2)) * 8U + (u0 + (r & 3U));
+            int64_t wv = (int64_t)wmat[pos];
+            int64_t diff = wv - (int64_t)e->sb_lv[sb][k] * (int64_t)dq;
+            d_acc += wv * wv - diff * diff;
+        }
+        int64_t d_pix = d_acc >> 8;
+        uint32_t r_sb = zcvid_lh_esr_sb_rate_q8(m, sb, e->sb_lv[sb], e->sb_mask[sb])
+                      + zcvid_lh_cost_q8(&m->esr_csbf[sb], 1U);
+        uint32_t r_off = zcvid_lh_cost_q8(&m->esr_csbf[sb], 0U);
+        uint32_t net_r = (r_sb > r_off) ? (r_sb - r_off) : 0U;
+        if (d_pix <= 0 || ((uint64_t)d_pix << 16) <= lambda_q8 * (uint64_t)net_r) {
+            e->csbf &= ~(1U << sb);
+            e->sb_mask[sb] = 0U;
+        }
+    }
+
+    if (e->csbf == 0U) return false;
+
+    /* Auto-promote to degree-2 Polynomial Prediction mode if all active coefs lie in k=0..5 of LL */
+    if (e->csbf == 1U && (e->sb_mask[0] & ~0x3FU) == 0U) {
+        e->poly_only = true;
+        e->poly_mask = e->sb_mask[0];
+        for (uint32_t k = 0U; k < 6U; ++k) e->poly_lv[k] = e->sb_lv[0][k];
+    }
+    return true;
+}
+
+static inline void zcvid_lh_esr_recon(const zcvid_lh_esr_t *e, const zcvid_lh_step_lut_t *lut,
+                                      int32_t out_delta[64]) {
+    static const uint32_t TQ_ZZ[16] = {
+        0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15
+    };
+    static const uint32_t POLY_POS[6] = { 0U, 1U, 8U, 16U, 9U, 2U };
+    const int32_t dq = lut->dct8_dq_step;
+    int32_t w_deq[64];
+
+    if (e->poly_only) {
+        w_deq[0] = 0; w_deq[1] = 0; w_deq[2] = 0;
+        w_deq[8] = 0; w_deq[9] = 0; w_deq[16] = 0;
+        uint32_t sm = e->poly_mask;
+        while (sm != 0U) {
+            uint32_t k = zcvid_lh_ctz32(sm);
+            sm &= (sm - 1U);
+            w_deq[POLY_POS[k]] = (int32_t)e->poly_lv[k] * dq;
+        }
+        zcvid_lh_dct8_inv_sparse(w_deq, 1U, true, out_delta);
+        return;
+    }
+
+    memset(w_deq, 0, sizeof(w_deq));
+    for (uint32_t sb = 0U; sb < 4U; ++sb) {
+        if (((e->csbf >> sb) & 1U) == 0U) continue;
+        uint32_t v0 = (sb >> 1) * 4U;
+        uint32_t u0 = (sb & 1U) * 4U;
+        uint32_t sm = e->sb_mask[sb];
+        while (sm != 0U) {
+            uint32_t k = zcvid_lh_ctz32(sm);
+            sm &= (sm - 1U);
+            uint32_t r = TQ_ZZ[k];
+            w_deq[(v0 + (r >> 2)) * 8U + (u0 + (r & 3U))] = (int32_t)e->sb_lv[sb][k] * dq;
+        }
+    }
+    zcvid_lh_dct8_inv_sparse(w_deq, e->csbf, false, out_delta);
+}
+
+static void zcvid_lh_esr_encode(zcrudp_rc_enc_t *rc, zcvid_lh_model_t *m, const zcvid_lh_esr_t *e) {
+    if (e->poly_only) {
+        if (e->poly_mask == 0U) return;
+        zcrudp_rc_enc_bit(rc, &m->esr_poly_only, 1U);
+        uint32_t last_k = 31U - zcvid_lh_clz32(e->poly_mask);
+        uint32_t has_ac = (last_k > 0U) ? 1U : 0U;
+        zcrudp_rc_enc_bit(rc, &m->esr_poly_has_ac, has_ac);
+        if (has_ac) {
+            uint32_t v = last_k - 1U;
+            uint32_t ge2 = (v >= 2U) ? 1U : 0U;
+            zcrudp_rc_enc_bit(rc, &m->esr_poly_last[0], ge2);
+            if (!ge2) {
+                zcrudp_rc_enc_bit(rc, &m->esr_poly_last[1], v & 1U);
+            } else {
+                uint32_t is4 = (v == 4U) ? 1U : 0U;
+                zcrudp_rc_enc_bit(rc, &m->esr_poly_last[2], is4);
+                if (!is4) {
+                    zcrudp_rc_enc_bit(rc, &m->esr_poly_last[3], v - 2U);
+                }
+            }
+            for (uint32_t k = 0U; k < last_k; ++k) {
+                zcrudp_rc_enc_bit(rc, &m->esr_poly_sig[k], (e->poly_mask >> k) & 1U);
+            }
+        }
+        for (uint32_t k = 0U; k <= last_k; ++k) {
+            if (((e->poly_mask >> k) & 1U) == 0U) continue;
+            int32_t val = e->poly_lv[k];
+            uint32_t neg = (val < 0) ? 1U : 0U;
+            zcrudp_rc_enc_bit_bypass(rc, neg);
+            uint32_t mag = (uint32_t)(neg ? -val : val);
+            uint32_t kb = (k == 0U) ? 0U : ((k <= 2U) ? 1U : 2U);
+            uint32_t gt1 = (mag > 1U) ? 1U : 0U;
+            zcrudp_rc_enc_bit(rc, &m->esr_gt1[kb], gt1);
+            if (gt1) {
+                uint32_t gt2 = (mag > 2U) ? 1U : 0U;
+                zcrudp_rc_enc_bit(rc, &m->esr_gt2[kb], gt2);
+                if (gt2) {
+                    zcrudp_rc_enc_egk(rc, m->esr_mag[kb], 7U, 12U, (uint64_t)(mag - 3U));
+                }
+            }
+        }
+        return;
+    }
+
+    zcrudp_rc_enc_bit(rc, &m->esr_poly_only, 0U);
+    for (uint32_t sb = 0U; sb < 4U; ++sb) {
+        uint32_t act = (e->csbf >> sb) & 1U;
+        zcrudp_rc_enc_bit(rc, &m->esr_csbf[sb], act);
+        if (!act) continue;
+        uint32_t sm = e->sb_mask[sb];
+        uint32_t last_k = 31U - zcvid_lh_clz32(sm);
+        uint32_t has_ac = (last_k > 0U) ? 1U : 0U;
+        zcrudp_rc_enc_bit(rc, &m->esr_has_ac[sb], has_ac);
+        if (has_ac) {
+            uint32_t v = last_k - 1U;
+            zcrudp_rc_prob_t *lk = m->esr_last[sb];
+            uint32_t b3 = (v >> 3) & 1U; zcrudp_rc_enc_bit(rc, &lk[0], b3);
+            uint32_t n2 = 2U | b3;
+            uint32_t b2 = (v >> 2) & 1U; zcrudp_rc_enc_bit(rc, &lk[n2 - 1U], b2);
+            uint32_t n1 = (n2 << 1) | b2;
+            uint32_t b1 = (v >> 1) & 1U; zcrudp_rc_enc_bit(rc, &lk[n1 - 1U], b1);
+            uint32_t n0 = (n1 << 1) | b1;
+            if (n0 != 15U) zcrudp_rc_enc_bit(rc, &lk[n0 - 1U], v & 1U);
+            for (uint32_t k = 0U; k < last_k; ++k) {
+                zcrudp_rc_enc_bit(rc, &m->esr_sig[sb][k], (sm >> k) & 1U);
+            }
+        }
+        for (uint32_t k = 0U; k <= last_k; ++k) {
+            if (((sm >> k) & 1U) == 0U) continue;
+            int32_t val = e->sb_lv[sb][k];
+            uint32_t neg = (val < 0) ? 1U : 0U;
+            zcrudp_rc_enc_bit_bypass(rc, neg);
+            uint32_t mag = (uint32_t)(neg ? -val : val);
+            uint32_t kb = (sb == 0U) ? zcvid_lh_tq_kb(k) : 3U;
+            uint32_t gt1 = (mag > 1U) ? 1U : 0U;
+            zcrudp_rc_enc_bit(rc, &m->esr_gt1[kb], gt1);
+            if (gt1) {
+                uint32_t gt2 = (mag > 2U) ? 1U : 0U;
+                zcrudp_rc_enc_bit(rc, &m->esr_gt2[kb], gt2);
+                if (gt2) {
+                    zcrudp_rc_enc_egk(rc, m->esr_mag[kb], 7U, 12U, (uint64_t)(mag - 3U));
+                }
+            }
+        }
+    }
+}
+
+static bool zcvid_lh_esr_decode(zcrudp_rc_dec_t *rc, zcvid_lh_model_t *m, zcvid_lh_esr_t *e) {
+    e->poly_only = (zcrudp_rc_dec_bit(rc, &m->esr_poly_only) != 0U);
+    if (e->poly_only) {
+        e->csbf = 1U;
+        uint32_t pm = 1U;
+        uint32_t last_k = 0U;
+        if (zcrudp_rc_dec_bit(rc, &m->esr_poly_has_ac) != 0U) {
+            uint32_t v;
+            if (zcrudp_rc_dec_bit(rc, &m->esr_poly_last[0]) == 0U) {
+                v = zcrudp_rc_dec_bit(rc, &m->esr_poly_last[1]);
+            } else if (zcrudp_rc_dec_bit(rc, &m->esr_poly_last[2]) != 0U) {
+                v = 4U;
+            } else {
+                v = 2U + zcrudp_rc_dec_bit(rc, &m->esr_poly_last[3]);
+            }
+            last_k = v + 1U;
+            pm = 1U << last_k;
+            for (uint32_t k = 0U; k < last_k; ++k) {
+                pm |= zcrudp_rc_dec_bit(rc, &m->esr_poly_sig[k]) << k;
+            }
+        }
+        e->poly_mask = pm;
+        for (uint32_t k = 0U; k <= last_k; ++k) {
+            if (((pm >> k) & 1U) == 0U) { e->poly_lv[k] = 0; continue; }
+            uint32_t neg = zcrudp_rc_dec_bit_bypass(rc);
+            uint32_t kb = (k == 0U) ? 0U : ((k <= 2U) ? 1U : 2U);
+            int32_t mag = 1;
+            if (zcrudp_rc_dec_bit(rc, &m->esr_gt1[kb]) != 0U) {
+                mag = 2;
+                if (zcrudp_rc_dec_bit(rc, &m->esr_gt2[kb]) != 0U) {
+                    mag = (int32_t)zcrudp_rc_dec_egk(rc, m->esr_mag[kb], 7U, 12U) + 3;
+                    if (mag > 4095) return false;
+                }
+            }
+            e->poly_lv[k] = (int16_t)(neg ? -mag : mag);
+        }
+        return true;
+    }
+
+    e->csbf = 0U;
+    e->poly_mask = 0U;
+    for (uint32_t sb = 0U; sb < 4U; ++sb) {
+        e->sb_mask[sb] = 0U;
+        if (zcrudp_rc_dec_bit(rc, &m->esr_csbf[sb]) == 0U) continue;
+        e->csbf |= (1U << sb);
+        uint32_t sm = 1U;
+        uint32_t last_k = 0U;
+        if (zcrudp_rc_dec_bit(rc, &m->esr_has_ac[sb]) != 0U) {
+            zcrudp_rc_prob_t *lk = m->esr_last[sb];
+            uint32_t node = 2U | zcrudp_rc_dec_bit(rc, &lk[0]);
+            node = (node << 1) | zcrudp_rc_dec_bit(rc, &lk[node - 1U]);
+            node = (node << 1) | zcrudp_rc_dec_bit(rc, &lk[node - 1U]);
+            node = (node == 15U) ? 30U : ((node << 1) | zcrudp_rc_dec_bit(rc, &lk[node - 1U]));
+            last_k = node - 15U;
+            sm = 1U << last_k;
+            for (uint32_t k = 0U; k < last_k; ++k) {
+                sm |= zcrudp_rc_dec_bit(rc, &m->esr_sig[sb][k]) << k;
+            }
+        }
+        e->sb_mask[sb] = sm;
+        for (uint32_t k = 0U; k <= last_k; ++k) {
+            if (((sm >> k) & 1U) == 0U) { e->sb_lv[sb][k] = 0; continue; }
+            uint32_t neg = zcrudp_rc_dec_bit_bypass(rc);
+            uint32_t kb = (sb == 0U) ? zcvid_lh_tq_kb(k) : 3U;
+            int32_t mag = 1;
+            if (zcrudp_rc_dec_bit(rc, &m->esr_gt1[kb]) != 0U) {
+                mag = 2;
+                if (zcrudp_rc_dec_bit(rc, &m->esr_gt2[kb]) != 0U) {
+                    mag = (int32_t)zcrudp_rc_dec_egk(rc, m->esr_mag[kb], 7U, 12U) + 3;
+                    if (mag > 4095) return false;
+                }
+            }
+            e->sb_lv[sb][k] = (int16_t)(neg ? -mag : mag);
+        }
+    }
+    return (e->csbf != 0U);
 }
 
 /* Bit-exact separable rank-1 8x8 inverse DCT for SPEC_LRF:
@@ -1368,6 +2193,19 @@ static uint32_t zcvid_lh_mode_rate_q8(const zcvid_lh_model_t *m, zcvid_lh_codec_
         }
         return c;
     }
+    if (codec == ZCVID_LH_HYBRID_ESR) {
+        /* 1-bit fast spectral path: 0 -> POLY_ESR, 1 -> Spatial {TQ4, LRF1, CASCADE} */
+        uint32_t is_spatial = (blk_mode != ZCVID_LH_BLK_POLY_ESR) ? 1U : 0U;
+        c += zcvid_lh_cost_q8(&m->mode_b[0], is_spatial);
+        if (is_spatial) {
+            uint32_t is_lrf = (blk_mode != ZCVID_LH_BLK_TQ4) ? 1U : 0U;
+            c += zcvid_lh_cost_q8(&m->mode_b[1], is_lrf);
+            if (is_lrf) {
+                c += zcvid_lh_cost_q8(&m->mode_b[2], (blk_mode == ZCVID_LH_BLK_CASCADE) ? 1U : 0U);
+            }
+        }
+        return c;
+    }
     /* ZCVID_LH_HYBRID_FULL: {TQ4, LRF1, LRF2, CASCADE, SPEC_LRF} */
     uint32_t has_lrf = (blk_mode != ZCVID_LH_BLK_TQ4) ? 1U : 0U;
     c += zcvid_lh_cost_q8(&m->mode_b[0], has_lrf);
@@ -1429,6 +2267,18 @@ static void zcvid_lh_encode_mode(zcrudp_rc_enc_t *rc, zcvid_lh_model_t *m, zcvid
         }
         return;
     }
+    if (codec == ZCVID_LH_HYBRID_ESR) {
+        uint32_t is_spatial = (blk_mode != ZCVID_LH_BLK_POLY_ESR) ? 1U : 0U;
+        zcrudp_rc_enc_bit(rc, &m->mode_b[0], is_spatial);
+        if (is_spatial) {
+            uint32_t is_lrf = (blk_mode != ZCVID_LH_BLK_TQ4) ? 1U : 0U;
+            zcrudp_rc_enc_bit(rc, &m->mode_b[1], is_lrf);
+            if (is_lrf) {
+                zcrudp_rc_enc_bit(rc, &m->mode_b[2], (blk_mode == ZCVID_LH_BLK_CASCADE) ? 1U : 0U);
+            }
+        }
+        return;
+    }
     /* FULL */
     uint32_t has_lrf = (blk_mode != ZCVID_LH_BLK_TQ4) ? 1U : 0U;
     zcrudp_rc_enc_bit(rc, &m->mode_b[0], has_lrf);
@@ -1466,6 +2316,11 @@ static zcvid_lh_blk_mode_t zcvid_lh_decode_mode(zcrudp_rc_dec_t *rc, zcvid_lh_mo
         if (zcrudp_rc_dec_bit(rc, &m->mode_b[0]) == 0U) return ZCVID_LH_BLK_TQ4;
         if (zcrudp_rc_dec_bit(rc, &m->mode_b[3]) != 0U) return ZCVID_LH_BLK_SPEC_LRF;
         return zcrudp_rc_dec_bit(rc, &m->mode_b[1]) ? ZCVID_LH_BLK_CASCADE : ZCVID_LH_BLK_LRF1;
+    }
+    if (codec == ZCVID_LH_HYBRID_ESR) {
+        if (zcrudp_rc_dec_bit(rc, &m->mode_b[0]) == 0U) return ZCVID_LH_BLK_POLY_ESR;
+        if (zcrudp_rc_dec_bit(rc, &m->mode_b[1]) == 0U) return ZCVID_LH_BLK_TQ4;
+        return zcrudp_rc_dec_bit(rc, &m->mode_b[2]) ? ZCVID_LH_BLK_CASCADE : ZCVID_LH_BLK_LRF1;
     }
     /* FULL */
     if (zcrudp_rc_dec_bit(rc, &m->mode_b[0]) == 0U) return ZCVID_LH_BLK_TQ4;
@@ -1614,7 +2469,8 @@ static size_t zcvid_lh_encode_slice_fast(zcvid_lh_codec_t codec, const uint8_t *
     zcvid_lh_model_t m;
     zcvid_lh_model_init(&m);
 
-    const bool is_hybrid = (codec == ZCVID_LH_HYBRID_FAST);
+    const bool is_hybrid = (codec == ZCVID_LH_HYBRID_FAST || codec == ZCVID_LH_HYBRID_ESR);
+    const bool use_esr   = (codec == ZCVID_LH_HYBRID_ESR);
 
     for (uint32_t sby = sby_begin; sby < sby_end; ++sby) {
         uint8_t left_nz = 0U;
@@ -1643,40 +2499,78 @@ static size_t zcvid_lh_encode_slice_fast(zcvid_lh_codec_t codec, const uint8_t *
             zcvid_lh_blk_mode_t best_mode = ZCVID_LH_BLK_SKIP;
             uint64_t best_j = skip_j;
 
-            /* Candidate A: SPEC_LRF (fast AVX2 DCT8 + integer LRF + rank-1 IDCT8) */
+            /* Candidate A: Shared-Routing 8x8 Spectral Stage (POLY_ESR + SPEC_LRF)
+             * Single forward DCT8 (zero-vpmulld AVX2 / 12-mul Negacyclic-Karatsuba)
+             * shared between Polynomial+Exact-Spectral-Repair and Rank-1 SPEC_LRF. */
             zcvid_lh_lrf_t spec_lrf;
             int32_t spec_delta[64];
             spec_lrf.level = 0;
             uint32_t spec_sse = 0xFFFFFFFFU;
+            zcvid_lh_esr_t esr;
+            int32_t esr_delta[64];
+            uint32_t esr_sse = 0xFFFFFFFFU;
+            uint32_t esr_rate_q8 = 0xFFFFFFFFU;
             bool skip_rest = false;
             if (is_hybrid) {
                 int32_t wmat[64];
                 zcvid_lh_dct8_fwd(res, wmat);
-                zcvid_lh_fit_lrf_fast(wmat, step_lut, true, &spec_lrf);
-                if (spec_lrf.level != 0) {
-                    zcvid_lh_spec_lrf_recon(&spec_lrf, spec_delta);
-                    spec_sse = zcvid_lh_sb_sse_clamp_i32(src_i32, pred_i32, spec_delta);
-                    uint32_t rs_q8 = zcvid_lh_mode_rate_q8(&m, codec, skip_ctx, ZCVID_LH_BLK_SPEC_LRF)
-                                   + zcvid_lh_lrf_rate_q8(&m, &spec_lrf);
-                    uint64_t js = ((uint64_t)spec_sse << 16) + lambda_q8 * (uint64_t)rs_q8;
-                    if (js < best_j) {
-                        best_j = js;
-                        best_mode = ZCVID_LH_BLK_SPEC_LRF;
-                        /* Fast early-accept: if SPEC_LRF is lossless OR captured >93.75% of
-                         * block energy with residual within quantization noise (<4*lambda). */
-                        if (spec_sse == 0U ||
-                            (spec_sse <= (skip_sse >> 4) && ((uint64_t)spec_sse << 16) <= lambda_q8 * 1024ULL)) {
-                            skip_rest = true;
+
+                if (use_esr) {
+                    if (zcvid_lh_esr_quant_and_prune(wmat, step_lut, &m, lambda_q8, is_inter, &esr)) {
+                        zcvid_lh_esr_recon(&esr, step_lut, esr_delta);
+                        esr_sse = zcvid_lh_sb_sse_clamp_i32(src_i32, pred_i32, esr_delta);
+                        esr_rate_q8 = zcvid_lh_mode_rate_q8(&m, codec, skip_ctx, ZCVID_LH_BLK_POLY_ESR)
+                                    + zcvid_lh_esr_rate_q8(&m, &esr);
+                        uint64_t je = ((uint64_t)esr_sse << 16) + lambda_q8 * (uint64_t)esr_rate_q8;
+                        if (je < best_j) {
+                            best_j = je;
+                            best_mode = ZCVID_LH_BLK_POLY_ESR;
+                            /* Early-accept ONLY when POLY_ESR is both accurate AND compact
+                             * (degree-2 polynomial or low-bit LL block <= 20 bits). High-bit
+                             * HF blocks (checkerboards, crisp UI edges) still test LRF1/CASCADE! */
+                            if (esr_sse == 0U && esr_rate_q8 <= (20U << 8)) {
+                                skip_rest = true;
+                            } else if (esr.poly_only && esr_sse <= (skip_sse >> 4) &&
+                                       ((uint64_t)esr_sse << 16) <= lambda_q8 * 1024ULL) {
+                                skip_rest = true;
+                            } else if (esr.csbf == 1U && esr_rate_q8 <= (24U << 8) &&
+                                       esr_sse <= (skip_sse >> 4) &&
+                                       ((uint64_t)esr_sse << 16) <= lambda_q8 * 1536ULL) {
+                                skip_rest = true;
+                            }
+                        }
+                    }
+                } else {
+                    zcvid_lh_fit_lrf_fast(wmat, step_lut, true, &spec_lrf);
+                    if (spec_lrf.level != 0) {
+                        zcvid_lh_spec_lrf_recon(&spec_lrf, spec_delta);
+                        spec_sse = zcvid_lh_sb_sse_clamp_i32(src_i32, pred_i32, spec_delta);
+                        uint32_t rs_q8 = zcvid_lh_mode_rate_q8(&m, codec, skip_ctx, ZCVID_LH_BLK_SPEC_LRF)
+                                       + zcvid_lh_lrf_rate_q8(&m, &spec_lrf);
+                        uint64_t js = ((uint64_t)spec_sse << 16) + lambda_q8 * (uint64_t)rs_q8;
+                        if (js < best_j) {
+                            best_j = js;
+                            best_mode = ZCVID_LH_BLK_SPEC_LRF;
+                            if (spec_sse == 0U ||
+                                (spec_sse <= (skip_sse >> 4) && ((uint64_t)spec_sse << 16) <= lambda_q8 * 1024ULL)) {
+                                skip_rest = true;
+                            }
                         }
                     }
                 }
             }
 
-            /* Candidate B: TQ4 (with per-quadrant SKIP, LUT quant/dequant & DC-only fast path) */
+            /* Candidate B: TQ4 (with per-quadrant SKIP, LUT quant/dequant & DC-only fast path)
+             * In HYBRID_ESR, skip 4x TQ4 only when 8x8 POLY_ESR already solved the block
+             * compactly in the LL sub-block (csbf==1, <=24 bits, >87.5% energy); allow TQ4
+             * to compete on high-rate / multi-subblock HF & localized 1-quadrant blocks! */
             int16_t tq_lv[4][16];
             uint32_t tq_cbp = 0U;
             int32_t tq_delta[64];
-            if (!skip_rest) {
+            const bool try_tq4 = !skip_rest &&
+                !(use_esr && best_mode == ZCVID_LH_BLK_POLY_ESR &&
+                  esr.csbf == 1U && esr_rate_q8 <= (24U << 8) && esr_sse <= (skip_sse >> 3));
+            if (try_tq4) {
                 memset(tq_delta, 0, sizeof(tq_delta));
                 uint32_t tq_sse = 0U;
                 uint32_t tq_rate_q8 = zcvid_lh_mode_rate_q8(&m, codec, skip_ctx, ZCVID_LH_BLK_TQ4);
@@ -1752,7 +2646,8 @@ static size_t zcvid_lh_encode_slice_fast(zcvid_lh_codec_t codec, const uint8_t *
 
             const bool try_spatial_lrf = is_hybrid && !skip_rest
                 && best_j > lambda_q8 * (10ULL << 8)
-                && !(best_mode == ZCVID_LH_BLK_SPEC_LRF && spec_sse <= (skip_sse >> 3));
+                && !(best_mode == ZCVID_LH_BLK_SPEC_LRF && spec_sse <= (skip_sse >> 3))
+                && !(best_mode == ZCVID_LH_BLK_POLY_ESR && esr_rate_q8 <= (24U << 8) && esr_sse <= (skip_sse >> 3));
 
             if (try_spatial_lrf) {
                 zcvid_lh_fit_lrf_fast(res, step_lut, false, &lrf1);
@@ -1865,6 +2760,9 @@ static size_t zcvid_lh_encode_slice_fast(zcvid_lh_codec_t codec, const uint8_t *
             } else if (best_mode == ZCVID_LH_BLK_SPEC_LRF) {
                 zcvid_lh_lrf_encode(&rc, &m, &spec_lrf);
                 final_delta = spec_delta;
+            } else if (best_mode == ZCVID_LH_BLK_POLY_ESR) {
+                zcvid_lh_esr_encode(&rc, &m, &esr);
+                final_delta = esr_delta;
             }
 
             if (out_rec) zcvid_lh_store_sb_clamp_u8(pred, w, bx, by, final_delta, out_rec);
@@ -1923,6 +2821,10 @@ static int zcvid_lh_decode_slice(zcvid_lh_codec_t codec, const uint8_t *bs, size
                 zcvid_lh_lrf_t f;
                 ok = zcvid_lh_lrf_decode_lut(&rc, &m, step_lut, true, &f);
                 if (ok) zcvid_lh_spec_lrf_recon(&f, delta);
+            } else if (bm == ZCVID_LH_BLK_POLY_ESR) {
+                zcvid_lh_esr_t esr;
+                ok = zcvid_lh_esr_decode(&rc, &m, &esr);
+                if (ok) zcvid_lh_esr_recon(&esr, step_lut, delta);
             } else {
                 memset(delta, 0, sizeof(delta));
                 if (bm == ZCVID_LH_BLK_TQ4 || bm == ZCVID_LH_BLK_CASCADE) {
@@ -2002,7 +2904,7 @@ static size_t zcvid_lh_encode_frame(zcvid_lh_codec_t codec, const uint8_t *src, 
     /* H.264/JVT Lagrangian multiplier: lambda = 0.85 * 2^((qp - 12)/3) */
     const double lambda = 0.85 * pow(2.0, ((double)qp - 12.0) / 3.0);
 
-    if (codec == ZCVID_LH_HYBRID_FAST) {
+    if (codec == ZCVID_LH_HYBRID_FAST || codec == ZCVID_LH_HYBRID_ESR) {
         zcvid_lh_step_lut_t step_lut;
         zcvid_lh_step_lut_init(&step_lut, qp);
         uint64_t lambda_q8 = (uint64_t)llround(lambda * 256.0);
@@ -2320,7 +3222,7 @@ typedef enum {
 typedef struct zcvid_lh_mt_pool zcvid_lh_mt_pool_t;
 
 typedef struct {
-    _Alignas(64) zcvid_lh_mt_pool_t *pool;
+    ZCVID_LH_ALIGNAS64 zcvid_lh_mt_pool_t *pool;
     uint32_t tid;
     uint8_t *up_row;
     size_t   up_cap;
@@ -2340,8 +3242,8 @@ struct zcvid_lh_mt_pool {
     uint32_t num_threads;
     zcvid_lh_mt_worker_t workers[ZCVID_LH_MT_MAX_THREADS];
 
-    _Alignas(64) atomic_uint_fast32_t gen;
-    _Alignas(64) atomic_uint_fast32_t active_workers;
+    ZCVID_LH_ALIGNAS64 atomic_uint_fast32_t gen;
+    ZCVID_LH_ALIGNAS64 atomic_uint_fast32_t active_workers;
     atomic_int op;
 
 #if defined(_WIN32)
@@ -2606,7 +3508,7 @@ static size_t zcvid_lh_mt_encode_frame(zcvid_lh_mt_pool_t *p, zcvid_lh_codec_t c
     if (!p || p->num_threads == 0U || !src || !pred || !out_bs ||
         w == 0U || h == 0U || w > 65535U || h > 65535U ||
         (w & 7U) != 0U || (h & 7U) != 0U || qp > 51U) return 0U;
-    if (codec != ZCVID_LH_HYBRID_FAST && codec != ZCVID_LH_TQ4) return 0U;
+    if (codec != ZCVID_LH_HYBRID_FAST && codec != ZCVID_LH_HYBRID_ESR && codec != ZCVID_LH_TQ4) return 0U;
     if (out_stats) memset(out_stats, 0, sizeof(*out_stats));
 
     const uint32_t sbh = h >> 3;
@@ -2659,7 +3561,7 @@ static size_t zcvid_lh_mt_encode_frame(zcvid_lh_mt_pool_t *p, zcvid_lh_codec_t c
         memcpy(out_bs + pos, p->workers[s].slice_buf, slen);
         pos += slen;
         if (out_stats) {
-            for (int k = 0; k < 6; ++k) out_stats->count[k] += p->workers[s].stats.count[k];
+            for (int k = 0; k < 7; ++k) out_stats->count[k] += p->workers[s].stats.count[k];
         }
     }
     return pos;

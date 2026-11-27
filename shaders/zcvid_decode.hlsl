@@ -47,6 +47,51 @@ static const int TQ_MF[18] = { 13107, 5243, 8066,  11916, 4660, 7490,  10082, 41
                                9362, 3647, 5825,   8192, 3355, 5243,   7282, 2893, 4559 };
 static const int TQ_V[18]  = { 10, 16, 13,  11, 18, 14,  13, 20, 16,
                                14, 23, 18,  16, 25, 20,  18, 29, 23 };
+static const int TQ8_V[6]  = { 40, 45, 51, 57, 64, 72 };
+
+int Tq8Dequant(int level, uint qp) {
+    uint qp_mod = qp % 6u;
+    uint qp_div = qp / 6u;
+    int dq_step = (qp_div >= 2u)
+                      ? (TQ8_V[qp_mod] << (qp_div - 2u))
+                      : (((TQ8_V[qp_mod] << qp_div) + 2) >> 2);
+    return clamp(level * dq_step, -65535, 65535);
+}
+
+// Exact 12-mul 1D HEVC IDCT8 (Negacyclic-Karatsuba 9-mul odd + Gauss 3-mul even).
+// Shared bit-for-bit with zcvid_encode.hlsl, zcvid_gpu_cpu_dec.h, and ZcvidDCT8Circuit.lean.
+void Dct8Inv1D(inout int x0, inout int x1, inout int x2, inout int x3,
+               inout int x4, inout int x5, inout int x6, inout int x7,
+               int rnd, int sh) {
+    int e0 = 64 * (x0 + x4);
+    int e1 = 64 * (x0 - x4);
+    int pev = 36 * (x2 + x6);
+    int g0 = pev + 47 * x2;
+    int g1 = pev - 119 * x6;
+    int E0 = e0 + g0, E1 = e1 + g1, E2 = e1 - g1, E3 = e0 - g0;
+
+    int s0 = x1 + x7, s1 = x5 + x3;
+    int m0 = 89 * x1, m1 = -75 * x5, m2 = 14 * (x1 + x5);
+    int m3 = -18 * x7, m4 = -50 * x3, m5 = -68 * (x7 + x3);
+    int m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+    int u0 = m0 + m3, d0 = m0 - m3;
+    int u1 = m1 + m4, d1 = m1 - m4;
+    int u2 = m2 + m5, d2 = m2 - m5;
+    int k0 = m6 - u0, k1 = m7 - u1;
+    int O0 = d0 - k1;
+    int O1 = d0 + d1 - d2;
+    int O2 = k0 + k1 + u2 - m8;
+    int O3 = -k0 - d1;
+
+    x0 = (E0 + O0 + rnd) >> sh;
+    x1 = (E1 + O1 + rnd) >> sh;
+    x2 = (E2 + O2 + rnd) >> sh;
+    x3 = (E3 + O3 + rnd) >> sh;
+    x4 = (E3 - O3 + rnd) >> sh;
+    x5 = (E2 - O2 + rnd) >> sh;
+    x6 = (E1 - O1 + rnd) >> sh;
+    x7 = (E0 - O0 + rnd) >> sh;
+}
 
 // 0: both coordinates even, 1: both odd, 2: mixed.
 uint TqClass(uint r) {
@@ -314,19 +359,29 @@ void CSApply(uint3 dtid : SV_DispatchThreadID) {
 
     if (tag == 3u) {
         if (is_2x != 0u && ((w0 >> 28) & 1u) != 0u) {
-            // Transform intra coefficient: stored dequantized, CSITrans rebuilds the block.
+            // Transform coefficient: stored dequantized, CSITrans rebuilds the block.
             uint pid = w0 & 0x0FFFFFFFu;
             uint b = pid / 48u;
             uint qp = (w1 >> 16) & 0xFFu;
             uint pred = (w1 >> 24) & 0xFFu;
-            uint nblocks = ((width + 3u) >> 2) * ((height + 3u) >> 2);
-            if (b >= nblocks || qp > 51u || pred > 3u) return;
+            uint bw = (width + 3u) >> 2;
+            uint bh = (height + 3u) >> 2;
+            uint nblocks = bw * bh;
+            if (b >= nblocks || qp > 51u || pred > 5u) return;
             int level = (int)(w1 << 16) >> 16;
-            if (level < -255 || level > 255) return;
-            uint r = TQ_ZZ[pid % 16u];
-            g_coef[pid] = (uint)TqDequant(level, r, qp);
-            g_tflag[b] = 1u + pred; // every record of a block carries the same pred
-
+            if (pred >= 4u) {
+                if (level < -2047 || level > 2047) return;
+                uint bx0 = (b % bw) & ~1u;
+                uint by0 = (b / bw) & ~1u;
+                if (bx0 + 1u >= bw || by0 + 1u >= bh) return;
+                g_coef[pid] = (uint)Tq8Dequant(level, qp);
+                g_tflag[by0 * bw + bx0] = 1u + pred;
+            } else {
+                if (level < -255 || level > 255) return;
+                uint r = TQ_ZZ[pid % 16u];
+                g_coef[pid] = (uint)TqDequant(level, r, qp);
+                g_tflag[b] = 1u + pred; // every record of a block carries the same pred
+            }
             return;
         }
         if (is_2x != 0u) {
@@ -479,22 +534,27 @@ int TqSample8x8(int c[16], uint lx, uint ly) {
 }
 
 // =========================================================================
-// Pass 2b: Transform reconstruction (4x4 mode 1..2 and 8x8 mode 3..4)
+// Pass 2b: Transform reconstruction (4x4 mode 1..2, legacy 8x8 mode 3..4,
+//          exact 8x8 Factored HEVC DCT8 mode 5..6)
 // Runs after CSApply. A flagged block is rebuilt from its coefficients
 // (missing ones are 0), then its coefficients and flag are cleared so the
 // buffers are all-zero again for the next frame.
 // =========================================================================
+groupshared int gs_dec8[2048]; // 32 slots x 64 ints (collision-free for even bx,by)
+
 [numthreads(64, 1, 1)]
-void CSITrans(uint3 dtid : SV_DispatchThreadID) {
+void CSITrans(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
     uint bw = (width + 3u) >> 2;
     uint bh = (height + 3u) >> 2;
     uint b = dtid.x;
     uint mode = (b < bw * bh) ? g_tflag[b] : 0u;
     if (mode == 0u) return;
     g_tflag[b] = 0u;
-    uint x0 = (b % bw) * 4u;
-    uint y0 = (b / bw) * 4u;
-    bool is_inter = (mode == 2u) || (mode == 4u);
+    uint bx0 = b % bw;
+    uint by0 = b / bw;
+    uint x0 = bx0 * 4u;
+    uint y0 = by0 * 4u;
+    bool is_inter = (mode == 2u) || (mode == 4u) || (mode == 6u);
     if (mode <= 2u) {
         bool inside = (x0 + 4u <= width) && (y0 + 4u <= height);
         uint cur[16];
@@ -521,7 +581,7 @@ void CSITrans(uint3 dtid : SV_DispatchThreadID) {
             g_cur_yuvd[idx] = (uint)rec[j] | ((uint)rec[16u + j] << 8) |
                               ((uint)rec[32u + j] << 16) | (delta_min << 24);
         }
-    } else {
+    } else if (mode <= 4u) {
         // 8x8 bilinear-upsampled transform block (mode 3 = intra, mode 4 = inter).
         bool inside8 = (x0 + 8u <= width) && (y0 + 8u <= height);
         int c0[16], c1[16], c2[16];
@@ -546,6 +606,82 @@ void CSITrans(uint3 dtid : SV_DispatchThreadID) {
                 int rb = clamp((int)((pw >> 8) & 0xFFu) + TqSample8x8(c1, lx, ly), 0, 255);
                 int rr = clamp((int)((pw >> 16) & 0xFFu) + TqSample8x8(c2, lx, ly), 0, 255);
                 g_cur_yuvd[idx] = (uint)ry | ((uint)rb << 8) | ((uint)rr << 16) | (delta_min << 24);
+            }
+        }
+    } else {
+        // Exact 8x8 Factored HEVC DCT8 (mode 5 = intra, mode 6 = inter).
+        bool valid_sb = ((bx0 & 1u) == 0u) && ((by0 & 1u) == 0u) && (bx0 + 1u < bw) && (by0 + 1u < bh);
+        if (!valid_sb) return;
+        bool inside8 = (x0 + 8u <= width) && (y0 + 8u <= height);
+        uint bq[4] = { b, b + 1u, b + bw, b + bw + 1u };
+        uint s8 = (gtid.x >> 1) * 64u;
+
+        [loop] for (uint pl = 0u; pl < 3u; pl++) {
+            uint csbf = 0u;
+            [loop] for (uint q = 0u; q < 4u; q++) {
+                uint u0 = (q & 1u) * 4u;
+                uint v0 = (q >> 1) * 4u;
+                uint base_pid = bq[q] * 48u + pl * 16u;
+                int nz_or = 0;
+                [unroll] for (uint k = 0u; k < 16u; k++) {
+                    int cv = (int)g_coef[base_pid + k];
+                    g_coef[base_pid + k] = 0u;
+                    uint r = TQ_ZZ[k];
+                    gs_dec8[s8 + (v0 + (r >> 2)) * 8u + (u0 + (r & 3u))] = cv;
+                    nz_or |= cv;
+                }
+                if (nz_or != 0) csbf |= (1u << q);
+            }
+            if (!inside8) continue;
+
+            uint sh = pl * 8u;
+            uint clear_m = ~(0xFFu << sh);
+            if (csbf == 0u) {
+                if (pl == 0u) {
+                    [loop] for (uint ly0 = 0u; ly0 < 8u; ly0++) {
+                        uint row_off = (y0 + ly0) * width + x0;
+                        [unroll] for (uint lx0 = 0u; lx0 < 8u; lx0++) {
+                            uint pw = is_inter ? g_cur_yuvd[row_off + lx0] : 0x00808080u;
+                            g_cur_yuvd[row_off + lx0] = (pw & 0x00FFFFFFu) | (delta_min << 24);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 12-mul Negacyclic-Karatsuba + Gauss 2D IDCT8 (with exact zero-row skip).
+            uint v_end = ((csbf & 12u) != 0u) ? 8u : 4u;
+            [loop] for (uint v = 0u; v < v_end; v++) {
+                uint rb = s8 + v * 8u;
+                int c0 = gs_dec8[rb + 0u], c1 = gs_dec8[rb + 1u], c2 = gs_dec8[rb + 2u], c3 = gs_dec8[rb + 3u];
+                int c4 = gs_dec8[rb + 4u], c5 = gs_dec8[rb + 5u], c6 = gs_dec8[rb + 6u], c7 = gs_dec8[rb + 7u];
+                if ((c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7) != 0) {
+                    Dct8Inv1D(c0, c1, c2, c3, c4, c5, c6, c7, 64, 7);
+                    gs_dec8[rb + 0u] = c0; gs_dec8[rb + 1u] = c1; gs_dec8[rb + 2u] = c2; gs_dec8[rb + 3u] = c3;
+                    gs_dec8[rb + 4u] = c4; gs_dec8[rb + 5u] = c5; gs_dec8[rb + 6u] = c6; gs_dec8[rb + 7u] = c7;
+                }
+            }
+            [loop] for (uint x = 0u; x < 8u; x++) {
+                uint cb = s8 + x;
+                int c0 = gs_dec8[cb + 0u],  c1 = gs_dec8[cb + 8u],  c2 = gs_dec8[cb + 16u], c3 = gs_dec8[cb + 24u];
+                int c4 = gs_dec8[cb + 32u], c5 = gs_dec8[cb + 40u], c6 = gs_dec8[cb + 48u], c7 = gs_dec8[cb + 56u];
+                Dct8Inv1D(c0, c1, c2, c3, c4, c5, c6, c7, 2048, 12);
+                gs_dec8[cb + 0u]  = c0; gs_dec8[cb + 8u]  = c1; gs_dec8[cb + 16u] = c2; gs_dec8[cb + 24u] = c3;
+                gs_dec8[cb + 32u] = c4; gs_dec8[cb + 40u] = c5; gs_dec8[cb + 48u] = c6; gs_dec8[cb + 56u] = c7;
+            }
+
+            [loop] for (uint ly = 0u; ly < 8u; ly++) {
+                uint row_off = (y0 + ly) * width + x0;
+                uint gs_row = s8 + ly * 8u;
+                [unroll] for (uint lx = 0u; lx < 8u; lx++) {
+                    uint idx = row_off + lx;
+                    uint pw = (pl == 0u && !is_inter) ? 0x00808080u : g_cur_yuvd[idx];
+                    int pv = (int)((pw >> sh) & 0xFFu);
+                    uint nv = (uint)clamp(pv + gs_dec8[gs_row + lx], 0, 255);
+                    uint out_w = (pw & clear_m) | (nv << sh);
+                    if (pl == 0u) out_w = (out_w & 0x00FFFFFFu) | (delta_min << 24);
+                    g_cur_yuvd[idx] = out_w;
+                }
             }
         }
     }

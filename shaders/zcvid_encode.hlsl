@@ -144,8 +144,13 @@ uint TqInterCap() {
         // On a GPU-detected abrupt scene cut (or single-frame keyframe), expand
         // the Frame-0 I-frame cap so 100% of superblocks refresh cleanly on
         // Frame 0 (minimum 3 DC records = 6 words/SB = 1.5*nb just for DC).
+        // CABAC v4 (mode_flags bit 8: 8x8 DCT8) codes ~35% more coefs per byte,
+        // so allow +1*nb record words while keeping encoded frame bytes <= legacy.
         uint nb = ((width + 3u) >> 2) * ((height + 3u) >> 2);
-        uint cut_cap = (max_record_words >= nb) ? (nb * 4u) : (nb * 3u);
+        bool dct8_cut = (mode_flags & 256u) != 0u;
+        uint cut_mult = (max_record_words >= nb) ? (dct8_cut ? 5u : 4u)
+                                                 : (dct8_cut ? 4u : 3u);
+        uint cut_cap = nb * cut_mult;
         if (cut_cap > max_safe) cut_cap = max_safe;
         return max(base_cap, cut_cap);
     }
@@ -210,6 +215,82 @@ static const int TQ_MF[18] = { 13107, 5243, 8066,  11916, 4660, 7490,  10082, 41
                                9362, 3647, 5825,   8192, 3355, 5243,   7282, 2893, 4559 };
 static const int TQ_V[18]  = { 10, 16, 13,  11, 18, 14,  13, 20, 16,
                                14, 23, 18,  16, 25, 20,  18, 29, 23 };
+static const int TQ8_MF[6] = { 26214, 23302, 20560, 18396, 16384, 14564 };
+static const int TQ8_V[6]  = { 40, 45, 51, 57, 64, 72 };
+
+int Tq8Dequant(int level, uint qp) {
+    uint qp_mod = qp % 6u;
+    uint qp_div = qp / 6u;
+    int dq_step = (qp_div >= 2u)
+                      ? (TQ8_V[qp_mod] << (qp_div - 2u))
+                      : (((TQ8_V[qp_mod] << qp_div) + 2) >> 2);
+    return clamp(level * dq_step, -65535, 65535);
+}
+
+// Exact 12-mul 1D forward HEVC DCT8 (Negacyclic-Karatsuba 9-mul odd + Gauss 3-mul even).
+// Proved bit-exact and overflow-free in zcvid/proofs/lean4/ZcvidDCT8Circuit.lean.
+void Dct8Fwd1D(inout int x0, inout int x1, inout int x2, inout int x3,
+               inout int x4, inout int x5, inout int x6, inout int x7,
+               int rnd, int sh) {
+    int e0 = x0 + x7, e1 = x1 + x6, e2 = x2 + x5, e3 = x3 + x4;
+    int o0 = x0 - x7, o1 = x1 - x6, o2 = x2 - x5, o3 = x3 - x4;
+    int ee0 = e0 + e3, ee1 = e1 + e2;
+    int eo0 = e0 - e3, eo1 = e1 - e2;
+    int pev = 36 * (eo0 + eo1);
+
+    int s0 = o0 + o3, s1 = o2 + o1;
+    int m0 = 89 * o0, m1 = -75 * o2, m2 = 14 * (o0 + o2);
+    int m3 = -18 * o3, m4 = -50 * o1, m5 = -68 * (o3 + o1);
+    int m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+    int u0 = m0 + m3, d0 = m0 - m3;
+    int u1 = m1 + m4, d1 = m1 - m4;
+    int u2 = m2 + m5, d2 = m2 - m5;
+    int k0 = m6 - u0, k1 = m7 - u1;
+
+    x0 = (64 * (ee0 + ee1) + rnd) >> sh;
+    x4 = (64 * (ee0 - ee1) + rnd) >> sh;
+    x2 = (pev + 47 * eo0 + rnd) >> sh;
+    x6 = (pev - 119 * eo1 + rnd) >> sh;
+    x1 = (d0 - k1 + rnd) >> sh;
+    x3 = (d0 + d1 - d2 + rnd) >> sh;
+    x5 = (k0 + k1 + u2 - m8 + rnd) >> sh;
+    x7 = (-k0 - d1 + rnd) >> sh;
+}
+
+// Exact 12-mul 1D inverse HEVC IDCT8 (reuses identical Negacyclic-Karatsuba circuit
+// by M_odd^T = M_odd duality). Shared word-for-word with zcvid_decode.hlsl.
+void Dct8Inv1D(inout int x0, inout int x1, inout int x2, inout int x3,
+               inout int x4, inout int x5, inout int x6, inout int x7,
+               int rnd, int sh) {
+    int e0 = 64 * (x0 + x4);
+    int e1 = 64 * (x0 - x4);
+    int pev = 36 * (x2 + x6);
+    int g0 = pev + 47 * x2;
+    int g1 = pev - 119 * x6;
+    int E0 = e0 + g0, E1 = e1 + g1, E2 = e1 - g1, E3 = e0 - g0;
+
+    int s0 = x1 + x7, s1 = x5 + x3;
+    int m0 = 89 * x1, m1 = -75 * x5, m2 = 14 * (x1 + x5);
+    int m3 = -18 * x7, m4 = -50 * x3, m5 = -68 * (x7 + x3);
+    int m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+    int u0 = m0 + m3, d0 = m0 - m3;
+    int u1 = m1 + m4, d1 = m1 - m4;
+    int u2 = m2 + m5, d2 = m2 - m5;
+    int k0 = m6 - u0, k1 = m7 - u1;
+    int O0 = d0 - k1;
+    int O1 = d0 + d1 - d2;
+    int O2 = k0 + k1 + u2 - m8;
+    int O3 = -k0 - d1;
+
+    x0 = (E0 + O0 + rnd) >> sh;
+    x1 = (E1 + O1 + rnd) >> sh;
+    x2 = (E2 + O2 + rnd) >> sh;
+    x3 = (E3 + O3 + rnd) >> sh;
+    x4 = (E3 - O3 + rnd) >> sh;
+    x5 = (E2 - O2 + rnd) >> sh;
+    x6 = (E1 - O1 + rnd) >> sh;
+    x7 = (E0 - O0 + rnd) >> sh;
+}
 
 // 0: both coordinates even, 1: both odd, 2: mixed.
 uint TqClass(uint r) {
@@ -1703,6 +1784,7 @@ groupshared uint gs_tq[64];
 groupshared uint gs_hist[16];
 groupshared uint gs_stage_base;
 groupshared uint gs_overflow_w;
+groupshared uint gs_any_try8;
 groupshared int  gs_it_c[1024]; // 64 threads x 16 ints for spill-free CSIntraT inverse
 groupshared uint gs_it_ok8[16]; // 1 if superblock's lane 0 admitted an 8x8 block
 
@@ -1717,7 +1799,24 @@ groupshared uint gs_sb_4bef[64];  // per-lane 4x4 SSD before
 groupshared uint gs_sb_ssd8[64];  // per-lane 8x8 SSD after (exact 16-px quadrant)
 groupshared uint gs_sb_win8[16];  // 1 if 8x8 won RDO for this superblock
 groupshared uint gs_sb_roll[16];  // non-zero if any quadrant is on rolling refresh or OOB
-groupshared uint gs_sb_pred8[16]; // pred8 (2 or 3) chosen by lane 0
+groupshared uint gs_sb_pred8[16]; // pred8 (2/3 legacy or 4/5 DCT8) chosen by lane 0
+
+// 4-lane parallel 12-mul Factored HEVC 8x8 DCT8 scratch (~11.5 KB).
+groupshared int  gs_dct8[1024];     // 16 superblocks x 64 ints
+groupshared uint gs_dct8_lv[1536];  // 64 lanes x 24 uints (3 planes x 8 packed int16 pairs)
+groupshared uint gs_sb_n8[64];      // per-lane non-zero DCT8 coef count
+groupshared uint gs_sb_sad8[64];    // per-lane SAD / AC-SAD
+groupshared uint gs_sb_sad8_128[64];
+groupshared uint gs_sb_sumy[64];
+groupshared uint gs_sb_qpy8[16];
+groupshared uint gs_sb_qpc8[16];
+groupshared uint gs_sb_slot8[16];   // staging slot0 for winning DCT8 superblock
+groupshared uint gs_sb_hf8[16];     // active HF sub-block count for RDO cost
+groupshared uint gs_it_from8[16];   // CSIntraT: staging source offset
+groupshared uint gs_it_dst8[16];    // CSIntraT: output record dst offset
+groupshared uint gs_it_w8[16];      // CSIntraT: output record words
+groupshared uint gs_it_b8[16];      // CSIntraT: TL block index b
+groupshared uint gs_it_nz8[16];     // CSIntraT: per-plane non-zero flag
 
 uint GroupExclusive64(uint t, uint v) {
     gs_tq[t] = v;
@@ -1864,12 +1963,20 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
         gs_sb_win8[gtid.x] = 0u;
         gs_sb_roll[gtid.x] = 0u;
         gs_sb_pred8[gtid.x] = 3u;
+        gs_sb_qpy8[gtid.x] = 12u;
+        gs_sb_qpc8[gtid.x] = 15u;
+        gs_sb_slot8[gtid.x] = 0xFFFFFFFFu;
+        gs_sb_hf8[gtid.x] = 0u;
     }
-    if (gtid.x == 0u) gs_overflow_w = 0u;
+    if (gtid.x == 0u) { gs_overflow_w = 0u; gs_any_try8 = 0u; }
     gs_sb_4gain[gtid.x] = 0u;
     gs_sb_4n[gtid.x] = 0u;
     gs_sb_4bef[gtid.x] = 0u;
     gs_sb_ssd8[gtid.x] = 0u;
+    gs_sb_n8[gtid.x] = 0u;
+    gs_sb_sad8[gtid.x] = 0u;
+    gs_sb_sad8_128[gtid.x] = 0u;
+    gs_sb_sumy[gtid.x] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
     uint bw = (width + 3u) >> 2;
@@ -1904,8 +2011,9 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
     }
 
     bool allow_inter = (mode_flags & 8u) != 0u;
+    bool use_dct8 = (mode_flags & 256u) != 0u;
     uint eff_tq_qp = is_cut ? TqSceneCutQp() : tq_qp;
-    bool may_8x8 = is_cut || hit_roll || (eff_tq_qp >= 20u);
+    bool may_8x8 = !use_dct8 && (is_cut || hit_roll || (eff_tq_qp >= 20u));
     uint sp[16], pp[16];
     uint ndis = 0u;
     int sad = 0, sad_128 = 0, max_abs_res = 0, sum_sy = 0;
@@ -2010,117 +2118,300 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // 2. Evaluate 8x8 superblock candidate on lane 0 when bitrate is constrained
-    //    (eff_tq_qp >= 22), on rolling refresh (hit_roll), or on a scene cut (is_cut).
+    // 2. Evaluate 8x8 superblock candidate:
+    //    - use_dct8 (mode_flags bit 8): 4-lane parallel exact 12-mul Factored HEVC DCT8
+    //      (pred = 4 intra / 5 inter) with Parseval CSBF HF pruning & Parseval spectral SSD
+    //      (proved < 0.086% of spatial SSD in Lean 4; saves 9 barriers + 2D IDCT8 in RDO).
+    //    - legacy (!use_dct8): bilinear-upsampled 4x4 transform (pred = 2 / 3).
     uint base4 = sbid * 4u;
     uint bef_all_sb = gs_sb_4bef[base4] + gs_sb_4bef[base4 + 1u] +
                       gs_sb_4bef[base4 + 2u] + gs_sb_4bef[base4 + 3u];
-    bool try_8x8 = (gs_sb_roll[sbid] == 0u) && (is_cut || hit_roll || (eff_tq_qp >= 20u && bef_all_sb >= 512u));
-    uint n8 = 0u, qp_y8 = 12u, qp_c8 = 15u, pred8 = 3u;
-    if (try_8x8 && lane == 0u) {
-        [unroll] for (uint z8 = 0u; z8 < 16u; z8++) gs_sb_lv8[sbid * 16u + z8] = 0u;
-        int sad8 = 0, sad8_128 = 0, sum8_y = 0;
-        [unroll] for (uint i8 = 0u; i8 < 16u; i8++) {
-            uint svw = gs_sb_s[sbid * 16u + i8];
-            uint pvw = gs_sb_p[sbid * 16u + i8];
-            int sy = (int)(svw & 0xFFu), py = (int)(pvw & 0xFFu);
-            sum8_y += sy;
-            sad8 += abs(sy - py);
-            sad8_128 += abs(sy - 128);
-        }
-        int mean8_y = (sum8_y + 8) >> 4;
-        uint ac_sad8 = 0u;
-        if (is_cut) {
-            [unroll] for (uint ia8 = 0u; ia8 < 16u; ia8++) {
-                ac_sad8 += (uint)abs((int)(gs_sb_s[sbid * 16u + ia8] & 0xFFu) - mean8_y);
-            }
-        }
-        bool is_inter8 = !is_cut && !hit_roll && allow_inter && (sad8_128 + 32 >= sad8);
-        pred8 = is_inter8 ? 3u : 2u;
-        gs_sb_pred8[sbid] = pred8;
-        uint q8_src = is_cut ? AqAdjustCutQp(eff_tq_qp, ac_sad8)
-                             : (hit_roll ? clamp(eff_tq_qp, 12u, 42u) : eff_tq_qp);
-        qp_y8 = clamp(q8_src, 12u, 51u);
-        qp_c8 = TqChromaQp(qp_y8);
-        if (is_cut) qp_c8 = max(qp_c8, (qp_y8 >= 26u) ? (qp_y8 - 6u) : qp_y8);
+    uint act4_any = gs_sb_4n[base4] | gs_sb_4n[base4 + 1u] |
+                    gs_sb_4n[base4 + 2u] | gs_sb_4n[base4 + 3u];
+    bool try_8x8 = (gs_sb_roll[sbid] == 0u) &&
+                   (use_dct8 ? (is_cut || hit_roll || act4_any != 0u || bef_all_sb >= 256u)
+                             : (is_cut || hit_roll || (eff_tq_qp >= 20u && bef_all_sb >= 512u)));
+    uint n8 = 0u, qp_y8 = 12u, qp_c8 = 15u, pred8 = use_dct8 ? 5u : 3u;
+    uint hf_sub8 = 0u;
 
-        [unroll] for (uint pl = 0u; pl < 3u; pl++) {
-            uint sh = pl * 8u;
-            int x[16];
-            [unroll] for (uint k0 = 0u; k0 < 16u; k0++) {
-                int sv = (int)((gs_sb_s[sbid * 16u + k0] >> sh) & 0xFFu);
-                int pv = is_inter8 ? (int)((gs_sb_p[sbid * 16u + k0] >> sh) & 0xFFu) : 128;
-                x[k0] = sv - pv;
-            }
-            [unroll] for (uint i = 0u; i < 4u; i++) {
-                int s0 = x[i * 4u] + x[i * 4u + 3u], s1 = x[i * 4u + 1u] + x[i * 4u + 2u];
-                int d0 = x[i * 4u] - x[i * 4u + 3u], d1 = x[i * 4u + 1u] - x[i * 4u + 2u];
-                x[i * 4u] = s0 + s1; x[i * 4u + 2u] = s0 - s1;
-                x[i * 4u + 1u] = 2 * d0 + d1; x[i * 4u + 3u] = d0 - 2 * d1;
-            }
-            [unroll] for (uint jc = 0u; jc < 4u; jc++) {
-                int s0 = x[jc] + x[12u + jc], s1 = x[4u + jc] + x[8u + jc];
-                int d0 = x[jc] - x[12u + jc], d1 = x[4u + jc] - x[8u + jc];
-                x[jc] = s0 + s1; x[8u + jc] = s0 - s1;
-                x[4u + jc] = 2 * d0 + d1; x[12u + jc] = d0 - 2 * d1;
-            }
-            uint qp = (pl == 0u) ? qp_y8 : qp_c8;
-            int qbits = 15 + (int)(qp / 6u);
-            int fq_dc = (1 << qbits) / 3;
-            int fq_ac = (!is_inter8 || qp < 16u) ? fq_dc : ((1 << qbits) / 6);
-            int c[16];
-            bool pl_nz = false;
-            [unroll] for (uint k = 0u; k < 16u; k++) {
-                uint r = TQ_ZZ[k];
-                int wv = x[r];
-                int fq = (k == 0u) ? fq_dc : fq_ac;
-                int z = (abs(wv) * TQ_MF[(qp % 6u) * 3u + TqClass(r)] + fq) >> qbits;
-                z = min(z, 255);
-                int l = (wv < 0) ? -z : z;
-                gs_sb_lv8[sbid * 16u + k] |= ((uint)(l + 256) << (pl * 10u));
-                c[r] = TqDequant(l, r, qp);
-                if (l != 0) { n8++; pl_nz = true; }
-            }
-            if (pl_nz) {
-                TqInverse(c);
-            } else {
-                [unroll] for (uint kz = 0u; kz < 16u; kz++) c[kz] = 0;
-            }
-            uint c8_off = sbid * 48u + pl * 16u;
-            [unroll] for (uint kw = 0u; kw < 16u; kw++) gs_sb_c8[c8_off + kw] = c[kw];
+    if (use_dct8) {
+        if (try_8x8) {
+            gs_any_try8 = 1u;
+            gs_sb_sad8[gtid.x] = (uint)sad;
+            gs_sb_sad8_128[gtid.x] = (uint)sad_128;
+            gs_sb_sumy[gtid.x] = (uint)sum_sy;
         }
-        if (!is_inter8 && n8 == 0u) n8 = 1u;
-    }
-    GroupMemoryBarrierWithGroupSync();
+        GroupMemoryBarrierWithGroupSync();
 
-    // 3. All 4 lanes compute exact 16-pixel bilinear 8x8 SSD for their quadrant
-    //    directly from groupshared gs_sb_c8 (zero register spills).
-    if (try_8x8) {
-        uint p8_mode = gs_sb_pred8[sbid];
-        bool is_inter8 = ((p8_mode & 1u) != 0u);
-        uint qx0 = (lane & 1u) * 4u;
-        uint qy0 = (lane >> 1) * 4u;
-        uint c8_base = sbid * 48u;
-        uint ssd8_q = 0u;
-        [loop] for (uint j = 0u; j < 16u; j++) {
-            uint lx = qx0 + (j & 3u);
-            uint ly = qy0 + (j >> 2);
-            int ry = (is_inter8 ? (int)(pp[j] & 0xFFu) : 128) + TqSample8x8Gs(c8_base, lx, ly);
-            int rb = (is_inter8 ? (int)((pp[j] >> 8) & 0xFFu) : 128) + TqSample8x8Gs(c8_base + 16u, lx, ly);
-            int rr = (is_inter8 ? (int)((pp[j] >> 16) & 0xFFu) : 128) + TqSample8x8Gs(c8_base + 32u, lx, ly);
-            int ey = (int)(sp[j] & 0xFFu) - clamp(ry, 0, 255);
-            int eb = (int)((sp[j] >> 8) & 0xFFu) - clamp(rb, 0, 255);
-            int er = (int)((sp[j] >> 16) & 0xFFu) - clamp(rr, 0, 255);
-            ssd8_q += (uint)(ey * ey) + ((uint)(eb * eb + er * er) >> 1);
+        if (gs_any_try8 != 0u) {
+            if (try_8x8 && lane == 0u) {
+                uint sum8_y = gs_sb_sumy[base4] + gs_sb_sumy[base4 + 1u] +
+                              gs_sb_sumy[base4 + 2u] + gs_sb_sumy[base4 + 3u];
+                gs_sb_sumy[base4] = (sum8_y + 32u) >> 6; // mean8_y
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (try_8x8 && is_cut) {
+                int mean8_y = (int)gs_sb_sumy[base4];
+                uint ac_lane = 0u;
+                [unroll] for (uint ja8 = 0u; ja8 < 16u; ja8++) {
+                    ac_lane += (uint)abs((int)(sp[ja8] & 0xFFu) - mean8_y);
+                }
+                gs_sb_sumy[gtid.x] = ac_lane;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (try_8x8 && lane == 0u) {
+                uint sad8 = gs_sb_sad8[base4] + gs_sb_sad8[base4 + 1u] +
+                            gs_sb_sad8[base4 + 2u] + gs_sb_sad8[base4 + 3u];
+                uint sad8_128 = gs_sb_sad8_128[base4] + gs_sb_sad8_128[base4 + 1u] +
+                                gs_sb_sad8_128[base4 + 2u] + gs_sb_sad8_128[base4 + 3u];
+                uint ac_sad8 = 0u;
+                if (is_cut) {
+                    ac_sad8 = (gs_sb_sumy[base4] + gs_sb_sumy[base4 + 1u] +
+                               gs_sb_sumy[base4 + 2u] + gs_sb_sumy[base4 + 3u]) >> 2;
+                }
+                bool is_inter8 = !is_cut && !hit_roll && allow_inter && (sad8_128 + 128u >= sad8);
+                pred8 = is_inter8 ? 5u : 4u;
+                uint q8_src = is_cut ? AqAdjustCutQp(eff_tq_qp, ac_sad8)
+                                     : (hit_roll ? clamp(eff_tq_qp, 12u, 42u) : eff_tq_qp);
+                qp_y8 = clamp(q8_src, 12u, 51u);
+                qp_c8 = TqChromaQp(qp_y8);
+                if (is_cut) qp_c8 = max(qp_c8, (qp_y8 >= 26u) ? (qp_y8 - 6u) : qp_y8);
+                gs_sb_pred8[sbid] = pred8;
+                gs_sb_qpy8[sbid] = qp_y8;
+                gs_sb_qpc8[sbid] = qp_c8;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            uint p8_mode = gs_sb_pred8[sbid];
+            bool is_inter8 = ((p8_mode & 1u) != 0u);
+            uint qy_s = gs_sb_qpy8[sbid];
+            uint qc_s = gs_sb_qpc8[sbid];
+            uint sb_base = sbid * 64u;
+            uint qx0 = (lane & 1u) * 4u;
+            uint qy0 = (lane >> 1) * 4u;
+            uint n8_lane = 0u;
+            uint ssd8_q = 0u;
+            uint lv_base = gtid.x * 24u;
+            uint lam_qp_hf = clamp(is_cut ? eff_tq_qp : qy_s, 12u, 51u);
+            uint qstep_hf = ((uint)TQ_V[(lam_qp_hf % 6u) * 3u] << (lam_qp_hf / 6u)) >> 2;
+            uint lam_hf = max((qstep_hf * qstep_hf) >> 7, 2u);
+            if (is_cut && max_record_words != 0u && max_record_words < nb) lam_hf <<= 1;
+
+            [unroll] for (uint pl = 0u; pl < 3u; pl++) {
+                uint sh = pl * 8u;
+                if (try_8x8) {
+                    [unroll] for (uint j = 0u; j < 16u; j++) {
+                        int sv = (int)((sp[j] >> sh) & 0xFFu);
+                        int pv = is_inter8 ? (int)((pp[j] >> sh) & 0xFFu) : 128;
+                        gs_dct8[sb_base + (qy0 + (j >> 2)) * 8u + (qx0 + (j & 3u))] = sv - pv;
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                // 4-lane parallel Forward Pass 1 (2 rows per lane, 12-mul Karatsuba + Gauss).
+                if (try_8x8) {
+                    [unroll] for (uint rr = 0u; rr < 2u; rr++) {
+                        uint rb = sb_base + (lane * 2u + rr) * 8u;
+                        int x0 = gs_dct8[rb + 0u], x1 = gs_dct8[rb + 1u], x2 = gs_dct8[rb + 2u], x3 = gs_dct8[rb + 3u];
+                        int x4 = gs_dct8[rb + 4u], x5 = gs_dct8[rb + 5u], x6 = gs_dct8[rb + 6u], x7 = gs_dct8[rb + 7u];
+                        Dct8Fwd1D(x0, x1, x2, x3, x4, x5, x6, x7, 2, 2);
+                        gs_dct8[rb + 0u] = x0; gs_dct8[rb + 1u] = x1; gs_dct8[rb + 2u] = x2; gs_dct8[rb + 3u] = x3;
+                        gs_dct8[rb + 4u] = x4; gs_dct8[rb + 5u] = x5; gs_dct8[rb + 6u] = x6; gs_dct8[rb + 7u] = x7;
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                // 4-lane parallel Forward Pass 2 (2 cols per lane, 12-mul Karatsuba + Gauss).
+                if (try_8x8) {
+                    [unroll] for (uint cc = 0u; cc < 2u; cc++) {
+                        uint cb = sb_base + lane * 2u + cc;
+                        int x0 = gs_dct8[cb + 0u],  x1 = gs_dct8[cb + 8u],  x2 = gs_dct8[cb + 16u], x3 = gs_dct8[cb + 24u];
+                        int x4 = gs_dct8[cb + 32u], x5 = gs_dct8[cb + 40u], x6 = gs_dct8[cb + 48u], x7 = gs_dct8[cb + 56u];
+                        Dct8Fwd1D(x0, x1, x2, x3, x4, x5, x6, x7, 256, 9);
+                        gs_dct8[cb + 0u]  = x0; gs_dct8[cb + 8u]  = x1; gs_dct8[cb + 16u] = x2; gs_dct8[cb + 24u] = x3;
+                        gs_dct8[cb + 32u] = x4; gs_dct8[cb + 40u] = x5; gs_dct8[cb + 48u] = x6; gs_dct8[cb + 56u] = x7;
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                // 4-lane parallel Quantize + Parseval HF Sub-block Pruning + Parseval Spectral SSD.
+                // Lane 0=LL, 1=LH, 2=HL, 3=HH. Exact orthonormal scale: 16x -> 256x energy.
+                if (try_8x8) {
+                    uint qp = (pl == 0u) ? qy_s : qc_s;
+                    uint qp_mod = qp % 6u;
+                    uint qp_div = qp / 6u;
+                    int mf = TQ8_MF[qp_mod];
+                    int qbits = 18 + (int)qp_div;
+                    int fq_dc = (1 << qbits) / 3;
+                    int fq_ac = (!is_inter8 || qp < 16u) ? fq_dc : ((1 << qbits) / 6);
+                    uint n_sub = 0u;
+                    uint kept_hi = 0u, kept_lo = 0u;
+                    uint zero_hi = 0u, zero_lo = 0u;
+                    int qlv[16];
+                    [unroll] for (uint k = 0u; k < 16u; k++) {
+                        uint r = TQ_ZZ[k];
+                        int wv = gs_dct8[sb_base + (qy0 + (r >> 2)) * 8u + (qx0 + (r & 3u))];
+                        int fq = (lane == 0u && k == 0u) ? fq_dc : fq_ac;
+                        int z = (abs(wv) * mf + fq) >> qbits;
+                        z = min(z, 2047);
+                        int l = (wv < 0) ? -z : z;
+                        int dq_v = (l != 0) ? Tq8Dequant(l, qp) : 0;
+                        qlv[k] = l;
+                        if (l != 0) n_sub++;
+                        uint ad = (uint)min(abs(wv - dq_v), 65535);
+                        uint sq_d = ad * ad;
+                        kept_hi += sq_d >> 8;
+                        kept_lo += sq_d & 255u;
+                        if (lane >= 1u) {
+                            uint aw = (uint)min(abs(wv), 65535);
+                            uint sq_w = aw * aw;
+                            zero_hi += sq_w >> 8;
+                            zero_lo += sq_w & 255u;
+                        }
+                    }
+                    uint ssd_sub = kept_hi + ((kept_lo + 128u) >> 8);
+                    if (lane >= 1u && n_sub > 0u) {
+                        uint ssd_zero = zero_hi + ((zero_lo + 128u) >> 8);
+                        uint gain_sub = (ssd_zero > ssd_sub) ? (ssd_zero - ssd_sub) : 0u;
+                        uint w_gain = (pl == 0u) ? gain_sub : (gain_sub >> 1);
+                        if (w_gain <= lam_hf * (n_sub + 1u)) {
+                            n_sub = 0u;
+                            ssd_sub = ssd_zero;
+                            [unroll] for (uint kz = 0u; kz < 16u; kz++) qlv[kz] = 0;
+                        } else {
+                            uint dummy_hf;
+                            InterlockedAdd(gs_sb_hf8[sbid], 1u, dummy_hf);
+                        }
+                    }
+                    ssd8_q += (pl == 0u) ? ssd_sub : (ssd_sub >> 1);
+                    n8_lane += n_sub;
+                    uint pl_lv = lv_base + pl * 8u;
+                    [unroll] for (uint kp = 0u; kp < 8u; kp++) {
+                        gs_dct8_lv[pl_lv + kp] = ((uint)(qlv[kp * 2u] + 2048)) |
+                                                 (((uint)(qlv[kp * 2u + 1u] + 2048)) << 16);
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            if (try_8x8) {
+                gs_sb_ssd8[gtid.x] = ssd8_q;
+                gs_sb_n8[gtid.x] = n8_lane;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (try_8x8 && lane == 0u) {
+                n8 = gs_sb_n8[base4] + gs_sb_n8[base4 + 1u] +
+                     gs_sb_n8[base4 + 2u] + gs_sb_n8[base4 + 3u];
+                if (!is_inter8 && n8 == 0u) n8 = 1u;
+                hf_sub8 = gs_sb_hf8[sbid];
+            }
         }
-        gs_sb_ssd8[gtid.x] = ssd8_q;
+    } else {
+        if (try_8x8 && lane == 0u) {
+            [unroll] for (uint z8 = 0u; z8 < 16u; z8++) gs_sb_lv8[sbid * 16u + z8] = 0u;
+            int sad8 = 0, sad8_128 = 0, sum8_y = 0;
+            [unroll] for (uint i8 = 0u; i8 < 16u; i8++) {
+                uint svw = gs_sb_s[sbid * 16u + i8];
+                uint pvw = gs_sb_p[sbid * 16u + i8];
+                int sy = (int)(svw & 0xFFu), py = (int)(pvw & 0xFFu);
+                sum8_y += sy;
+                sad8 += abs(sy - py);
+                sad8_128 += abs(sy - 128);
+            }
+            int mean8_y = (sum8_y + 8) >> 4;
+            uint ac_sad8 = 0u;
+            if (is_cut) {
+                [unroll] for (uint ia8 = 0u; ia8 < 16u; ia8++) {
+                    ac_sad8 += (uint)abs((int)(gs_sb_s[sbid * 16u + ia8] & 0xFFu) - mean8_y);
+                }
+            }
+            bool is_inter8 = !is_cut && !hit_roll && allow_inter && (sad8_128 + 32 >= sad8);
+            pred8 = is_inter8 ? 3u : 2u;
+            gs_sb_pred8[sbid] = pred8;
+            uint q8_src = is_cut ? AqAdjustCutQp(eff_tq_qp, ac_sad8)
+                                 : (hit_roll ? clamp(eff_tq_qp, 12u, 42u) : eff_tq_qp);
+            qp_y8 = clamp(q8_src, 12u, 51u);
+            qp_c8 = TqChromaQp(qp_y8);
+            if (is_cut) qp_c8 = max(qp_c8, (qp_y8 >= 26u) ? (qp_y8 - 6u) : qp_y8);
+
+            [unroll] for (uint pl = 0u; pl < 3u; pl++) {
+                uint sh = pl * 8u;
+                int x[16];
+                [unroll] for (uint k0 = 0u; k0 < 16u; k0++) {
+                    int sv = (int)((gs_sb_s[sbid * 16u + k0] >> sh) & 0xFFu);
+                    int pv = is_inter8 ? (int)((gs_sb_p[sbid * 16u + k0] >> sh) & 0xFFu) : 128;
+                    x[k0] = sv - pv;
+                }
+                [unroll] for (uint i = 0u; i < 4u; i++) {
+                    int s0 = x[i * 4u] + x[i * 4u + 3u], s1 = x[i * 4u + 1u] + x[i * 4u + 2u];
+                    int d0 = x[i * 4u] - x[i * 4u + 3u], d1 = x[i * 4u + 1u] - x[i * 4u + 2u];
+                    x[i * 4u] = s0 + s1; x[i * 4u + 2u] = s0 - s1;
+                    x[i * 4u + 1u] = 2 * d0 + d1; x[i * 4u + 3u] = d0 - 2 * d1;
+                }
+                [unroll] for (uint jc = 0u; jc < 4u; jc++) {
+                    int s0 = x[jc] + x[12u + jc], s1 = x[4u + jc] + x[8u + jc];
+                    int d0 = x[jc] - x[12u + jc], d1 = x[4u + jc] - x[8u + jc];
+                    x[jc] = s0 + s1; x[8u + jc] = s0 - s1;
+                    x[4u + jc] = 2 * d0 + d1; x[12u + jc] = d0 - 2 * d1;
+                }
+                uint qp = (pl == 0u) ? qp_y8 : qp_c8;
+                int qbits = 15 + (int)(qp / 6u);
+                int fq_dc = (1 << qbits) / 3;
+                int fq_ac = (!is_inter8 || qp < 16u) ? fq_dc : ((1 << qbits) / 6);
+                int c[16];
+                bool pl_nz = false;
+                [unroll] for (uint k = 0u; k < 16u; k++) {
+                    uint r = TQ_ZZ[k];
+                    int wv = x[r];
+                    int fq = (k == 0u) ? fq_dc : fq_ac;
+                    int z = (abs(wv) * TQ_MF[(qp % 6u) * 3u + TqClass(r)] + fq) >> qbits;
+                    z = min(z, 255);
+                    int l = (wv < 0) ? -z : z;
+                    gs_sb_lv8[sbid * 16u + k] |= ((uint)(l + 256) << (pl * 10u));
+                    c[r] = TqDequant(l, r, qp);
+                    if (l != 0) { n8++; pl_nz = true; }
+                }
+                if (pl_nz) {
+                    TqInverse(c);
+                } else {
+                    [unroll] for (uint kz = 0u; kz < 16u; kz++) c[kz] = 0;
+                }
+                uint c8_off = sbid * 48u + pl * 16u;
+                [unroll] for (uint kw = 0u; kw < 16u; kw++) gs_sb_c8[c8_off + kw] = c[kw];
+            }
+            if (!is_inter8 && n8 == 0u) n8 = 1u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // 3. All 4 lanes compute exact 16-pixel bilinear 8x8 SSD for their quadrant
+        //    directly from groupshared gs_sb_c8 (zero register spills).
+        if (try_8x8) {
+            uint p8_mode = gs_sb_pred8[sbid];
+            bool is_inter8 = ((p8_mode & 1u) != 0u);
+            uint qx0 = (lane & 1u) * 4u;
+            uint qy0 = (lane >> 1) * 4u;
+            uint c8_base = sbid * 48u;
+            uint ssd8_q = 0u;
+            [loop] for (uint j = 0u; j < 16u; j++) {
+                uint lx = qx0 + (j & 3u);
+                uint ly = qy0 + (j >> 2);
+                int ry = (is_inter8 ? (int)(pp[j] & 0xFFu) : 128) + TqSample8x8Gs(c8_base, lx, ly);
+                int rb = (is_inter8 ? (int)((pp[j] >> 8) & 0xFFu) : 128) + TqSample8x8Gs(c8_base + 16u, lx, ly);
+                int rr = (is_inter8 ? (int)((pp[j] >> 16) & 0xFFu) : 128) + TqSample8x8Gs(c8_base + 32u, lx, ly);
+                int ey = (int)(sp[j] & 0xFFu) - clamp(ry, 0, 255);
+                int eb = (int)((sp[j] >> 8) & 0xFFu) - clamp(rb, 0, 255);
+                int er = (int)((sp[j] >> 16) & 0xFFu) - clamp(rr, 0, 255);
+                ssd8_q += (uint)(ey * ey) + ((uint)(eb * eb + er * er) >> 1);
+            }
+            gs_sb_ssd8[gtid.x] = ssd8_q;
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
 
     // 4. Lane 0 decides 8x8 vs 4x4 by exact H.264/HEVC Lagrangian RDO (J = D + lambda * R).
-    //    At moderate QP (15+ Mbps), lambda is small so sharp 4x4 detail wins; at high QP
-    //    (8-10 Mbps / 480Hz / 4K 15 Mbps), lambda grows with qstep^2 so 8x8 saves 4x
-    //    headers on smooth/panning regions while 4x4 still wins on sharp edges/text.
     if (try_8x8 && lane == 0u && n8 > 0u) {
         uint bef_all = bef_all_sb;
         uint aft8_all = gs_sb_ssd8[base4] + gs_sb_ssd8[base4 + 1u] +
@@ -2129,10 +2420,11 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
                       gs_sb_4n[base4 + 2u] + gs_sb_4n[base4 + 3u];
         uint act4 = (gs_sb_4n[base4] > 0u ? 1u : 0u) + (gs_sb_4n[base4 + 1u] > 0u ? 1u : 0u) +
                     (gs_sb_4n[base4 + 2u] > 0u ? 1u : 0u) + (gs_sb_4n[base4 + 3u] > 0u ? 1u : 0u);
-        uint cost8 = n8 + 3u;
+        uint cost8 = n8 + (use_dct8 ? (2u + hf_sub8) : 3u);
         uint cost4 = n4_sum + act4 * 3u;
         bool win8 = false;
         uint rdo_gain8 = 1u;
+        bool is_intra8 = ((pred8 & 1u) == 0u);
         if (hit_roll) {
             uint aft4_all = gs_sb_4gain[base4] + gs_sb_4gain[base4 + 1u] +
                             gs_sb_4gain[base4 + 2u] + gs_sb_4gain[base4 + 3u];
@@ -2147,12 +2439,12 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
                              gs_sb_4gain[base4 + 2u] + gs_sb_4gain[base4 + 3u];
             bool tight_cut = is_cut && (max_record_words != 0u) && (max_record_words * 10u < nb);
             bool force_kf = (mode_flags & 128u) != 0u;
-            bool good8 = (pred8 == 2u)
+            bool good8 = is_intra8
                              ? (force_kf || bef_all > 128u || tight_cut)
-                             : (aft8_all * 5u < bef_all * 4u && gain8 > 96u);
+                             : (aft8_all * 5u < bef_all * 4u && gain8 > (use_dct8 ? 32u : 96u));
             uint lam_qp = clamp(eff_tq_qp, 12u, 51u);
             uint qstep_q4 = ((uint)TQ_V[(lam_qp % 6u) * 3u] << (lam_qp / 6u)) >> 2;
-            uint lam_cost = (qstep_q4 * qstep_q4) >> 7;
+            uint lam_cost = max((qstep_q4 * qstep_q4) >> 7, 1u);
             uint cut_lam = tight_cut ? (lam_cost * 2u) : lam_cost;
             win8 = good8 && (act4 == 0u ||
                              (gain8 + cut_lam * cost4 >= gain4_all + cut_lam * cost8));
@@ -2168,7 +2460,9 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
             if (hit_roll) {
                 rdo_bin = (eff_tq_qp <= 34u) ? max(rdo_bin, 13u) : max(rdo_bin, 8u);
             }
-            [unroll] for (uint zc = 0u; zc < 16u; zc++) lv_pk[zc] = gs_sb_lv8[sbid * 16u + zc];
+            if (!use_dct8) {
+                [unroll] for (uint zc = 0u; zc < 16u; zc++) lv_pk[zc] = gs_sb_lv8[sbid * 16u + zc];
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -2187,6 +2481,7 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
     }
     GroupMemoryBarrierWithGroupSync();
 
+    bool my_dct8_win = use_dct8 && (gs_sb_win8[sbid] != 0u);
     if (w != 0u) {
         uint stage_n = 0u, stride = 0u;
         g_tq_stage.GetDimensions(stage_n, stride);
@@ -2194,26 +2489,30 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
         if (slot + w <= stage_n) {
             g_tq_scratch[dtid.x] = w | (rdo_bin << 24);
             g_tq_scratch[TqPositions() + dtid.x] = slot;
-            uint b_base = 0xF0000000u | (b * 48u);
-            uint written_c = 0u;
-            [unroll] for (uint pl = 0u; pl < 3u; pl++) {
-                uint qp = (pl == 0u) ? qp_y : qp_c;
-                uint qp_pred = (qp << 16) | (pred << 24);
-                uint p_off = pl * 16u;
-                uint sh = pl * 10u;
-                [unroll] for (uint k = 0u; k < 16u; k++) {
-                    int l = (int)((lv_pk[k] >> sh) & 0x3FFu) - 256;
-                    if (l != 0) {
-                        g_tq_stage[slot]      = b_base + p_off + k;
-                        g_tq_stage[slot + 1u] = ((uint)l & 0xFFFFu) | qp_pred;
-                        slot += 2u;
-                        written_c += 2u;
+            if (my_dct8_win) {
+                gs_sb_slot8[sbid] = slot;
+            } else {
+                uint b_base = 0xF0000000u | (b * 48u);
+                uint written_c = 0u;
+                [unroll] for (uint pl = 0u; pl < 3u; pl++) {
+                    uint qp = (pl == 0u) ? qp_y : qp_c;
+                    uint qp_pred = (qp << 16) | (pred << 24);
+                    uint p_off = pl * 16u;
+                    uint sh = pl * 10u;
+                    [unroll] for (uint k = 0u; k < 16u; k++) {
+                        int l = (int)((lv_pk[k] >> sh) & 0x3FFu) - 256;
+                        if (l != 0) {
+                            g_tq_stage[slot]      = b_base + p_off + k;
+                            g_tq_stage[slot + 1u] = ((uint)l & 0xFFFFu) | qp_pred;
+                            slot += 2u;
+                            written_c += 2u;
+                        }
                     }
                 }
-            }
-            if (written_c == 0u) {
-                g_tq_stage[slot]      = b_base;
-                g_tq_stage[slot + 1u] = (qp_y << 16) | (pred << 24);
+                if (written_c == 0u) {
+                    g_tq_stage[slot]      = b_base;
+                    g_tq_stage[slot + 1u] = (qp_y << 16) | (pred << 24);
+                }
             }
             uint dummy;
             InterlockedAdd(gs_hist[rdo_bin], w, dummy);
@@ -2224,6 +2523,57 @@ void CSIntraTCount(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uin
         }
     } else {
         g_tq_scratch[dtid.x] = 0u;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    // 4-lane parallel staging for winning 8x8 DCT8 superblocks (zero serial bottleneck).
+    if (my_dct8_win) {
+        uint slot0 = gs_sb_slot8[sbid];
+        if (slot0 != 0xFFFFFFFFu) {
+            uint n0 = gs_sb_n8[base4 + 0u];
+            uint n1 = gs_sb_n8[base4 + 1u];
+            uint n2 = gs_sb_n8[base4 + 2u];
+            uint n3 = gs_sb_n8[base4 + 3u];
+            uint ntot = n0 + n1 + n2 + n3;
+            if (ntot == 0u) {
+                if (lane == 0u) {
+                    g_tq_stage[slot0]      = 0xF0000000u | (b * 48u);
+                    g_tq_stage[slot0 + 1u] = (gs_sb_qpy8[sbid] << 16) | (gs_sb_pred8[sbid] << 24);
+                }
+            } else {
+                uint off_q = 0u;
+                if (lane >= 1u) off_q += n0 * 2u;
+                if (lane >= 2u) off_q += n1 * 2u;
+                if (lane >= 3u) off_q += n2 * 2u;
+                uint slot = slot0 + off_q;
+                uint b_base = 0xF0000000u | (b * 48u);
+                uint qy_s = gs_sb_qpy8[sbid];
+                uint qc_s = gs_sb_qpc8[sbid];
+                uint p8_s = gs_sb_pred8[sbid];
+                uint lv_base = gtid.x * 24u;
+                [unroll] for (uint pl = 0u; pl < 3u; pl++) {
+                    uint qp = (pl == 0u) ? qy_s : qc_s;
+                    uint qp_pred = (qp << 16) | (p8_s << 24);
+                    uint p_off = pl * 16u;
+                    uint pl_lv = lv_base + pl * 8u;
+                    [unroll] for (uint kp = 0u; kp < 8u; kp++) {
+                        uint pk = gs_dct8_lv[pl_lv + kp];
+                        int l0 = (int)(pk & 0xFFFFu) - 2048;
+                        int l1 = (int)(pk >> 16) - 2048;
+                        if (l0 != 0) {
+                            g_tq_stage[slot]      = b_base + p_off + (kp * 2u);
+                            g_tq_stage[slot + 1u] = ((uint)l0 & 0xFFFFu) | qp_pred;
+                            slot += 2u;
+                        }
+                        if (l1 != 0) {
+                            g_tq_stage[slot]      = b_base + p_off + (kp * 2u + 1u);
+                            g_tq_stage[slot + 1u] = ((uint)l1 & 0xFFFFu) | qp_pred;
+                            slot += 2u;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     GroupMemoryBarrierWithGroupSync();
@@ -2331,7 +2681,7 @@ void CSIntraT(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt
     uint w_hi = (w != 0u && bin > cut) ? w : 0u;
     uint w_eq = (w != 0u && bin == cut) ? w : 0u;
     if (gtid.x < 16u) gs_it_ok8[gtid.x] = 0u;
-    if (gtid.x == 0u) { gs_hist[1] = 0u; gs_hist[2] = 0u; gs_hist[3] = 0u; }
+    if (gtid.x == 0u) { gs_hist[1] = 0u; gs_hist[2] = 0u; gs_hist[3] = 0u; gs_hist[4] = 0u; }
     GroupMemoryBarrierWithGroupSync();
     if (w_hi != 0u) gs_hist[1] = 1u;
     if (w_eq != 0u) gs_hist[2] = 1u;
@@ -2364,6 +2714,7 @@ void CSIntraT(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt
     }
 
     uint sbid = gtid.x >> 2;
+    uint lane = gtid.x & 3u;
 
     bool in_sb = false;
     uint b = 0u;
@@ -2376,8 +2727,16 @@ void CSIntraT(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt
             uint pred_mode = (g_tq_stage[from + 1u] >> 24) & 0xFFu;
             bool is_inter = ((pred_mode & 1u) != 0u);
             bool is_8x8 = (pred_mode >= 2u);
+            bool is_dct8 = (pred_mode >= 4u);
             if (is_8x8 && in_sb) {
-                gs_it_ok8[sbid] = 1u;
+                gs_it_ok8[sbid] = is_dct8 ? (is_inter ? 3u : 2u) : 1u;
+                if (is_dct8) {
+                    gs_it_from8[sbid] = from;
+                    gs_it_dst8[sbid] = dst;
+                    gs_it_w8[sbid] = w;
+                    gs_it_b8[sbid] = b;
+                    gs_hist[4] = 1u;
+                }
             }
             if (!is_8x8) {
                 uint out_yuv[16];
@@ -2426,10 +2785,8 @@ void CSIntraT(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt
                     uint idx = (y0 + (j1 >> 2)) * width + x0 + (j1 & 3u);
                     g_cur_yuvd[idx] = out_yuv[j1];
                 }
-            } else {
-                // 8x8 bilinear-upsampled transform reconstruction (64 pixels) using
-                // groupshared gs_sb_c8 (only lane 0 of each superblock enters here ->
-                // zero register spills for all 64 threads in the workgroup).
+            } else if (!is_dct8) {
+                // Legacy 8x8 bilinear-upsampled transform reconstruction (64 pixels).
                 uint cur = 0u;
                 uint cbase = gtid.x * 16u;
                 uint c8_base = sbid * 48u;
@@ -2478,6 +2835,122 @@ void CSIntraT(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt
         }
     }
     GroupMemoryBarrierWithGroupSync();
+
+    // 4-lane parallel Exact 8x8 Factored HEVC IDCT8 reconstruction (pred = 4 intra / 5 inter).
+    if (gs_hist[4] != 0u) {
+        uint ok8_m = gs_it_ok8[sbid];
+        bool do_dct8 = (ok8_m >= 2u);
+        bool is_inter8 = (ok8_m == 3u);
+        uint from8 = gs_it_from8[sbid];
+        uint dst8 = gs_it_dst8[sbid];
+        uint w8 = gs_it_w8[sbid];
+        uint b_tl = gs_it_b8[sbid];
+        uint x0_sb = (b_tl % bw) * 4u;
+        uint y0_sb = (b_tl / bw) * 4u;
+        uint qx0 = (lane & 1u) * 4u;
+        uint qy0 = (lane >> 1) * 4u;
+        uint sb_base = sbid * 64u;
+
+        // Cooperatively copy all records of this 8x8 DCT8 superblock to g_out_records.
+        if (do_dct8) {
+            [loop] for (uint i = lane * 2u; i < w8; i += 8u) {
+                g_out_records[dst8 + i]      = g_tq_stage[from8 + i];
+                g_out_records[dst8 + i + 1u] = g_tq_stage[from8 + i + 1u];
+            }
+        }
+
+        [unroll] for (uint pl = 0u; pl < 3u; pl++) {
+            if (lane == 0u) gs_it_nz8[sbid] = 0u;
+            if (do_dct8) {
+                uint zbase = sb_base + lane * 16u;
+                [unroll] for (uint z = 0u; z < 16u; z++) gs_dct8[zbase + z] = 0;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (do_dct8) {
+                bool any_pl = false;
+                [loop] for (uint i = lane * 2u; i < w8; i += 8u) {
+                    uint rw0 = g_tq_stage[from8 + i];
+                    uint pid = rw0 & 0x0FFFFFFFu;
+                    uint rb = pid / 48u;
+                    uint rem = pid - rb * 48u;
+                    uint rpl = rem >> 4;
+                    if (rpl == pl) {
+                        uint rw1 = g_tq_stage[from8 + i + 1u];
+                        int level = (int)(rw1 << 16) >> 16;
+                        if (level != 0) {
+                            uint qp = (rw1 >> 16) & 0xFFu;
+                            uint rk = rem & 15u;
+                            uint r_off = rb - b_tl;
+                            uint rq = (r_off >= bw) ? (2u + (r_off - bw)) : r_off;
+                            uint u0 = (rq & 1u) * 4u;
+                            uint v0 = (rq >> 1) * 4u;
+                            uint r = TQ_ZZ[rk];
+                            gs_dct8[sb_base + (v0 + (r >> 2)) * 8u + (u0 + (r & 3u))] = Tq8Dequant(level, qp);
+                            any_pl = true;
+                        }
+                    }
+                }
+                if (any_pl) gs_it_nz8[sbid] = 1u;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            bool nz_pl = do_dct8 && (gs_it_nz8[sbid] != 0u);
+            if (nz_pl) {
+                [unroll] for (uint rr = 0u; rr < 2u; rr++) {
+                    uint rb = sb_base + (lane * 2u + rr) * 8u;
+                    int c0 = gs_dct8[rb + 0u], c1 = gs_dct8[rb + 1u], c2 = gs_dct8[rb + 2u], c3 = gs_dct8[rb + 3u];
+                    int c4 = gs_dct8[rb + 4u], c5 = gs_dct8[rb + 5u], c6 = gs_dct8[rb + 6u], c7 = gs_dct8[rb + 7u];
+                    if ((c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7) != 0) {
+                        Dct8Inv1D(c0, c1, c2, c3, c4, c5, c6, c7, 64, 7);
+                        gs_dct8[rb + 0u] = c0; gs_dct8[rb + 1u] = c1; gs_dct8[rb + 2u] = c2; gs_dct8[rb + 3u] = c3;
+                        gs_dct8[rb + 4u] = c4; gs_dct8[rb + 5u] = c5; gs_dct8[rb + 6u] = c6; gs_dct8[rb + 7u] = c7;
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (nz_pl) {
+                [unroll] for (uint cc = 0u; cc < 2u; cc++) {
+                    uint cb = sb_base + lane * 2u + cc;
+                    int c0 = gs_dct8[cb + 0u],  c1 = gs_dct8[cb + 8u],  c2 = gs_dct8[cb + 16u], c3 = gs_dct8[cb + 24u];
+                    int c4 = gs_dct8[cb + 32u], c5 = gs_dct8[cb + 40u], c6 = gs_dct8[cb + 48u], c7 = gs_dct8[cb + 56u];
+                    Dct8Inv1D(c0, c1, c2, c3, c4, c5, c6, c7, 2048, 12);
+                    gs_dct8[cb + 0u]  = c0; gs_dct8[cb + 8u]  = c1; gs_dct8[cb + 16u] = c2; gs_dct8[cb + 24u] = c3;
+                    gs_dct8[cb + 32u] = c4; gs_dct8[cb + 40u] = c5; gs_dct8[cb + 48u] = c6; gs_dct8[cb + 56u] = c7;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (do_dct8) {
+                uint sh = pl * 8u;
+                uint clear_m = ~(0xFFu << sh);
+                if (nz_pl) {
+                    [unroll] for (uint j = 0u; j < 16u; j++) {
+                        uint lx = qx0 + (j & 3u);
+                        uint ly = qy0 + (j >> 2);
+                        uint idx = (y0_sb + ly) * width + x0_sb + lx;
+                        uint pw = (pl == 0u) ? (is_inter8 ? g_pred_yuvd[idx] : 0x00808080u) : g_cur_yuvd[idx];
+                        int pv = (int)((pw >> sh) & 0xFFu);
+                        uint nv = (uint)clamp(pv + gs_dct8[sb_base + ly * 8u + lx], 0, 255);
+                        uint out_w = (pw & clear_m) | (nv << sh);
+                        if (pl == 0u) out_w = (out_w & 0x00FFFFFFu) | (delta_min << 24);
+                        g_cur_yuvd[idx] = out_w;
+                    }
+                } else if (pl == 0u) {
+                    [unroll] for (uint j = 0u; j < 16u; j++) {
+                        uint lx = qx0 + (j & 3u);
+                        uint ly = qy0 + (j >> 2);
+                        uint idx = (y0_sb + ly) * width + x0_sb + lx;
+                        uint pw = is_inter8 ? g_pred_yuvd[idx] : 0x00808080u;
+                        g_cur_yuvd[idx] = (pw & 0x00FFFFFFu) | (delta_min << 24);
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
     if (gtid.x == 0u && gs_hist[3] != 0u) {
         uint dummy;
         InterlockedMax(g_tq_scratch[TqMisc() + 3u], gs_hist[3], dummy);

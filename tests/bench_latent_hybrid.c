@@ -202,18 +202,70 @@ static void run_unit_and_edge_tests(void) {
     printf("=== Equivalence & Edge-Case Verification ===\n");
     uint32_t rng = 0x12345678U;
 
-    /* 1. AVX2/Butterfly DCT8 forward == naive reference on 1000 random blocks */
-    for (int t = 0; t < 1000; ++t) {
-        int32_t in[64], out_ref[64], out_fast[64];
-        for (int i = 0; i < 64; ++i) in[i] = (int32_t)(xorshift32(&rng) % 511U) - 255;
+    /* 1. Factored DCT8 Forward (AVX2 vpmaddwd & 12-mul Negacyclic-Karatsuba scalar) == Reference */
+    for (int t = 0; t < 2000; ++t) {
+        int32_t in[64], out_ref[64], out_fast[64], out_sc[64];
+        if (t == 0) {
+            for (int i = 0; i < 64; ++i) in[i] = 255;
+        } else if (t == 1) {
+            for (int i = 0; i < 64; ++i) in[i] = -255;
+        } else if (t < 1800) {
+            for (int i = 0; i < 64; ++i) in[i] = (int32_t)(xorshift32(&rng) % 511U) - 255;
+        } else {
+            /* Out-of-8-bit range to exercise 32-bit Negacyclic-Karatsuba fallback */
+            for (int i = 0; i < 64; ++i) in[i] = (int32_t)(xorshift32(&rng) % 4001U) - 2000;
+        }
         zcvid_lh_dct8_fwd_ref(in, out_ref);
         zcvid_lh_dct8_fwd(in, out_fast);
-        if (memcmp(out_ref, out_fast, sizeof(out_ref)) != 0) {
+        zcvid_lh_dct8_fwd_scalar(in, out_sc);
+        if (memcmp(out_ref, out_fast, sizeof(out_ref)) != 0 ||
+            memcmp(out_ref, out_sc, sizeof(out_ref)) != 0) {
             fprintf(stderr, "FAIL: dct8_fwd mismatch on trial %d\n", t);
             exit(1);
         }
     }
-    printf("  [PASS] DCT8 Forward (AVX2/Butterfly == Reference): 1000/1000 exact\n");
+    printf("  [PASS] DCT8 Forward (AVX2 12-mul == Scalar 12-mul == Ref): 2000/2000 exact\n");
+
+    /* 1b. Factored IDCT8 (AVX2 12-mul, 12-mul scalar, sparse poly_only/LL/full) == Reference */
+    for (int t = 0; t < 2000; ++t) {
+        int32_t in[64], out_ref[64], out_fast[64], out_sc[64], out_sp[64];
+        memset(in, 0, sizeof(in));
+        bool poly_only = false;
+        uint32_t csbf = 15U;
+        if (t < 400) {
+            /* DC-only or degree-2 polynomial */
+            poly_only = true;
+            csbf = 1U;
+            static const uint32_t PPOS[6] = { 0U, 1U, 8U, 16U, 9U, 2U };
+            if (t < 100) {
+                in[0] = (int32_t)(xorshift32(&rng) % 65535U) - 32767;
+            } else {
+                for (int k = 0; k < 6; ++k) in[PPOS[k]] = (int32_t)(xorshift32(&rng) % 65535U) - 32767;
+            }
+        } else if (t < 900) {
+            /* LL-only 4x4 sub-block */
+            csbf = 1U;
+            for (int v = 0; v < 4; ++v)
+                for (int u = 0; u < 4; ++u)
+                    in[v * 8 + u] = (int32_t)(xorshift32(&rng) % 65535U) - 32767;
+        } else if (t < 1800) {
+            for (int i = 0; i < 64; ++i) in[i] = (int32_t)(xorshift32(&rng) % 131071U) - 65535;
+        } else {
+            /* Extreme >65535 overflow-guard inputs */
+            for (int i = 0; i < 64; ++i) in[i] = (int32_t)(xorshift32(&rng) % 400001U) - 200000;
+        }
+        zcvid_lh_dct8_inv_ref(in, out_ref);
+        zcvid_lh_dct8_inv(in, out_fast);
+        zcvid_lh_dct8_inv_scalar(in, out_sc);
+        zcvid_lh_dct8_inv_sparse(in, csbf, poly_only, out_sp);
+        if (memcmp(out_ref, out_fast, sizeof(out_ref)) != 0 ||
+            memcmp(out_ref, out_sc, sizeof(out_ref)) != 0 ||
+            memcmp(out_ref, out_sp, sizeof(out_ref)) != 0) {
+            fprintf(stderr, "FAIL: dct8_inv mismatch on trial %d\n", t);
+            exit(1);
+        }
+    }
+    printf("  [PASS] IDCT8 Inverse (AVX2 12-mul == Scalar 12-mul == Sparse Poly/LL == Ref): 2000/2000 exact\n");
 
     /* 2. Separable rank-1 IDCT8 == full 2D IDCT8 on 1000 random LRF factors */
     for (int t = 0; t < 1000; ++t) {
@@ -346,14 +398,14 @@ static void run_unit_and_edge_tests(void) {
             free(cs); free(cp); free(ce); free(cd); free(cb);
         }
 
-        /* 4g. Fuzz 500 corrupted ZCLS bitstreams at QP=51 (no UB / crash) */
+        /* 4g. Fuzz 500 corrupted ZCLS bitstreams at QP=51 (HYBRID_FAST & HYBRID_ESR, no UB / crash) */
         {
             uint8_t fbs[256];
             for (int t = 0; t < 500; ++t) {
                 for (int i = 0; i < 256; ++i) fbs[i] = (uint8_t)xorshift32(&rng);
                 fbs[0] = 'Z'; fbs[1] = 'C'; fbs[2] = 'L'; fbs[3] = 'S';
                 fbs[4] = 64; fbs[5] = 0; fbs[6] = 64; fbs[7] = 0;
-                fbs[8] = (uint8_t)ZCVID_LH_HYBRID_FAST;
+                fbs[8] = (uint8_t)((t & 1) ? ZCVID_LH_HYBRID_ESR : ZCVID_LH_HYBRID_FAST);
                 fbs[9] = 51U;
                 fbs[10] = 0U;
                 fbs[11] = 2U;
@@ -362,9 +414,95 @@ static void run_unit_and_edge_tests(void) {
                 (void)zcvid_lh_mt_decode_frame(&pool, fbs, sizeof(fbs), p64, 64U, 64U, dr64);
             }
         }
+
+        /* 4h. HYBRID_ESR edge cases: QP=0, QP=51, 8x8 SKIP, +/-255 checker, MT 12->4T */
+        {
+            uint8_t er8e[64], dr8e[64], bs8e[4096];
+            size_t le = zcvid_lh_encode_frame(ZCVID_LH_HYBRID_ESR, s8, p8, 8U, 8U, 24U, true, bs8e, sizeof(bs8e), er8e, &st);
+            assert(le > 12U && st.count[ZCVID_LH_BLK_SKIP] == 1ULL);
+            assert(zcvid_lh_decode_frame(bs8e, le, p8, 8U, 8U, dr8e) == 0);
+            assert(memcmp(er8e, dr8e, 64U) == 0);
+
+            uint32_t edge_qps[3] = { 0U, 18U, 51U };
+            for (int qi = 0; qi < 3; ++qi) {
+                size_t lq = zcvid_lh_mt_encode_frame(&pool, ZCVID_LH_HYBRID_ESR, s64, p64, 64U, 64U, edge_qps[qi], false, bs64, sizeof(bs64), er64, NULL);
+                assert(lq > 16U);
+                assert(zcvid_lh_mt_decode_frame(&pool, bs64, lq, p64, 64U, 64U, dr64) == 0);
+                assert(memcmp(er64, dr64, 4096U) == 0);
+            }
+        }
     }
     zcvid_lh_mt_pool_destroy(&pool);
-    printf("  [PASS] Edge Cases (8x8, 100%% SKIP, +/-255, QP51 ovf, 12->4T dec, bad args, fuzz500)\n\n");
+    printf("  [PASS] Edge Cases (8x8, 100%% SKIP, +/-255, QP0/51 ESR, 12->4T dec, bad args, fuzz500)\n\n");
+
+    /* 5. Linear Circuit Micro-Benchmark (ns / 8x8 block across 200,000 blocks) */
+    {
+        enum { NBLK = 200000 };
+        int32_t in_fwd[64], in_inv[64], in_ll[64], in_poly[64], out[64];
+        memset(in_ll, 0, sizeof(in_ll));
+        memset(in_poly, 0, sizeof(in_poly));
+        for (int i = 0; i < 64; ++i) {
+            in_fwd[i] = (int32_t)(xorshift32(&rng) % 511U) - 255;
+            in_inv[i] = (int32_t)(xorshift32(&rng) % 4097U) - 2048;
+        }
+        for (int v = 0; v < 4; ++v)
+            for (int u = 0; u < 4; ++u)
+                in_ll[v * 8 + u] = in_inv[v * 8 + u];
+        static const uint32_t PPOS[6] = { 0U, 1U, 8U, 16U, 9U, 2U };
+        for (int k = 0; k < 6; ++k) in_poly[PPOS[k]] = in_inv[PPOS[k]];
+
+        volatile int64_t sink = 0;
+        double t0, t1;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_fwd[i & 63] = (i & 255) - 128; zcvid_lh_dct8_fwd_ref(in_fwd, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_fwd_ref = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_fwd[i & 63] = (i & 255) - 128; zcvid_lh_dct8_fwd_scalar(in_fwd, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_fwd_sc = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_fwd[i & 63] = (i & 255) - 128; zcvid_lh_dct8_fwd(in_fwd, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_fwd_avx = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_inv[i & 63] = (i & 1023) - 512; zcvid_lh_dct8_inv_ref(in_inv, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_inv_ref = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_inv[i & 63] = (i & 1023) - 512; zcvid_lh_dct8_inv_scalar(in_inv, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_inv_sc = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_inv[i & 63] = (i & 1023) - 512; zcvid_lh_dct8_inv(in_inv, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_inv_avx = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_ll[(i & 3) * 8 + ((i >> 2) & 3)] = (i & 1023) - 512; zcvid_lh_dct8_inv_sparse(in_ll, 1U, false, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_inv_ll = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        t0 = now_ms();
+        for (int i = 0; i < NBLK; ++i) { in_poly[PPOS[i % 6]] = (i & 1023) - 512; zcvid_lh_dct8_inv_sparse(in_poly, 1U, true, out); sink += out[i & 63]; }
+        t1 = now_ms();
+        double ns_inv_poly = ((t1 - t0) * 1e6) / (double)NBLK;
+
+        (void)sink;
+        printf("=== 8x8 DCT/IDCT Linear Circuit Micro-Benchmark (%d blocks, 0 mismatch) ===\n", NBLK);
+        printf("  DCT8 Forward : Ref 1024-MAC = %6.1f ns | Scalar 12-mul = %5.1f ns (%.1fx) | AVX2 12-mul = %5.1f ns (%.1fx)\n",
+               ns_fwd_ref, ns_fwd_sc, ns_fwd_ref / ns_fwd_sc, ns_fwd_avx, ns_fwd_ref / ns_fwd_avx);
+        printf("  IDCT8 Inverse: Ref 1024-MAC = %6.1f ns | Scalar 12-mul = %5.1f ns (%.1fx) | AVX2 12-mul = %5.1f ns (%.1fx)\n",
+               ns_inv_ref, ns_inv_sc, ns_inv_ref / ns_inv_sc, ns_inv_avx, ns_inv_ref / ns_inv_avx);
+        printf("  IDCT8 Sparse : LL 4x4 CSBF  = %6.1f ns (%.1fx) | Poly 3x3 Deg-2 = %5.1f ns (%.1fx)\n\n",
+               ns_inv_ll, ns_inv_ref / ns_inv_ll, ns_inv_poly, ns_inv_ref / ns_inv_poly);
+    }
 }
 
 static void run_1080p_realtime_bench(void) {
@@ -402,19 +540,23 @@ static void run_1080p_realtime_bench(void) {
         zcvid_lh_codec_t codec;
         zcvid_lh_mt_pool_t *pool;
     } cfg_t;
-    cfg_t cfgs[6] = {
+    cfg_t cfgs[10] = {
         { "TQ4 (1T baseline)",     ZCVID_LH_TQ4,         NULL    },
         { "TQ4 (12T MT)",          ZCVID_LH_TQ4,         &pool12 },
         { "HYBRID_FAST (1T)",      ZCVID_LH_HYBRID_FAST, NULL    },
         { "HYBRID_FAST (8T MT)",   ZCVID_LH_HYBRID_FAST, &pool8  },
         { "HYBRID_FAST (12T MT)",  ZCVID_LH_HYBRID_FAST, &pool12 },
-        { "HYBRID_FAST (16T MT)",  ZCVID_LH_HYBRID_FAST, &pool16 }
+        { "HYBRID_FAST (16T MT)",  ZCVID_LH_HYBRID_FAST, &pool16 },
+        { "HYBRID_ESR (1T)",       ZCVID_LH_HYBRID_ESR,  NULL    },
+        { "HYBRID_ESR (8T MT)",    ZCVID_LH_HYBRID_ESR,  &pool8  },
+        { "HYBRID_ESR (12T MT)",   ZCVID_LH_HYBRID_ESR,  &pool12 },
+        { "HYBRID_ESR (16T MT)",   ZCVID_LH_HYBRID_ESR,  &pool16 }
     };
 
     const uint32_t qps[2] = { 24U, 30U };
     const int iters = 3;
 
-    for (int ci = 0; ci < 6; ++ci) {
+    for (int ci = 0; ci < 10; ++ci) {
         double enc_sum = 0.0, dec_sum = 0.0, bpp_sum = 0.0, psnr_sum = 0.0;
         int runs = 0;
 
@@ -490,7 +632,7 @@ int main(void) {
         "45deg Diag + Check",
         "Mixed HUD + Texture"
     };
-    enum { BENCH_ROWS = ZCVID_LH_CODEC_COUNT + 1 }; /* +1 for HYBRID_FAST (12T MT) */
+    enum { BENCH_ROWS = ZCVID_LH_CODEC_COUNT + 2 }; /* +2 for HYBRID_FAST (12T) & HYBRID_ESR (12T) */
     static const char *k_codec_names[BENCH_ROWS] = {
         "TQ4 (4x4 baseline)",
         "LRF-R1 (pure)",
@@ -499,7 +641,9 @@ int main(void) {
         "HYBRID_CASCADE",
         "HYBRID_FULL",
         "HYBRID_FAST (1T)",
-        "HYBRID_FAST (12T)"
+        "HYBRID_ESR (1T)",
+        "HYBRID_FAST (12T)",
+        "HYBRID_ESR (12T)"
     };
     static const uint32_t k_qps[NUM_QPS] = { 18U, 24U, 30U, 36U, 42U };
 
@@ -519,7 +663,7 @@ int main(void) {
     double psnr_tbl[NUM_SCENES][BENCH_ROWS][NUM_QPS];
     double enc_ms_sum[BENCH_ROWS] = {0};
     double dec_ms_sum[BENCH_ROWS] = {0};
-    uint64_t mode_tot[BENCH_ROWS][6];
+    uint64_t mode_tot[BENCH_ROWS][7];
     memset(mode_tot, 0, sizeof(mode_tot));
 
     printf("=== zcvid Latent Factorization vs 4x4 Transform Hybrid Benchmark (%dx%d) ===\n\n",
@@ -534,8 +678,10 @@ int main(void) {
                "BD-Rate", "BD-PSNR");
 
         for (int c = 0; c < BENCH_ROWS; ++c) {
-            const bool use_mt = (c == ZCVID_LH_CODEC_COUNT);
-            const zcvid_lh_codec_t codec = use_mt ? ZCVID_LH_HYBRID_FAST : (zcvid_lh_codec_t)c;
+            const bool use_mt = (c >= ZCVID_LH_CODEC_COUNT);
+            const zcvid_lh_codec_t codec = (c == ZCVID_LH_CODEC_COUNT) ? ZCVID_LH_HYBRID_FAST
+                                         : (c == ZCVID_LH_CODEC_COUNT + 1) ? ZCVID_LH_HYBRID_ESR
+                                         : (zcvid_lh_codec_t)c;
             for (int qi = 0; qi < NUM_QPS; ++qi) {
                 zcvid_lh_stats_t st;
                 double t0 = now_ms();
@@ -564,7 +710,7 @@ int main(void) {
                 psnr_tbl[s][c][qi] = compute_psnr(src, dec_rec, npix);
                 enc_ms_sum[c] += (t1 - t0);
                 dec_ms_sum[c] += (t3 - t2);
-                for (int k = 0; k < 6; ++k) mode_tot[c][k] += st.count[k];
+                for (int k = 0; k < 7; ++k) mode_tot[c][k] += st.count[k];
             }
 
             double bd_rate = 0.0, bd_psnr = 0.0;
@@ -589,7 +735,7 @@ int main(void) {
     const double scale_1080p = (1920.0 * 1080.0) / (double)npix;
     const double runs_per_codec = (double)(NUM_SCENES * NUM_QPS);
     printf("  %-19s | %10s | %10s | %12s | %12s | %s\n",
-           "Codec", "Mean BD-R", "Mean BD-dB", "1080p Enc", "1080p Dec", "Block Mode Mix (SKIP/TQ4/LRF1/LRF2/CAS/SPEC)");
+           "Codec", "Mean BD-R", "Mean BD-dB", "1080p Enc", "1080p Dec", "Block Mode Mix (SKIP/TQ4/LRF1/LRF2/CAS/SPEC/ESR)");
     for (int c = 0; c < BENCH_ROWS; ++c) {
         double sum_r = 0.0, sum_p = 0.0;
         if (c > 0) {
@@ -603,16 +749,16 @@ int main(void) {
             sum_p /= NUM_SCENES;
         }
         uint64_t tot_blk = 0ULL;
-        for (int k = 0; k < 6; ++k) tot_blk += mode_tot[c][k];
-        double pct[6] = {0};
+        for (int k = 0; k < 7; ++k) tot_blk += mode_tot[c][k];
+        double pct[7] = {0};
         if (tot_blk > 0ULL) {
-            for (int k = 0; k < 6; ++k) pct[k] = 100.0 * (double)mode_tot[c][k] / (double)tot_blk;
+            for (int k = 0; k < 7; ++k) pct[k] = 100.0 * (double)mode_tot[c][k] / (double)tot_blk;
         }
         double e1080 = (enc_ms_sum[c] / runs_per_codec) * scale_1080p;
         double d1080 = (dec_ms_sum[c] / runs_per_codec) * scale_1080p;
-        printf("  %-19s | %+8.2f%% | %+8.2f dB | %9.2f ms | %9.2f ms | %4.1f / %4.1f / %4.1f / %4.1f / %4.1f / %4.1f %%\n",
+        printf("  %-19s | %+8.2f%% | %+8.2f dB | %9.2f ms | %9.2f ms | %4.1f / %4.1f / %4.1f / %4.1f / %4.1f / %4.1f / %4.1f %%\n",
                k_codec_names[c], sum_r, sum_p, e1080, d1080,
-               pct[0], pct[1], pct[2], pct[3], pct[4], pct[5]);
+               pct[0], pct[1], pct[2], pct[3], pct[4], pct[5], pct[6]);
     }
     printf("\n");
 

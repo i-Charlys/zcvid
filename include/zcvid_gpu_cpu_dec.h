@@ -106,6 +106,112 @@ static inline int32_t zcvid_dec_tq_sample8x8(const int32_t c[16], uint32_t lx, u
   return (9 * c[v * 4u + u] + 3 * c[v * 4u + un] + 3 * c[vn * 4u + u] + c[vn * 4u + un] + 8) >> 4;
 }
 
+/* Exact 8x8 HEVC DCT8 dequantizer (proved overflow-free in ZcvidDCT8Circuit.lean Thm 7a). */
+static inline int32_t zcvid_dec_tq8_dequant(int32_t level, uint32_t qp) {
+  static const int32_t TQ8_V[6] = { 40, 45, 51, 57, 64, 72 };
+  uint32_t qp_mod = qp % 6u;
+  uint32_t qp_div = qp / 6u;
+  int32_t dq_step = (qp_div >= 2u)
+                        ? (TQ8_V[qp_mod] << (qp_div - 2u))
+                        : (((TQ8_V[qp_mod] << qp_div) + 2) >> 2);
+  int32_t v = level * dq_step;
+  return zcvid_dec_clamp_i32(v, -65535, 65535);
+}
+
+/* Exact 12-mul 1D HEVC IDCT8 (Negacyclic-Karatsuba 9-mul odd + Gauss 3-mul even).
+ * Shared bit-for-bit with zcvid_encode.hlsl, zcvid_decode.hlsl, and ZcvidDCT8Circuit.lean. */
+static inline void zcvid_dec_dct8_inv_1d(int32_t c0, int32_t c1, int32_t c2, int32_t c3,
+                                         int32_t c4, int32_t c5, int32_t c6, int32_t c7,
+                                         int32_t rnd, int sh,
+                                         int32_t *out, uint32_t stride) {
+  int32_t e0 = 64 * (c0 + c4);
+  int32_t e1 = 64 * (c0 - c4);
+  int32_t pev = 36 * (c2 + c6);
+  int32_t g0 = pev + 47 * c2;
+  int32_t g1 = pev - 119 * c6;
+  int32_t E0 = e0 + g0, E1 = e1 + g1, E2 = e1 - g1, E3 = e0 - g0;
+
+  int32_t s0 = c1 + c7, s1 = c5 + c3;
+  int32_t m0 = 89 * c1, m1 = -75 * c5, m2 = 14 * (c1 + c5);
+  int32_t m3 = -18 * c7, m4 = -50 * c3, m5 = -68 * (c7 + c3);
+  int32_t m6 = 71 * s0, m7 = -125 * s1, m8 = -54 * (s0 + s1);
+  int32_t u0 = m0 + m3, d0 = m0 - m3;
+  int32_t u1 = m1 + m4, d1 = m1 - m4;
+  int32_t u2 = m2 + m5, d2 = m2 - m5;
+  int32_t k0 = m6 - u0, k1 = m7 - u1;
+  int32_t O0 = d0 - k1;
+  int32_t O1 = d0 + d1 - d2;
+  int32_t O2 = k0 + k1 + u2 - m8;
+  int32_t O3 = -k0 - d1;
+
+  out[0u * stride] = (E0 + O0 + rnd) >> sh;
+  out[1u * stride] = (E1 + O1 + rnd) >> sh;
+  out[2u * stride] = (E2 + O2 + rnd) >> sh;
+  out[3u * stride] = (E3 + O3 + rnd) >> sh;
+  out[4u * stride] = (E3 - O3 + rnd) >> sh;
+  out[5u * stride] = (E2 - O2 + rnd) >> sh;
+  out[6u * stride] = (E1 - O1 + rnd) >> sh;
+  out[7u * stride] = (E0 - O0 + rnd) >> sh;
+}
+
+/* Exact 2D 8x8 HEVC IDCT8 with Lean-4-proved sparse fast-paths (DC-only, LL-only, general). */
+static inline void zcvid_dec_tq8_inverse(const int32_t in[64], uint32_t csbf, int32_t out[64]) {
+  if (csbf == 0u) {
+    memset(out, 0, sizeof(int32_t) * 64u);
+    return;
+  }
+  if (csbf == 1u) {
+    int32_t ac_or = in[1] | in[2] | in[3] |
+                    in[8] | in[9] | in[10] | in[11] |
+                    in[16] | in[17] | in[18] | in[19] |
+                    in[24] | in[25] | in[26] | in[27];
+    if (ac_or == 0) {
+      int32_t t0 = (64 * in[0] + 64) >> 7;
+      int32_t v = (64 * t0 + 2048) >> 12;
+      for (uint32_t i = 0u; i < 64u; ++i) out[i] = v;
+      return;
+    }
+    static const int32_t k1[8] = { 89, 75, 50, 18, -18, -50, -75, -89 };
+    static const int32_t k2[8] = { 83, 36, -36, -83, -83, -36, 36, 83 };
+    static const int32_t k3[8] = { 75, -18, -89, -50, 50, 89, 18, -75 };
+    int32_t t[4][8];
+    for (uint32_t v = 0u; v < 4u; ++v) {
+      const int32_t *row = in + v * 8u;
+      for (uint32_t x = 0u; x < 8u; ++x) {
+        t[v][x] = (64 * row[0] + k1[x] * row[1] + k2[x] * row[2] + k3[x] * row[3] + 64) >> 7;
+      }
+    }
+    for (uint32_t y = 0u; y < 4u; ++y) {
+      for (uint32_t x = 0u; x < 8u; ++x) {
+        int32_t ev = 64 * t[0][x] + k2[y] * t[2][x];
+        int32_t od = k1[y] * t[1][x] + k3[y] * t[3][x];
+        out[y * 8u + x] = (ev + od + 2048) >> 12;
+        out[(7u - y) * 8u + x] = (ev - od + 2048) >> 12;
+      }
+    }
+    return;
+  }
+  int32_t tmp[64];
+  uint32_t v_end = ((csbf & 12u) != 0u) ? 8u : 4u;
+  for (uint32_t v = 0u; v < v_end; ++v) {
+    const int32_t *c = in + v * 8u;
+    if ((c[0] | c[1] | c[2] | c[3] | c[4] | c[5] | c[6] | c[7]) == 0) {
+      memset(tmp + v * 8u, 0, sizeof(int32_t) * 8u);
+      continue;
+    }
+    zcvid_dec_dct8_inv_1d(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                          64, 7, tmp + v * 8u, 1u);
+  }
+  if (v_end < 8u) {
+    memset(tmp + 32u, 0, sizeof(int32_t) * 32u);
+  }
+  for (uint32_t x = 0u; x < 8u; ++x) {
+    zcvid_dec_dct8_inv_1d(tmp[0u * 8u + x], tmp[1u * 8u + x], tmp[2u * 8u + x], tmp[3u * 8u + x],
+                          tmp[4u * 8u + x], tmp[5u * 8u + x], tmp[6u * 8u + x], tmp[7u * 8u + x],
+                          2048, 12, out + x, 8u);
+  }
+}
+
 static inline int32_t zcvid_dec_leaky(int32_t prev_val, int32_t neutral, uint32_t gamma_q8) {
   int32_t diff = prev_val - neutral;
   return zcvid_dec_clamp_i32(neutral + (diff * (int32_t)gamma_q8) / 256, 0, 255);
@@ -310,12 +416,21 @@ static inline int zcvid_gpu_dec_decode_frame(zcvid_gpu_dec_state_t *st,
         uint32_t b    = pid / 48u;
         uint32_t qp   = (w1 >> 16) & 0xFFu;
         uint32_t pred = (w1 >> 24) & 0xFFu;
-        if (b >= st->nblocks || qp > 51u || pred > 3u) continue;
+        if (b >= st->nblocks || qp > 51u || pred > 5u) continue;
         int32_t level = (int16_t)(w1 & 0xFFFFu);
-        if (level < -255 || level > 255) continue;
-        uint32_t r = TQ_ZZ[pid % 16u];
-        st->coef[pid] = zcvid_dec_tq_dequant(level, r, qp);
-        st->tflag[b]  = (uint8_t)(1u + pred);
+        if (pred >= 4u) {
+          if (level < -2047 || level > 2047) continue;
+          uint32_t bx0 = (b % bw) & ~1u;
+          uint32_t by0 = (b / bw) & ~1u;
+          if (bx0 + 1u >= bw || by0 + 1u >= bh) continue;
+          st->coef[pid] = zcvid_dec_tq8_dequant(level, qp);
+          st->tflag[by0 * bw + bx0] = (uint8_t)(1u + pred);
+        } else {
+          if (level < -255 || level > 255) continue;
+          uint32_t r = TQ_ZZ[pid % 16u];
+          st->coef[pid] = zcvid_dec_tq_dequant(level, r, qp);
+          st->tflag[b]  = (uint8_t)(1u + pred);
+        }
         any_transform = 1u;
         continue;
       }
@@ -378,15 +493,17 @@ static inline int zcvid_gpu_dec_decode_frame(zcvid_gpu_dec_state_t *st,
     }
   }
 
-  /* Pass 2b: CSITrans (4x4 mode 1..2 and 8x8 mode 3..4) */
+  /* Pass 2b: CSITrans (4x4 mode 1..2, legacy 8x8 mode 3..4, exact 8x8 DCT8 mode 5..6) */
   if (any_transform) {
     for (uint32_t b = 0; b < bw * bh; ++b) {
       uint32_t mode = st->tflag[b];
       if (mode == 0u) continue;
       st->tflag[b] = 0u;
-      uint32_t x0 = (b % bw) * 4u;
-      uint32_t y0 = (b / bw) * 4u;
-      int is_inter = (mode == 2u) || (mode == 4u);
+      uint32_t bx0 = b % bw;
+      uint32_t by0 = b / bw;
+      uint32_t x0 = bx0 * 4u;
+      uint32_t y0 = by0 * 4u;
+      int is_inter = (mode == 2u) || (mode == 4u) || (mode == 6u);
 
       if (mode <= 2u) {
         int inside = (x0 + 4u <= w) && (y0 + 4u <= h);
@@ -416,7 +533,7 @@ static inline int zcvid_gpu_dec_decode_frame(zcvid_gpu_dec_state_t *st,
                               ((uint32_t)rec[32u + j] << 16) |
                               (p->delta_min << 24);
         }
-      } else {
+      } else if (mode <= 4u) {
         int inside8 = (x0 + 8u <= w) && (y0 + 8u <= h);
         int32_t c_pl[3][16];
         for (uint32_t pl = 0; pl < 3u; ++pl) {
@@ -435,6 +552,46 @@ static inline int zcvid_gpu_dec_decode_frame(zcvid_gpu_dec_state_t *st,
             int32_t ry = zcvid_dec_clamp_i32((int32_t)(pw & 0xFFu) + zcvid_dec_tq_sample8x8(c_pl[0], lx, ly), 0, 255);
             int32_t rb = zcvid_dec_clamp_i32((int32_t)((pw >> 8) & 0xFFu) + zcvid_dec_tq_sample8x8(c_pl[1], lx, ly), 0, 255);
             int32_t rr = zcvid_dec_clamp_i32((int32_t)((pw >> 16) & 0xFFu) + zcvid_dec_tq_sample8x8(c_pl[2], lx, ly), 0, 255);
+            st->cur_yuvd[idx] = (uint32_t)ry | ((uint32_t)rb << 8) | ((uint32_t)rr << 16) | (p->delta_min << 24);
+          }
+        }
+      } else {
+        /* Exact 8x8 Factored HEVC DCT8 (mode 5 = intra, mode 6 = inter). */
+        int valid_sb = ((bx0 & 1u) == 0u) && ((by0 & 1u) == 0u) && (bx0 + 1u < bw) && (by0 + 1u < bh);
+        if (!valid_sb) continue;
+        int inside8 = (x0 + 8u <= w) && (y0 + 8u <= h);
+        uint32_t bq[4] = { b, b + 1u, b + bw, b + bw + 1u };
+        int32_t res_pl[3][64];
+        for (uint32_t pl = 0u; pl < 3u; ++pl) {
+          int32_t w_in[64];
+          uint32_t csbf = 0u;
+          for (uint32_t q = 0u; q < 4u; ++q) {
+            uint32_t u0 = (q & 1u) * 4u;
+            uint32_t v0 = (q >> 1) * 4u;
+            uint32_t base_pid = bq[q] * 48u + pl * 16u;
+            int32_t nz_or = 0;
+            for (uint32_t k = 0u; k < 16u; ++k) {
+              int32_t cv = st->coef[base_pid + k];
+              st->coef[base_pid + k] = 0;
+              uint32_t r = TQ_ZZ[k];
+              w_in[(v0 + (r >> 2)) * 8u + (u0 + (r & 3u))] = cv;
+              nz_or |= cv;
+            }
+            if (nz_or != 0) csbf |= (1u << q);
+          }
+          if (inside8) {
+            zcvid_dec_tq8_inverse(w_in, csbf, res_pl[pl]);
+          }
+        }
+        if (!inside8) continue;
+        for (uint32_t ly = 0u; ly < 8u; ++ly) {
+          for (uint32_t lx = 0u; lx < 8u; ++lx) {
+            uint32_t idx = (y0 + ly) * w + x0 + lx;
+            uint32_t pw = is_inter ? st->cur_yuvd[idx] : 0x00808080u;
+            uint32_t p8 = ly * 8u + lx;
+            int32_t ry = zcvid_dec_clamp_i32((int32_t)(pw & 0xFFu) + res_pl[0][p8], 0, 255);
+            int32_t rb = zcvid_dec_clamp_i32((int32_t)((pw >> 8) & 0xFFu) + res_pl[1][p8], 0, 255);
+            int32_t rr = zcvid_dec_clamp_i32((int32_t)((pw >> 16) & 0xFFu) + res_pl[2][p8], 0, 255);
             st->cur_yuvd[idx] = (uint32_t)ry | ((uint32_t)rb << 8) | ((uint32_t)rr << 16) | (p->delta_min << 24);
           }
         }

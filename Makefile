@@ -44,16 +44,21 @@ $(TARGET_PACKING): tests/test_zcvid_packing.c include/protocol_zcvid.h
 $(TARGET_CODEC): tests/test_zcvid_codec.c include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_mt.h include/zcvid_zcrudp_bridge.h include/protocol_zcvid.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-$(TARGET_PROOFS): tests/test_zcvid_proofs.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h include/zcvid_gpu_cpu_dec.h
+$(TARGET_PROOFS): tests/test_zcvid_proofs.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_proofs.c include/protocol_zcvid.h include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h
+sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_proofs.c include/protocol_zcvid.h include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_packing.c -o tests/test_zcvid_packing_san$(EXE)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_codec.c -o tests/test_zcvid_codec_san$(EXE) $(LDFLAGS)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_proofs.c -o tests/test_zcvid_proofs_san$(EXE) $(LDFLAGS)
 	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_packing_san$(EXE),./tests/test_zcvid_packing_san$(EXE))
 	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_codec_san$(EXE),./tests/test_zcvid_codec_san$(EXE))
 	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_proofs_san$(EXE),./tests/test_zcvid_proofs_san$(EXE))
+
+# Formal Lean 4 verification of the 12-mul HEVC DCT8 circuit & wire quantizer
+LEAN ?= lean
+test-lean: proofs/lean4/ZcvidDCT8Circuit.lean
+	$(LEAN) $<
 
 # Token vs entropy-coded size on a real picture: make bench-image IMG=photo.pgm
 bench-image: tests/bench_image.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h
@@ -74,4 +79,4 @@ else
 	$(RM) $(TARGET_PACKING) $(TARGET_CODEC) $(TARGET_PROOFS) $(TARGET_LATENT) tests/test_zcvid_packing_san tests/test_zcvid_codec_san tests/test_zcvid_proofs_san tests/bench_image
 endif
 
-.PHONY: all test sanitize bench-image bench-latent clean
+.PHONY: all test test-lean sanitize bench-image bench-latent clean

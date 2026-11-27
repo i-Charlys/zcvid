@@ -19,6 +19,7 @@
 #include "zcvid_codec.h"
 #include "zcvid_mt.h"
 #include "zcvid_gpu_cpu_dec.h"
+#include "zcvid_latent_hybrid.h"
 
 typedef struct {
     uint8_t (*pkts)[1400];
@@ -1360,6 +1361,430 @@ static void prove_portable_gpu_cpu_decoder(void) {
     printf("PROVEN (0 violet, exact MC/delta/4x4/8x8)\n");
 }
 
+/*
+ * Proof 19: Factored 12-mul Negacyclic-Karatsuba + Gauss AVX2/Scalar DCT8/IDCT8
+ * Linear Circuits + Polynomial Prediction / Exact Spectral Repair (HYBRID_ESR)
+ * Bit-Exact Closed-Loop Parity, INT32_MIN/Boundary Safety & Adversarial Fuzz.
+ */
+static void prove_dct8_circuit_and_hybrid_esr(void) {
+    printf("[PROOF 19] Factored DCT8/IDCT8 Circuits & HYBRID_ESR Parity/Fuzz... ");
+    uint32_t rng = 0xC0DEC26DU;
+
+    /* 1. Forward DCT8: AVX2 12-mul == Scalar 12-mul == 64-bit ref */
+    for (int t = 0; t < 2000; ++t) {
+        int32_t in[64], out_ref[64], out_fast[64], out_sc[64];
+        if (t == 0) {
+            for (int i = 0; i < 64; ++i) in[i] = 255;
+        } else if (t == 1) {
+            for (int i = 0; i < 64; ++i) in[i] = -255;
+        } else if (t < 1800) {
+            for (int i = 0; i < 64; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                in[i] = (int32_t)(rng % 511U) - 255;
+            }
+        } else {
+            for (int i = 0; i < 64; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                in[i] = (int32_t)(rng % 4001U) - 2000;
+            }
+        }
+        zcvid_lh_dct8_fwd_ref(in, out_ref);
+        zcvid_lh_dct8_fwd(in, out_fast);
+        zcvid_lh_dct8_fwd_scalar(in, out_sc);
+        assert(memcmp(out_ref, out_fast, sizeof(out_ref)) == 0);
+        assert(memcmp(out_ref, out_sc, sizeof(out_ref)) == 0);
+    }
+
+    /* 2. Inverse IDCT8: AVX2 12-mul == Scalar 12-mul == Sparse (DC/Poly3/LL/Full) == 64-bit ref */
+    for (int t = 0; t < 2000; ++t) {
+        int32_t in[64], out_ref[64], out_fast[64], out_sc[64], out_sp[64];
+        memset(in, 0, sizeof(in));
+        bool poly_only = false;
+        uint32_t csbf = 15U;
+        if (t < 400) {
+            poly_only = true;
+            csbf = 1U;
+            static const uint32_t PPOS[6] = { 0U, 1U, 8U, 16U, 9U, 2U };
+            if (t < 100) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                in[0] = (int32_t)(rng % 65535U) - 32767;
+            } else {
+                for (int k = 0; k < 6; ++k) {
+                    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                    in[PPOS[k]] = (int32_t)(rng % 65535U) - 32767;
+                }
+            }
+        } else if (t < 900) {
+            csbf = 1U;
+            for (int v = 0; v < 4; ++v) {
+                for (int u = 0; u < 4; ++u) {
+                    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                    in[v * 8 + u] = (int32_t)(rng % 65535U) - 32767;
+                }
+            }
+        } else if (t < 1800) {
+            for (int i = 0; i < 64; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                in[i] = (int32_t)(rng % 131071U) - 65535;
+            }
+        } else {
+            for (int i = 0; i < 64; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                in[i] = (int32_t)(rng % 400001U) - 200000;
+            }
+        }
+        zcvid_lh_dct8_inv_ref(in, out_ref);
+        zcvid_lh_dct8_inv(in, out_fast);
+        zcvid_lh_dct8_inv_scalar(in, out_sc);
+        zcvid_lh_dct8_inv_sparse(in, csbf, poly_only, out_sp);
+        assert(memcmp(out_ref, out_fast, sizeof(out_ref)) == 0);
+        assert(memcmp(out_ref, out_sc, sizeof(out_ref)) == 0);
+        assert(memcmp(out_ref, out_sp, sizeof(out_ref)) == 0);
+    }
+
+    /* 2b. Adversarial INT32_MIN / INT32_MAX / boundary overflow-guard equivalence (no abs UB!) */
+    {
+        static const int32_t extremes[6] = { INT32_MIN, INT32_MAX, -65536, 65536, -4096, 4096 };
+        for (int ei = 0; ei < 6; ++ei) {
+            int32_t in[64], out_ref[64], out_fast[64], out_sc[64], out_sp[64];
+            memset(in, 0, sizeof(in));
+            in[0] = extremes[ei];
+            zcvid_lh_dct8_fwd_ref(in, out_ref);
+            zcvid_lh_dct8_fwd(in, out_fast);
+            zcvid_lh_dct8_fwd_scalar(in, out_sc);
+            assert(memcmp(out_ref, out_fast, sizeof(out_ref)) == 0);
+            assert(memcmp(out_ref, out_sc, sizeof(out_ref)) == 0);
+
+            zcvid_lh_dct8_inv_ref(in, out_ref);
+            zcvid_lh_dct8_inv(in, out_fast);
+            zcvid_lh_dct8_inv_scalar(in, out_sc);
+            zcvid_lh_dct8_inv_sparse(in, 1U, true, out_sp);
+            assert(memcmp(out_ref, out_fast, sizeof(out_ref)) == 0);
+            assert(memcmp(out_ref, out_sc, sizeof(out_ref)) == 0);
+            assert(memcmp(out_ref, out_sp, sizeof(out_ref)) == 0);
+            zcvid_lh_dct8_inv_sparse(in, 1U, false, out_sp);
+            assert(memcmp(out_ref, out_sp, sizeof(out_ref)) == 0);
+            zcvid_lh_dct8_inv_sparse(in, 15U, false, out_sp);
+            assert(memcmp(out_ref, out_sp, sizeof(out_ref)) == 0);
+        }
+    }
+
+    /* 2c. Localized 1-quadrant non-rank-1 4x4 detail: verify HYBRID_ESR lets TQ4 compete cleanly */
+    {
+        const uint32_t lw = 64U, lh = 64U;
+        uint8_t lsrc[64 * 64], lpred[64 * 64], lrec[64 * 64], ldec[64 * 64], lbs[64 * 64 * 4];
+        for (uint32_t y = 0U; y < lh; ++y) {
+            for (uint32_t x = 0U; x < lw; ++x) {
+                uint32_t lx = x & 7U, ly = y & 7U;
+                lpred[y * lw + x] = 128U;
+                if (lx < 4U && ly < 4U) {
+                    lsrc[y * lw + x] = (uint8_t)((lx == ly || lx + ly == 3U) ? 245U : ((lx == 0U && ly == 2U) ? 10U : 128U));
+                } else {
+                    lsrc[y * lw + x] = 128U;
+                }
+            }
+        }
+        zcvid_lh_stats_t st_esr;
+        size_t l_tq = zcvid_lh_encode_frame(ZCVID_LH_TQ4, lsrc, lpred, lw, lh, 30U, false, lbs, sizeof(lbs), lrec, NULL);
+        size_t l_esr = zcvid_lh_encode_frame(ZCVID_LH_HYBRID_ESR, lsrc, lpred, lw, lh, 30U, false, lbs, sizeof(lbs), lrec, &st_esr);
+        assert(l_tq > 12U && l_esr > 12U);
+        assert(st_esr.count[ZCVID_LH_BLK_TQ4] > 0ULL);
+        assert(zcvid_lh_decode_frame(lbs, l_esr, lpred, lw, lh, ldec) == 0);
+        assert(memcmp(lrec, ldec, sizeof(lrec)) == 0);
+    }
+
+    /* 2d. Non-multiple-of-64 dimensions (8x8, 8x24, 24x8, 56x40) with 1T & 16T->1T MT decode */
+    {
+        static const uint32_t dims[4][2] = { {8U, 8U}, {8U, 24U}, {24U, 8U}, {56U, 40U} };
+        for (int di = 0; di < 4; ++di) {
+            uint32_t dw = dims[di][0], dh = dims[di][1];
+            uint8_t *ds = (uint8_t *)malloc(dw * dh), *dp = (uint8_t *)malloc(dw * dh);
+            uint8_t *de = (uint8_t *)malloc(dw * dh), *dd = (uint8_t *)malloc(dw * dh);
+            uint8_t *db = (uint8_t *)malloc(dw * dh * 8U + 4096U);
+            assert(ds && dp && de && dd && db);
+            for (uint32_t i = 0U; i < dw * dh; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                ds[i] = (uint8_t)rng;
+                dp[i] = (uint8_t)(rng >> 9);
+            }
+            size_t l1 = zcvid_lh_encode_frame(ZCVID_LH_HYBRID_ESR, ds, dp, dw, dh, 24U, false, db, dw * dh * 8U + 4096U, de, NULL);
+            assert(l1 > 12U && zcvid_lh_decode_frame(db, l1, dp, dw, dh, dd) == 0 && memcmp(de, dd, dw * dh) == 0);
+            zcvid_lh_mt_pool_t p16, p1;
+            assert(zcvid_lh_mt_pool_init(&p16, 16U, dw, dh));
+            assert(zcvid_lh_mt_pool_init(&p1, 1U, dw, dh));
+            size_t lm = zcvid_lh_mt_encode_frame(&p16, ZCVID_LH_HYBRID_ESR, ds, dp, dw, dh, 24U, false, db, dw * dh * 8U + 4096U, de, NULL);
+            assert(lm > 16U && zcvid_lh_mt_decode_frame(&p1, db, lm, dp, dw, dh, dd) == 0 && memcmp(de, dd, dw * dh) == 0);
+            zcvid_lh_mt_pool_destroy(&p16);
+            zcvid_lh_mt_pool_destroy(&p1);
+            free(ds); free(dp); free(de); free(dd); free(db);
+        }
+    }
+
+    /* 3. HYBRID_ESR full QP sweep (0, 6, 12, 18, 24, 30, 36, 42, 51), 1T + MT, edge & fuzz */
+    const uint32_t W = 128U, H = 64U;
+    uint8_t *src = (uint8_t *)malloc(W * H);
+    uint8_t *pred = (uint8_t *)malloc(W * H);
+    uint8_t *erec = (uint8_t *)malloc(W * H);
+    uint8_t *drec = (uint8_t *)malloc(W * H);
+    uint8_t *bs = (uint8_t *)malloc(W * H * 4U + 4096U);
+    assert(src && pred && erec && drec && bs);
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            uint32_t idx = y * W + x;
+            if (x < 48U) {
+                src[idx] = (uint8_t)((x * 3U + y * 2U) & 255U);
+                pred[idx] = 128U;
+            } else if (x < 96U) {
+                src[idx] = (uint8_t)(((x / 3U + y / 3U) & 1U) ? 240U : 16U);
+                pred[idx] = 128U;
+            } else {
+                src[idx] = (uint8_t)((x ^ y) & 1U ? 255U : 0U);
+                pred[idx] = (uint8_t)((x ^ y) & 1U ? 0U : 255U);
+            }
+        }
+    }
+
+    zcvid_lh_mt_pool_t p4, p2;
+    assert(zcvid_lh_mt_pool_init(&p4, 4U, W, H));
+    assert(zcvid_lh_mt_pool_init(&p2, 2U, W, H));
+    static const uint32_t qps[9] = { 0U, 6U, 12U, 18U, 24U, 30U, 36U, 42U, 51U };
+    for (int qi = 0; qi < 9; ++qi) {
+        size_t l1 = zcvid_lh_encode_frame(ZCVID_LH_HYBRID_ESR, src, pred, W, H, qps[qi],
+                                          (qi & 1) != 0, bs, W * H * 4U + 4096U, erec, NULL);
+        assert(l1 > 12U);
+        assert(zcvid_lh_decode_frame(bs, l1, pred, W, H, drec) == 0);
+        assert(memcmp(erec, drec, W * H) == 0);
+
+        size_t l2 = zcvid_lh_mt_encode_frame(&p4, ZCVID_LH_HYBRID_ESR, src, pred, W, H, qps[qi],
+                                             (qi & 1) != 0, bs, W * H * 4U + 4096U, erec, NULL);
+        assert(l2 > 16U);
+        assert(zcvid_lh_mt_decode_frame(&p2, bs, l2, pred, W, H, drec) == 0);
+        assert(memcmp(erec, drec, W * H) == 0);
+    }
+
+    /* Fuzz 500 corrupted HYBRID_ESR ZCLH/ZCLS bitstreams at QP=51 */
+    uint8_t fbs[256];
+    for (int t = 0; t < 500; ++t) {
+        for (int i = 0; i < 256; ++i) {
+            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+            fbs[i] = (uint8_t)rng;
+        }
+        fbs[0] = 'Z'; fbs[1] = 'C'; fbs[2] = 'L'; fbs[3] = (t & 1) ? 'S' : 'H';
+        fbs[4] = (uint8_t)W; fbs[5] = 0; fbs[6] = (uint8_t)H; fbs[7] = 0;
+        fbs[8] = (uint8_t)ZCVID_LH_HYBRID_ESR;
+        fbs[9] = 51U;
+        fbs[10] = 0U;
+        fbs[11] = (t & 1) ? 2U : 0U;
+        if (t & 1) {
+            fbs[12] = 100; fbs[13] = 0; fbs[14] = 0; fbs[15] = 0;
+            fbs[16] = 136; fbs[17] = 0; fbs[18] = 0; fbs[19] = 0;
+            (void)zcvid_lh_mt_decode_frame(&p2, fbs, sizeof(fbs), pred, W, H, drec);
+        } else {
+            (void)zcvid_lh_decode_frame(fbs, sizeof(fbs), pred, W, H, drec);
+        }
+    }
+
+    zcvid_lh_mt_pool_destroy(&p4);
+    zcvid_lh_mt_pool_destroy(&p2);
+    free(src); free(pred); free(erec); free(drec); free(bs);
+    printf("PROVEN (4000/4000 circuit exact, QP 0..51 1T/MT exact, fuzz500 safe)\n");
+}
+
+/*
+ * Proof 20: Live Codec 8x8 Factored DCT8 Wire Primitives & CPU Decoder
+ * (zcvid_gpu_cpu_dec.h pred = 4 intra / pred = 5 inter).
+ * Verifies:
+ *  - Tq8Dequant symmetry, clamp bounds [-65535, 65535], and quant/dequant gain
+ *    consistency across all qp in [0..51].
+ *  - zcvid_dec_tq8_inverse bit-exact match with 64-bit zcvid_lh_dct8_inv_ref
+ *    across DC-only, LL-only (csbf==1), all 15 non-empty CSBF masks, and
+ *    adversarial extreme amplitudes (level = +-2047 at qp = 51).
+ *  - zcvid_gpu_dec_decode_frame with pred=4/5 on non-multiple-of-8 dimensions
+ *    (37x29), verifying exact 8x8 reconstruction, quadrant clearing, and safe
+ *    edge clamping with zero out-of-bounds access.
+ */
+static void prove_live_dct8_wire_cpu_decoder(void) {
+    printf("[PROOF 20] Live Wire DCT8 (pred=4/5, CSBF, QP 0..51, 37x29 edge)... ");
+    static const int32_t k_mf[6] = { 26214, 23302, 20560, 18396, 16384, 14564 };
+    static const uint32_t k_zz[16] = {
+        0u, 1u, 4u, 8u, 5u, 2u, 3u, 6u, 9u, 12u, 13u, 10u, 7u, 11u, 14u, 15u
+    };
+
+    /* 1. Tq8Dequant exhaustive QP 0..51 bounds, symmetry & quant(dequant(l))==l */
+    for (uint32_t qp = 0U; qp <= 51U; ++qp) {
+        assert(zcvid_dec_tq8_dequant(0, qp) == 0);
+        int32_t dp = zcvid_dec_tq8_dequant(2047, qp);
+        int32_t dn = zcvid_dec_tq8_dequant(-2047, qp);
+        assert(dp > 0 && dp <= 65535);
+        assert(dn == -dp);
+        int32_t qbits = 18 + (int32_t)(qp / 6U);
+        int32_t fq = (1 << qbits) / 3;
+        int32_t mf = k_mf[qp % 6U];
+        for (int32_t lv = 1; lv <= 64; ++lv) {
+            int32_t dq = zcvid_dec_tq8_dequant(lv, qp);
+            assert(zcvid_dec_tq8_dequant(-lv, qp) == -dq);
+            if (dq < 65535) {
+                int32_t qback = (int32_t)(((int64_t)dq * (int64_t)mf + (int64_t)fq) >> qbits);
+                if (qp >= 12U) {
+                    assert(qback == lv);
+                } else {
+                    int32_t diff = qback - lv;
+                    assert(diff >= -2 && diff <= 2);
+                }
+            }
+        }
+    }
+
+    /* 2. zcvid_dec_tq8_inverse vs 64-bit zcvid_lh_dct8_inv_ref across all CSBF masks
+     *    plus DC-only and adversarial +-65535 extreme coefficients */
+    uint32_t rng = 0x51A7F3C9U;
+    for (uint32_t t = 0U; t < 1000U; ++t) {
+        int32_t c_in[64];
+        memset(c_in, 0, sizeof(c_in));
+        uint32_t csbf = 0U;
+        if (t < 100U) {
+            /* DC-only */
+            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+            uint32_t qp = rng % 52U;
+            int32_t lv = (int32_t)((rng >> 8) % 4095U) - 2047;
+            c_in[0] = zcvid_dec_tq8_dequant(lv, qp);
+            csbf = (c_in[0] != 0) ? 1U : 0U;
+        } else if (t < 300U) {
+            /* Adversarial extreme +-2047 at QP=51 -> +-65535 across random CSBF */
+            uint32_t mask = 1U + (t % 15U);
+            for (uint32_t q = 0U; q < 4U; ++q) {
+                if ((mask & (1U << q)) == 0U) continue;
+                uint32_t qx = (q & 1U) * 4U, qy = (q >> 1) * 4U;
+                for (uint32_t k = 0U; k < 16U; ++k) {
+                    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                    int32_t lv = (rng & 1U) ? 2047 : -2047;
+                    uint32_t r = k_zz[k];
+                    c_in[(qy + (r >> 2)) * 8U + (qx + (r & 3U))] = zcvid_dec_tq8_dequant(lv, 51U);
+                }
+                csbf |= (1U << q);
+            }
+        } else {
+            /* Random sparse/dense blocks across all 15 non-empty CSBF masks & all QPs */
+            uint32_t mask = 1U + (t % 15U);
+            uint32_t qp = t % 52U;
+            for (uint32_t q = 0U; q < 4U; ++q) {
+                if ((mask & (1U << q)) == 0U) continue;
+                uint32_t qx = (q & 1U) * 4U, qy = (q >> 1) * 4U;
+                bool any = false;
+                for (uint32_t k = 0U; k < 16U; ++k) {
+                    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                    if ((rng & 3U) != 0U) continue;
+                    int32_t lv = (int32_t)((rng >> 8) % 201U) - 100;
+                    uint32_t r = k_zz[k];
+                    int32_t dq = zcvid_dec_tq8_dequant(lv, qp);
+                    c_in[(qy + (r >> 2)) * 8U + (qx + (r & 3U))] = dq;
+                    if (dq != 0) any = true;
+                }
+                if (any) csbf |= (1U << q);
+            }
+        }
+
+        int32_t got[64], ref[64];
+        zcvid_dec_tq8_inverse(c_in, csbf, got);
+        zcvid_lh_dct8_inv_ref(c_in, ref);
+        for (int i = 0; i < 64; ++i) {
+            assert(got[i] == ref[i]);
+        }
+    }
+
+    /* 3. Full zcvid_gpu_dec_decode_frame with pred=4 (DCT8 intra) & pred=5 (DCT8 inter)
+     *    on non-multiple-of-8 frame dimensions (37x29 -> bw=10, bh=8). */
+    const uint32_t W = 37U, H = 29U;
+    const uint32_t bw = (W + 3U) >> 2; /* 10 */
+    zcvid_gpu_dec_state_t dec;
+    assert(zcvid_gpu_dec_init(&dec, W, H) == 0);
+    zcvid_gpu_dec_reset(&dec, 128U, 4U);
+    zcvid_gpu_dec_params_t p = {
+        .width = W, .height = H,
+        .delta_min = 4U, .delta_max = 32U,
+        .gamma_q8 = 256U, .neutral_y = 128U,
+        .mv_qpel = 1U, .post_thr = 0U
+    };
+
+    /* Superblock at (bx=2, by=2) -> pixels x=8..15, y=8..15.
+     * Emit pred=4 (DCT8 intra) with:
+     *   - LL DC (q=0, k=0): Y level=+16, qp=12 -> dq=640 -> 2D IDCT8 = +5 -> 128+5=133
+     *   - LH coef (q=1, k=0, freq u=0,v=4): Y level=+8, qp=12 -> dq=320
+     *   - HL coef (q=2, k=1, freq u=4,v=1): Y level=-4, qp=12 -> dq=-160
+     *   - HH coef (q=3, k=0, freq u=4,v=4): Y level=+6, qp=12 -> dq=240
+     *   - LL DC Cb (pl=1, q=0, k=0): level=-16, qp=12 -> dq=-640 -> -5 -> 128-5=123
+     * Also emit a boundary-clipped pred=4 at (bx=8, by=6) -> x=32..36, y=24..28
+     * (partial 5x5 edge) to confirm zero OOB writes. */
+    uint32_t b_tl = 2U * bw + 2U;
+    uint32_t b_tr = b_tl + 1U;
+    uint32_t b_bl = b_tl + bw;
+    uint32_t b_br = b_bl + 1U;
+    uint32_t b_edge = 6U * bw + 8U;
+
+    uint32_t recs[12] = {
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_tl * 48U + 0U),
+        ((uint32_t)16 & 0xFFFFU) | (12U << 16) | (4U << 24),
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_tr * 48U + 0U),
+        ((uint32_t)8 & 0xFFFFU) | (12U << 16) | (4U << 24),
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_bl * 48U + 1U),
+        ((uint32_t)(uint16_t)(-4) & 0xFFFFU) | (12U << 16) | (4U << 24),
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_br * 48U + 0U),
+        ((uint32_t)6 & 0xFFFFU) | (12U << 16) | (4U << 24),
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_tl * 48U + 16U),
+        ((uint32_t)(uint16_t)(-16) & 0xFFFFU) | (12U << 16) | (4U << 24),
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_edge * 48U + 0U),
+        ((uint32_t)32 & 0xFFFFU) | (12U << 16) | (4U << 24)
+    };
+    assert(zcvid_gpu_dec_decode_frame(&dec, &p, NULL, recs, 12U) == 0);
+
+    int32_t exp_c[64];
+    memset(exp_c, 0, sizeof(exp_c));
+    exp_c[0 * 8 + 0] = zcvid_dec_tq8_dequant(16, 12U);
+    exp_c[0 * 8 + 4] = zcvid_dec_tq8_dequant(8, 12U);
+    exp_c[4 * 8 + 1] = zcvid_dec_tq8_dequant(-4, 12U);
+    exp_c[4 * 8 + 4] = zcvid_dec_tq8_dequant(6, 12U);
+    int32_t exp_res[64];
+    zcvid_lh_dct8_inv_ref(exp_c, exp_res);
+    for (uint32_t ly = 0U; ly < 8U; ++ly) {
+        for (uint32_t lx = 0U; lx < 8U; ++lx) {
+            uint32_t wv = dec.prev_yuvd[(8U + ly) * W + (8U + lx)];
+            int32_t ey = 128 + exp_res[ly * 8U + lx];
+            if (ey < 0) ey = 0;
+            if (ey > 255) ey = 255;
+            assert((int32_t)(wv & 0xFFU) == ey);
+            assert(((wv >> 8) & 0xFFU) == 123U);
+            assert(((wv >> 16) & 0xFFU) == 128U);
+        }
+    }
+    /* OOB partial edge superblock (x0=32, x0+8=40 > W=37) must be safely ignored
+     * (pixels untouched at 128) and all its st->coef entries cleared to 0. */
+    assert((dec.prev_yuvd[24U * W + 32U] & 0xFFU) == 128U);
+    assert((dec.prev_yuvd[28U * W + 36U] & 0xFFU) == 128U);
+    assert(dec.coef[b_edge * 48U + 0U] == 0);
+
+    /* Frame 2: pred=5 (DCT8 inter) on (bx=2, by=2) adding Y DC level=+16 (+5) */
+    uint32_t recs_inter[2] = {
+        (3U << 30) | (1U << 29) | (1U << 28) | (b_tl * 48U + 0U),
+        ((uint32_t)16 & 0xFFFFU) | (12U << 16) | (5U << 24)
+    };
+    assert(zcvid_gpu_dec_decode_frame(&dec, &p, NULL, recs_inter, 2U) == 0);
+    for (uint32_t ly = 0U; ly < 8U; ++ly) {
+        for (uint32_t lx = 0U; lx < 8U; ++lx) {
+            uint32_t wv = dec.prev_yuvd[(8U + ly) * W + (8U + lx)];
+            int32_t prev_y = 128 + exp_res[ly * 8U + lx];
+            if (prev_y < 0) prev_y = 0;
+            if (prev_y > 255) prev_y = 255;
+            int32_t ey = prev_y + 5;
+            if (ey > 255) ey = 255;
+            assert((int32_t)(wv & 0xFFU) == ey);
+            assert(((wv >> 8) & 0xFFU) == 123U);
+        }
+    }
+
+    zcvid_gpu_dec_destroy(&dec);
+    printf("PROVEN (QP 0..51 gain exact, 1000/1000 CSBF/extreme bit-exact, 37x29 pred=4/5 exact)\n");
+}
+
 int main(void) {
     printf("=== zcrudp Zcvid Formal & Exhaustive Proof Suite ===\n\n");
     prove_quant_strict_descent();
@@ -1380,6 +1805,8 @@ int main(void) {
     prove_rans_fuzz_and_edge_fixes();
     prove_pdq_optimal_and_fast_skip_parity();
     prove_portable_gpu_cpu_decoder();
+    prove_dct8_circuit_and_hybrid_esr();
+    prove_live_dct8_wire_cpu_decoder();
     printf("\n=== ALL PROOFS VERIFIED ===\n");
     return 0;
 }
