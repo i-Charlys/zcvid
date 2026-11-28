@@ -44,10 +44,10 @@ $(TARGET_PACKING): tests/test_zcvid_packing.c include/protocol_zcvid.h
 $(TARGET_CODEC): tests/test_zcvid_codec.c include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_mt.h include/zcvid_zcrudp_bridge.h include/protocol_zcvid.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-$(TARGET_PROOFS): tests/test_zcvid_proofs.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h
+$(TARGET_PROOFS): tests/test_zcvid_proofs.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h include/zcvid_galois_dct8.h include/zcvid_tropical_simplicial.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_proofs.c include/protocol_zcvid.h include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h
+sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_proofs.c include/protocol_zcvid.h include/zcvid_codec.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h include/zcvid_latent_hybrid.h include/zcvid_galois_dct8.h include/zcvid_tropical_simplicial.h
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_packing.c -o tests/test_zcvid_packing_san$(EXE)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_codec.c -o tests/test_zcvid_codec_san$(EXE) $(LDFLAGS)
 	$(CC) -Wall -Wextra -O1 -g -std=c11 -Iinclude -fsanitize=address,undefined tests/test_zcvid_proofs.c -o tests/test_zcvid_proofs_san$(EXE) $(LDFLAGS)
@@ -55,10 +55,14 @@ sanitize: tests/test_zcvid_packing.c tests/test_zcvid_codec.c tests/test_zcvid_p
 	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_codec_san$(EXE),./tests/test_zcvid_codec_san$(EXE))
 	$(if $(filter Windows_NT,$(OS)),tests\test_zcvid_proofs_san$(EXE),./tests/test_zcvid_proofs_san$(EXE))
 
-# Formal Lean 4 verification of the 12-mul HEVC DCT8 circuit & wire quantizer
+# Formal Lean 4 verification of the DCT8/2D Galois circuits, CLADM, Morgenstern & Tropical-Simplicial
 LEAN ?= lean
-test-lean: proofs/lean4/ZcvidDCT8Circuit.lean
-	$(LEAN) $<
+test-lean: proofs/lean4/ZcvidCore.lean proofs/lean4/ZcvidCLADM.lean proofs/lean4/ZcvidDCT8Circuit.lean proofs/lean4/ZcvidGalois2D.lean proofs/lean4/ZcvidTropicalSimplicial.lean
+	$(LEAN) proofs/lean4/ZcvidCore.lean
+	$(LEAN) proofs/lean4/ZcvidCLADM.lean
+	$(LEAN) proofs/lean4/ZcvidDCT8Circuit.lean
+	$(LEAN) proofs/lean4/ZcvidGalois2D.lean
+	$(LEAN) proofs/lean4/ZcvidTropicalSimplicial.lean
 
 # Token vs entropy-coded size on a real picture: make bench-image IMG=photo.pgm
 bench-image: tests/bench_image.c include/zcvid_codec.h include/zcvid_entropy.h include/protocol_zcvid.h
@@ -69,7 +73,7 @@ bench-image: tests/bench_image.c include/zcvid_codec.h include/zcvid_entropy.h i
 bench-latent: $(TARGET_LATENT)
 	$(if $(filter Windows_NT,$(OS)),$(subst /,\,$(TARGET_LATENT)),./$(TARGET_LATENT))
 
-$(TARGET_LATENT): tests/bench_latent_hybrid.c include/zcvid_latent_hybrid.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h
+$(TARGET_LATENT): tests/bench_latent_hybrid.c include/zcvid_latent_hybrid.h include/zcvid_entropy.h include/zcvid_gpu_cpu_dec.h include/zcvid_galois_dct8.h include/zcvid_tropical_simplicial.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:

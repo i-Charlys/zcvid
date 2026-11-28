@@ -20,6 +20,8 @@
 #include "zcvid_mt.h"
 #include "zcvid_gpu_cpu_dec.h"
 #include "zcvid_latent_hybrid.h"
+#include "zcvid_galois_dct8.h"
+#include "zcvid_tropical_simplicial.h"
 
 typedef struct {
     uint8_t (*pkts)[1400];
@@ -1785,6 +1787,268 @@ static void prove_live_dct8_wire_cpu_decoder(void) {
     printf("PROVEN (QP 0..51 gain exact, 1000/1000 CSBF/extreme bit-exact, 37x29 pred=4/5 exact)\n");
 }
 
+/* Reference exact integer K * X * K^T and K^T * C * K over int64_t */
+static void ref_hevc_dct8_2d_exact_i64(const int32_t in[64], int64_t out[64], bool inv) {
+    static const int64_t K[8][8] = {
+        { 64,  64,  64,  64,  64,  64,  64,  64 },
+        { 89,  75,  50,  18, -18, -50, -75, -89 },
+        { 83,  36, -36, -83, -83, -36,  36,  83 },
+        { 75, -18, -89, -50,  50,  89,  18, -75 },
+        { 64, -64, -64,  64,  64, -64, -64,  64 },
+        { 50, -89,  18,  75, -75, -18,  89, -50 },
+        { 36, -83,  83, -36, -36,  83, -83,  36 },
+        { 18, -50,  75, -89,  89, -75,  50, -18 }
+    };
+    int64_t tmp[64];
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            int64_t acc = 0;
+            for (int k = 0; k < 8; k++) {
+                int64_t w = inv ? K[k][r] : K[r][k];
+                acc += w * (int64_t)in[k * 8 + c];
+            }
+            tmp[r * 8 + c] = acc;
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            int64_t acc = 0;
+            for (int k = 0; k < 8; k++) {
+                int64_t w = inv ? K[k][c] : K[c][k];
+                acc += tmp[r * 8 + k] * w;
+            }
+            out[r * 8 + c] = acc;
+        }
+    }
+}
+
+/* Proof 21: Exact 116-Mul 2D Cyclotomic Galois-Subfield HEVC DCT8 / IDCT8 */
+static void prove_galois_2d_116mul_and_duality(void) {
+    printf("[PROOF 21] Exact 116-Mul 2D Cyclotomic Galois-Subfield HEVC DCT8/IDCT8 & Duality... ");
+    fflush(stdout);
+
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    for (int t = 0; t < 2000; t++) {
+        int32_t x[64], xt[64], y_sc[64], y_vec[64], yt_sc[64];
+        int32_t inv_sc[64], inv_vec[64];
+        int64_t y_i64[64], ref_fwd[64], inv_i64[64], ref_inv[64];
+        int32_t bound = (t < 1500) ? 255 : 511;
+        for (int i = 0; i < 64; i++) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            int32_t v = (int32_t)((rng >> 33) % (uint32_t)(2 * bound + 1)) - bound;
+            if (t < 8 && i == t) v = bound;
+            else if (t < 8) v = -bound;
+            x[i] = v;
+        }
+        for (int r = 0; r < 8; r++)
+            for (int c = 0; c < 8; c++)
+                xt[c * 8 + r] = x[r * 8 + c];
+
+        ref_hevc_dct8_2d_exact_i64(x, ref_fwd, false);
+        ref_hevc_dct8_2d_exact_i64(x, ref_inv, true);
+
+        zcvid_galois_dct8_2d_exact_i64(x, y_i64);
+        zcvid_galois_dct8_2d_exact_scalar(x, y_sc);
+        zcvid_galois_dct8_2d_exact(x, y_vec);
+        zcvid_galois_dct8_2d_exact_scalar(xt, yt_sc);
+
+        zcvid_galois_idct8_2d_exact_i64(x, inv_i64);
+        zcvid_galois_idct8_2d_exact_scalar(x, inv_sc);
+        zcvid_galois_idct8_2d_exact(x, inv_vec);
+
+        for (int i = 0; i < 64; i++) {
+            assert(y_i64[i] == ref_fwd[i]);
+            assert((int64_t)y_sc[i] == ref_fwd[i]);
+            assert((int64_t)y_vec[i] == ref_fwd[i]);
+            assert(inv_i64[i] == ref_inv[i]);
+            assert((int64_t)inv_sc[i] == ref_inv[i]);
+            assert((int64_t)inv_vec[i] == ref_inv[i]);
+        }
+        for (int r = 0; r < 8; r++)
+            for (int c = 0; c < 8; c++)
+                assert(yt_sc[c * 8 + r] == y_sc[r * 8 + c]);
+
+        /* Check rounded fwd/inv wrappers reconstruct within HEVC scaling accuracy */
+        if (t < 200) {
+            int32_t fq[64], rec[64];
+            zcvid_galois_dct8_2d_fwd(x, fq);
+            zcvid_galois_dct8_2d_inv(fq, rec);
+            for (int i = 0; i < 64; i++) {
+                int32_t diff = rec[i] - x[i];
+                if (diff < 0) diff = -diff;
+                assert(diff <= 2);
+            }
+        }
+    }
+
+    /* Fallback path for |in| > 511 and extreme range without UB */
+    static const int32_t ext_bounds[3] = { 4095, 16384, INT32_MAX / 4096 };
+    for (int b = 0; b < 3; b++) {
+        int32_t x[64], y_sc[64], y_vec[64], inv_sc[64], inv_vec[64];
+        int64_t ref_fwd[64], ref_inv[64];
+        for (int i = 0; i < 64; i++) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            int64_t v = (int64_t)(rng >> 33) % ((int64_t)ext_bounds[b] * 2 + 1) - ext_bounds[b];
+            x[i] = (b == 2 && (i & 1)) ? -ext_bounds[b] : (int32_t)v;
+        }
+        if (b < 2) {
+            ref_hevc_dct8_2d_exact_i64(x, ref_fwd, false);
+            ref_hevc_dct8_2d_exact_i64(x, ref_inv, true);
+            zcvid_galois_dct8_2d_exact_scalar(x, y_sc);
+            zcvid_galois_dct8_2d_exact(x, y_vec);
+            zcvid_galois_idct8_2d_exact_scalar(x, inv_sc);
+            zcvid_galois_idct8_2d_exact(x, inv_vec);
+            for (int i = 0; i < 64; i++) {
+                assert((int64_t)y_sc[i] == ref_fwd[i]);
+                assert((int64_t)y_vec[i] == ref_fwd[i]);
+                assert((int64_t)inv_sc[i] == ref_inv[i]);
+                assert((int64_t)inv_vec[i] == ref_inv[i]);
+            }
+        } else {
+            int64_t y_i64[64], inv_i64[64];
+            ref_hevc_dct8_2d_exact_i64(x, ref_fwd, false);
+            ref_hevc_dct8_2d_exact_i64(x, ref_inv, true);
+            zcvid_galois_dct8_2d_exact_i64(x, y_i64);
+            zcvid_galois_idct8_2d_exact_i64(x, inv_i64);
+            for (int i = 0; i < 64; i++) {
+                assert(y_i64[i] == ref_fwd[i]);
+                assert(inv_i64[i] == ref_inv[i]);
+            }
+        }
+    }
+
+    printf("PROVEN (2000/2000 exact i64/scalar/AVX2 fwd+inv + transpose duality + large-range i64)\n");
+}
+
+/* Proof 22: Unified Semiring Algebra, Differentiable Greedy (Free Energy),
+ * Simplicial Complex Cohomology (d1(d0)=0), & Speculative Parallel Tropical Rollback */
+static void prove_tropical_simplicial_speculative(void) {
+    printf("[PROOF 22] Unified Semiring, Gibbs Free Energy, Simplicial d1(d0)=0, & Speculative Rollback... ");
+    fflush(stdout);
+
+    /* 1. Unified Semiring Associativity: (A * B) * x == A * (B * x) on Linear & Tropical */
+    double A[16] = {
+        2.0, 1.0, 4.0, 3.0,
+        0.5, 3.0, 2.0, 1.0,
+        1.0, 2.0, 0.5, 4.0,
+        3.0, 0.5, 1.0, 2.0
+    };
+    double B[16] = {
+        1.0, 2.5, 0.5, 3.0,
+        3.0, 1.0, 2.0, 0.5,
+        2.0, 0.5, 1.0, 4.0,
+        0.5, 3.0, 2.0, 1.0
+    };
+    double x[4] = { 1.5, -0.5, 2.0, 0.25 };
+    double AB[16], lhs[4], Bx[4], rhs[4];
+    for (int r = 0; r < 2; ++r) {
+        zcvid_ts_semiring_t ring = (r == 0) ? ZCVID_TS_LINEAR : ZCVID_TS_TROPICAL;
+        zcvid_ts_matmul(ring, 0.0, 4u, 4u, 4u, A, B, AB);
+        zcvid_ts_matvec(ring, 0.0, 4u, 4u, AB, x, lhs);
+        zcvid_ts_matvec(ring, 0.0, 4u, 4u, B, x, Bx);
+        zcvid_ts_matvec(ring, 0.0, 4u, 4u, A, Bx, rhs);
+        for (size_t i = 0; i < 4u; ++i) {
+            assert(fabs(lhs[i] - rhs[i]) < 1e-12);
+        }
+    }
+
+    /* 2. Minimal Physical Law: Helmholtz Free Energy F_tau = E[E] - tau*H(p)
+     *    & analytic Boltzmann gradient == finite difference */
+    double E[4] = { 12.4, 9.8, 15.1, 10.6 };
+    double probs[4];
+    const double taus[3] = { 5.0, 1.0, 0.05 };
+    for (int ti = 0; ti < 3; ++ti) {
+        double tau = taus[ti];
+        zcvid_ts_free_energy_res_t res = zcvid_ts_free_energy_eval(E, 4u, tau, probs);
+        double gibbs_rhs = res.expected_energy - tau * res.entropy;
+        assert(fabs(res.free_energy - gibbs_rhs) < 1e-11);
+        assert(res.free_energy >= res.min_energy - tau * log(4.0) - 1e-11);
+        assert(res.free_energy <= res.min_energy + 1e-11);
+        double eps = 1e-5;
+        for (size_t m = 0; m < 4u; ++m) {
+            double Ep[4], Em[4];
+            memcpy(Ep, E, sizeof(E));
+            memcpy(Em, E, sizeof(E));
+            Ep[m] += eps;
+            Em[m] -= eps;
+            double fp = zcvid_ts_free_energy_eval(Ep, 4u, tau, NULL).free_energy;
+            double fm = zcvid_ts_free_energy_eval(Em, 4u, tau, NULL).free_energy;
+            double fd = (fp - fm) / (2.0 * eps);
+            assert(fabs(fd - probs[m]) < 1e-7);
+        }
+    }
+    /* Smooth Free-Energy matrix associativity approaches Tropical as tau -> 0+ */
+    double ft_res[4], tr_res[4];
+    zcvid_ts_matvec(ZCVID_TS_FREE_ENERGY, 1e-3, 4u, 4u, A, x, ft_res);
+    zcvid_ts_matvec(ZCVID_TS_TROPICAL, 0.0, 4u, 4u, A, x, tr_res);
+    for (size_t i = 0; i < 4u; ++i) assert(fabs(ft_res[i] - tr_res[i]) < 1e-2);
+
+    /* Differentiable Greedy lambda tuning converges smoothly */
+    double dist[4] = { 420.0, 180.0, 95.0, 30.0 };
+    double rate[4] = { 1.0, 8.0, 18.0, 45.0 };
+    double lam = zcvid_ts_diff_greedy_tune(dist, rate, 4u, 5.0, 16.0, 2.0, 0.05, 250);
+    assert(lam > 1.0 && lam < 100.0);
+
+    /* 3. 2D Simplicial Complex Cohomology: d1(d0(phi)) == 0 & Hodge Energy >= 0 */
+    int32_t phi[32 * 24];
+    uint64_t rng = 0x517CC1B727220A95ULL;
+    for (size_t i = 0; i < 32u * 24u; ++i) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        phi[i] = (int32_t)((rng >> 40) & 0x3FFU) - 512;
+    }
+    int64_t hodge = -1;
+    int32_t max_curl = zcvid_ts_simplicial_d1_d0_max_abs(phi, 32u, 24u, &hodge);
+    assert(max_curl == 0 && hodge > 0);
+    assert(zcvid_ts_simplex_planar_pred(42, 55, 37) == 60);
+
+    /* 4. Speculative Parallel Tropical RDO with Local-Dependency Rollback == Sequential */
+    zcvid_ts_coupling_t coup;
+    for (size_t a = 0; a < ZCVID_TS_MODES; ++a) {
+        for (size_t b = 0; b < ZCVID_TS_MODES; ++b) {
+            coup.edge_cost[a][b] = (a == b) ? 0.0 : (3.5 + 0.75 * (double)llabs((long long)a - (long long)b));
+        }
+    }
+    coup.tl_diag_bonus = 1.8;
+
+    zcvid_ts_pool_t pool4;
+    assert(zcvid_ts_pool_init(&pool4, 4u));
+
+    const size_t bw = 40u, bh = 28u;
+    const size_t nb = bw * bh;
+    double *en = (double *)malloc(nb * ZCVID_TS_MODES * sizeof(double));
+    uint8_t *seq_m = (uint8_t *)malloc(nb);
+    uint8_t *sp1_m = (uint8_t *)malloc(nb);
+    uint8_t *sp4_m = (uint8_t *)malloc(nb);
+    uint8_t *init_p = (uint8_t *)malloc(nb);
+    assert(en && seq_m && sp1_m && sp4_m && init_p);
+
+    for (int tc = 0; tc < 200; ++tc) {
+        for (size_t v = 0; v < nb; ++v) {
+            for (size_t m = 0; m < ZCVID_TS_MODES; ++m) {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                double base = (double)((rng >> 48) & 0xFFU) * 0.1;
+                if (tc >= 160 && m == ((v / bw + v % bw) & 3u)) base *= 0.2; /* adversarial diagonal wave */
+                en[v * ZCVID_TS_MODES + m] = base;
+            }
+            init_p[v] = (tc < 80) ? 0u : (uint8_t)((v + (size_t)tc) & 3u);
+        }
+        zcvid_ts_rdo_seq(bw, bh, en, &coup, seq_m);
+        zcvid_ts_spec_stats_t st1, st4;
+        assert(zcvid_ts_rdo_spec_solve(NULL, bw, bh, en, &coup, (tc & 1) ? init_p : NULL, sp1_m, &st1));
+        assert(zcvid_ts_rdo_spec_solve(&pool4, bw, bh, en, &coup, (tc & 1) ? init_p : NULL, sp4_m, &st4));
+        assert(memcmp(seq_m, sp1_m, nb) == 0);
+        assert(memcmp(seq_m, sp4_m, nb) == 0);
+    }
+
+    zcvid_ts_pool_destroy(&pool4);
+    free(en);
+    free(seq_m);
+    free(sp1_m);
+    free(sp4_m);
+    free(init_p);
+    printf("PROVEN (Linear+Tropical assoc, Gibbs F=E-tH exact, d1(d0)=0, 200/200 1T/4T rollback == Seq)\n");
+}
+
 int main(void) {
     printf("=== zcrudp Zcvid Formal & Exhaustive Proof Suite ===\n\n");
     prove_quant_strict_descent();
@@ -1807,6 +2071,8 @@ int main(void) {
     prove_portable_gpu_cpu_decoder();
     prove_dct8_circuit_and_hybrid_esr();
     prove_live_dct8_wire_cpu_decoder();
+    prove_galois_2d_116mul_and_duality();
+    prove_tropical_simplicial_speculative();
     printf("\n=== ALL PROOFS VERIFIED ===\n");
     return 0;
 }

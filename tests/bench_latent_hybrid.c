@@ -4,6 +4,8 @@
  */
 
 #include "zcvid_latent_hybrid.h"
+#include "zcvid_galois_dct8.h"
+#include "zcvid_tropical_simplicial.h"
 
 #include <assert.h>
 #include <math.h>
@@ -622,6 +624,196 @@ static void run_1080p_realtime_bench(void) {
     free(bs);
 }
 
+static void ref1024_exact_dct8_2d(const int32_t in[64], int32_t out[64]) {
+    static const int32_t K[8][8] = {
+        { 64,  64,  64,  64,  64,  64,  64,  64 },
+        { 89,  75,  50,  18, -18, -50, -75, -89 },
+        { 83,  36, -36, -83, -83, -36,  36,  83 },
+        { 75, -18, -89, -50,  50,  89,  18, -75 },
+        { 64, -64, -64,  64,  64, -64, -64,  64 },
+        { 50, -89,  18,  75, -75, -18,  89, -50 },
+        { 36, -83,  83, -36, -36,  83, -83,  36 },
+        { 18, -50,  75, -89,  89, -75,  50, -18 }
+    };
+    int32_t tmp[64];
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            int32_t acc = 0;
+            for (int k = 0; k < 8; k++) acc += K[r][k] * in[k * 8 + c];
+            tmp[r * 8 + c] = acc;
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            int32_t acc = 0;
+            for (int k = 0; k < 8; k++) acc += tmp[r * 8 + k] * K[c][k];
+            out[r * 8 + c] = acc;
+        }
+    }
+}
+
+static void sep192_exact_dct8_1d(const int32_t x[8], int32_t s, int32_t out[8], int32_t os) {
+    int32_t e0 = x[0] + x[7 * s], e1 = x[s] + x[6 * s], e2 = x[2 * s] + x[5 * s], e3 = x[3 * s] + x[4 * s];
+    int32_t o0 = x[0] - x[7 * s], o1 = x[s] - x[6 * s], o2 = x[2 * s] - x[5 * s], o3 = x[3 * s] - x[4 * s];
+    int32_t ee0 = e0 + e3, ee1 = e1 + e2;
+    int32_t eo0 = e0 - e3, eo1 = e1 - e2;
+    out[0 * os] = (ee0 + ee1) << 6;
+    out[4 * os] = (ee0 - ee1) << 6;
+    zc_g2d_even_rot_i32(eo0, eo1, &out[2 * os], &out[6 * os]);
+    zc_g2d_odd1d_i32(o0, o1, o2, o3, &out[1 * os], &out[3 * os], &out[5 * os], &out[7 * os]);
+}
+
+static void sep192_exact_dct8_2d(const int32_t in[64], int32_t out[64]) {
+    int32_t tmp[64];
+    for (int c = 0; c < 8; c++) sep192_exact_dct8_1d(in + c, 8, tmp + c, 8);
+    for (int r = 0; r < 8; r++) sep192_exact_dct8_1d(tmp + r * 8, 1, out + r * 8, 1);
+}
+
+static void run_galois_2d_microbench(void) {
+    int32_t in[64], ref[64], sep[64], g_sc[64], g_vec[64];
+    uint64_t rng = 0x123456789ABCDEF0ULL;
+    for (int t = 0; t < 32; t++) {
+        for (int i = 0; i < 64; i++) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            in[i] = (int32_t)((rng >> 33) % 511U) - 255;
+        }
+        ref1024_exact_dct8_2d(in, ref);
+        sep192_exact_dct8_2d(in, sep);
+        zcvid_galois_dct8_2d_exact_scalar(in, g_sc);
+        zcvid_galois_dct8_2d_exact(in, g_vec);
+        assert(memcmp(ref, sep, sizeof(ref)) == 0);
+        assert(memcmp(ref, g_sc, sizeof(ref)) == 0);
+        assert(memcmp(ref, g_vec, sizeof(ref)) == 0);
+    }
+
+    const int N = 400000;
+    volatile int64_t sink = 0;
+    double t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        in[(i * 7) & 63] = (i & 255) - 128;
+        ref1024_exact_dct8_2d(in, ref);
+        sink += ref[(i * 13) & 63];
+    }
+    double ms_ref = now_ms() - t0;
+
+    t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        in[(i * 7) & 63] = (i & 255) - 128;
+        sep192_exact_dct8_2d(in, sep);
+        sink += sep[(i * 13) & 63];
+    }
+    double ms_sep = now_ms() - t0;
+
+    t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        in[(i * 7) & 63] = (i & 255) - 128;
+        zcvid_galois_dct8_2d_exact_scalar(in, g_sc);
+        sink += g_sc[(i * 13) & 63];
+    }
+    double ms_gsc = now_ms() - t0;
+
+    t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        in[(i * 7) & 63] = (i & 255) - 128;
+        zcvid_galois_dct8_2d_exact(in, g_vec);
+        sink += g_vec[(i * 13) & 63];
+    }
+    double ms_gvec = now_ms() - t0;
+
+    printf("\n=== 2D 8x8 Exact Transform Microbench (0 mismatch vs Ref, sink=%lld) ===\n",
+           (long long)sink);
+    printf("  Ref 1024-MAC exact     : %7.2f ns/blk (1024 muls)\n", (ms_ref * 1e6) / N);
+    printf("  Separable 192-mul exact: %7.2f ns/blk ( 192 muls, %.2fx vs Ref)\n",
+           (ms_sep * 1e6) / N, ms_ref / (ms_sep > 1e-6 ? ms_sep : 1e-6));
+    printf("  Galois 116-mul Scalar  : %7.2f ns/blk ( 116 muls, %.2fx vs Sep, %.2fx vs Ref)\n",
+           (ms_gsc * 1e6) / N,
+           ms_sep / (ms_gsc > 1e-6 ? ms_gsc : 1e-6),
+           ms_ref / (ms_gsc > 1e-6 ? ms_gsc : 1e-6));
+    printf("  Galois 116-mul Active  : %7.2f ns/blk ( 116 muls, %.2fx vs Sep, %.2fx vs Ref)\n",
+           (ms_gvec * 1e6) / N,
+           ms_sep / (ms_gvec > 1e-6 ? ms_gvec : 1e-6),
+           ms_ref / (ms_gvec > 1e-6 ? ms_gvec : 1e-6));
+}
+
+static void run_tropical_simplicial_bench(void) {
+    const size_t bw = 240u, bh = 135u; /* 1920x1080 in 8x8 blocks = 32,400 blocks */
+    const size_t nb = bw * bh;
+    double *en = (double *)malloc(nb * ZCVID_TS_MODES * sizeof(double));
+    uint8_t *prev_m = (uint8_t *)malloc(nb);
+    uint8_t *seq_m  = (uint8_t *)malloc(nb);
+    uint8_t *sp1_m  = (uint8_t *)malloc(nb);
+    uint8_t *sp8_m  = (uint8_t *)malloc(nb);
+    assert(en && prev_m && seq_m && sp1_m && sp8_m);
+
+    zcvid_ts_coupling_t coup;
+    for (size_t a = 0; a < ZCVID_TS_MODES; ++a) {
+        for (size_t b = 0; b < ZCVID_TS_MODES; ++b) {
+            coup.edge_cost[a][b] = (a == b) ? 0.0 : 4.5;
+        }
+    }
+    coup.tl_diag_bonus = 2.0;
+
+    zcvid_ts_pool_t pool8;
+    assert(zcvid_ts_pool_init(&pool8, 8u));
+
+    printf("\n=== 1080p (%zux%zu = %zu blocks) Tropical-Simplicial Speculative RDO ===\n",
+           bw, bh, nb);
+    uint64_t rng = 0xCAFEBABE12345678ULL;
+    for (int sc = 0; sc < 2; ++sc) {
+        for (size_t v = 0; v < nb; ++v) {
+            size_t x = v % bw, y = v / bw;
+            uint8_t region_m = (uint8_t)(((x / 16u) + (y / 12u)) & 3u);
+            for (size_t m = 0; m < ZCVID_TS_MODES; ++m) {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                double noise = (double)((rng >> 48) & 0xFFU) * 0.05;
+                if (sc == 0) {
+                    en[v * ZCVID_TS_MODES + m] = (m == region_m ? 1.0 : 12.0) + noise;
+                } else {
+                    en[v * ZCVID_TS_MODES + m] = noise * 4.0;
+                }
+            }
+            if (sc == 0) {
+                /* 93% coherent temporal warm-start + 7% motion-edge innovations */
+                prev_m[v] = ((rng & 15u) == 0u) ? (uint8_t)((region_m + 1u) & 3u) : region_m;
+            } else {
+                prev_m[v] = (uint8_t)((rng >> 50) & 3u);
+            }
+        }
+        const int ITERS = 40;
+        double t0 = now_ms();
+        for (int it = 0; it < ITERS; ++it) zcvid_ts_rdo_seq(bw, bh, en, &coup, seq_m);
+        double ms_seq = (now_ms() - t0) / ITERS;
+
+        zcvid_ts_spec_stats_t st1, st8;
+        t0 = now_ms();
+        for (int it = 0; it < ITERS; ++it) {
+            assert(zcvid_ts_rdo_spec_solve(NULL, bw, bh, en, &coup, prev_m, sp1_m, &st1));
+        }
+        double ms_sp1 = (now_ms() - t0) / ITERS;
+
+        t0 = now_ms();
+        for (int it = 0; it < ITERS; ++it) {
+            assert(zcvid_ts_rdo_spec_solve(&pool8, bw, bh, en, &coup, prev_m, sp8_m, &st8));
+        }
+        double ms_sp8 = (now_ms() - t0) / ITERS;
+
+        assert(memcmp(seq_m, sp1_m, nb) == 0);
+        assert(memcmp(seq_m, sp8_m, nb) == 0);
+        printf("  %-18s | Seq: %6.3f ms | Spec1T: %6.3f ms | Spec8T: %6.3f ms (%.2fx vs Seq) | rounds=%zu, rollbacks=%zu (%.1f%% hit)\n",
+               (sc == 0) ? "Coherent Video 93%" : "Adversarial Random",
+               ms_seq, ms_sp1, ms_sp8,
+               ms_seq / (ms_sp8 > 1e-6 ? ms_sp8 : 1e-6),
+               st8.rounds, st8.rollbacks, st8.spec_hit_rate * 100.0);
+    }
+
+    zcvid_ts_pool_destroy(&pool8);
+    free(en);
+    free(prev_m);
+    free(seq_m);
+    free(sp1_m);
+    free(sp8_m);
+}
+
 int main(void) {
     run_unit_and_edge_tests();
 
@@ -770,5 +962,7 @@ int main(void) {
     free(bs);
 
     run_1080p_realtime_bench();
+    run_galois_2d_microbench();
+    run_tropical_simplicial_bench();
     return 0;
 }
